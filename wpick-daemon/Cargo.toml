@@ -1,0 +1,26 @@
+[package]
+name    = "wpick-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wpick-daemon"
+path = "src/main.rs"
+
+[dependencies]
+wpick-core              = { path = "../wpick-core" }
+serde                   = { workspace = true }
+serde_json              = { workspace = true }
+anyhow                  = { workspace = true }
+tokio                   = { workspace = true }
+tracing                 = { workspace = true }
+tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
+tracing-appender        = "0.2"
+wayland-client          = "0.31"
+wayland-protocols-wlr   = { version = "0.3", features = ["client"] }
+wgpu                    = "22"
+bytemuck                = { version = "1", features = ["derive"] }
+ffmpeg-next             = "8"
+rodio                   = "0.19"
+parking_lot             = "0.12"
+raw-window-handle       = "0.6"

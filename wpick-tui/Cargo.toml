@@ -1,0 +1,19 @@
+[package]
+name    = "wpick-tui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wpick"
+path = "src/main.rs"
+
+[dependencies]
+wpick-core         = { path = "../wpick-core" }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+anyhow             = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui            = "0.29"
+crossterm          = "0.28"
