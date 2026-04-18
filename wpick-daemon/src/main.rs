@@ -22,7 +22,7 @@ async fn main() -> anyhow::Result<()> {
     let config = WpickConfig::load().context("Failed to load config")?;
     let dirs   = config.app_dirs().context("Failed to resolve app dirs")?;
 
-    // 2. File logging (daemon has no terminal)
+    // 2. File logging
     let file_appender = tracing_appender::rolling::daily(&dirs.log_dir, "wpick.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
     tracing_subscriber::fmt()
@@ -47,7 +47,6 @@ async fn main() -> anyhow::Result<()> {
     let (volume_tx,   volume_rx)   = tokio::sync::watch::channel(
         (config.general.volume, config.general.muted),
     );
-    let (pause_tx,  pause_rx)      = tokio::sync::watch::channel(false);
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
     // 5. DaemonState
@@ -55,11 +54,9 @@ async fn main() -> anyhow::Result<()> {
         current:     None,
         volume:      config.general.volume,
         muted:       config.general.muted,
-        paused:      false,
         renderer_tx,
         audio_tx,
         volume_tx,
-        pause_tx,
         shutdown_tx: shutdown_tx.clone(),
     }));
 
@@ -80,12 +77,10 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to bind Unix socket")?;
     tracing::info!("Listening on {:?}", socket_path);
 
-    // 8. Cleanup helper (used on graceful shutdown path)
+    // 8. Cleanup helper
     let cleanup = {
         let sp = socket_path.clone();
-        move || {
-            let _ = std::fs::remove_file(&sp);
-        }
+        move || { let _ = std::fs::remove_file(&sp); }
     };
 
     // 9. Signal handlers
@@ -116,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 10. IPC server task (worker thread)
+    // 10. IPC server task
     {
         let state = Arc::clone(&state);
         let cache = Arc::clone(&cache);
@@ -128,9 +123,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 11. Audio task — runs on a dedicated OS thread with its own runtime so
-    //     rodio::OutputStream never needs to be Send.
+    // 11. Audio task — dedicated OS thread (rodio OutputStream is !Send)
     {
+        let duck = ducking::start();
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
@@ -138,17 +133,16 @@ async fn main() -> anyhow::Result<()> {
                     .enable_all()
                     .build()
                     .expect("audio runtime");
-                if let Err(e) = rt.block_on(audio::run(ducking::start(), audio_rx, volume_rx, pause_rx)) {
+                if let Err(e) = rt.block_on(audio::run(duck, audio_rx, volume_rx)) {
                     tracing::error!("Audio task: {}", e);
                 }
             })
             .context("Failed to spawn audio thread")?;
     }
 
-    // 12. Renderer — must run on this thread (Wayland is not Send).
-    //     LocalSet pins the !Send future to the current thread.
-    eprintln!("DEBUG: about to start renderer");  // тимчасово
+    // 12. Renderer — must run on this thread (Wayland is !Send)
     tracing::info!("Starting renderer");
+    eprintln!("DEBUG: about to start renderer");
     let local = tokio::task::LocalSet::new();
     local
         .run_until(renderer::run(renderer_rx, shutdown_rx))

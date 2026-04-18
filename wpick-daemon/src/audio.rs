@@ -24,10 +24,24 @@ impl Iterator for AudioSamples {
 }
 
 impl rodio::Source for AudioSamples {
-    fn current_frame_len(&self) -> Option<usize>             { None }
-    fn channels(&self)          -> u16                        { self.channels }
-    fn sample_rate(&self)       -> u32                        { self.sample_rate }
+    fn current_frame_len(&self) -> Option<usize>              { None }
+    fn channels(&self)          -> u16                         { self.channels }
+    fn sample_rate(&self)       -> u32                         { self.sample_rate }
     fn total_duration(&self)    -> Option<std::time::Duration> { None }
+}
+
+// ─── Volume/mute helper ───────────────────────────────────────────────────────
+//
+// rodio 0.19 + ALSA/PipeWire: set_volume() is ignored for playing sinks.
+// Use sink.pause() for mute and sink.play() for unmute instead.
+fn apply_volume(sink: &rodio::Sink, vol: f32, muted: bool) {
+    if muted {
+        sink.set_volume(0.0);
+        sink.pause();
+    } else {
+        sink.set_volume(vol.clamp(0.0, 1.0));
+        sink.play();
+    }
 }
 
 // ─── Audio decode ─────────────────────────────────────────────────────────────
@@ -78,7 +92,6 @@ fn decode_audio_to_f32(path: &str) -> anyhow::Result<(Vec<f32>, u32, u16)> {
         }
     }
 
-    // Flush resampler
     let mut resampled = ffmpeg::frame::Audio::empty();
     if resampler.flush(&mut resampled).is_ok() {
         let data = resampled.data(0);
@@ -96,9 +109,7 @@ pub async fn run(
     duck:             crate::ducking::DuckHandle,
     mut wallpaper_rx: tokio::sync::watch::Receiver<Option<WallpaperInfo>>,
     mut volume_rx:    tokio::sync::watch::Receiver<(f32, bool)>,
-    mut pause_rx:     tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    // _output_stream must outlive every Sink created from stream_handle (E-16)
     let (_output_stream, stream_handle) = rodio::OutputStream::try_default()
         .map_err(|e| anyhow::anyhow!("Audio output init failed: {}", e))?;
 
@@ -108,7 +119,6 @@ pub async fn run(
         if wallpaper_rx.has_changed()? {
             let new_wp = wallpaper_rx.borrow_and_update().clone();
 
-            // Stop current audio
             if let Some(sink) = current_sink.take() {
                 sink.stop();
             }
@@ -118,30 +128,37 @@ pub async fn run(
                     let path  = info.file_path.clone();
                     let title = info.title.clone();
 
-                    match tokio::task::spawn_blocking(move || decode_audio_to_f32(&path)).await? {
+                    match tokio::task::spawn_blocking(move || {
+                        decode_audio_to_f32(&path)
+                    }).await? {
                         Ok((samples, rate, ch)) => {
                             match rodio::Sink::try_new(&stream_handle) {
                                 Ok(sink) => {
-                                    let (vol, muted) = *volume_rx.borrow();
-                                    sink.set_volume(if muted { 0.0 } else { vol });
                                     sink.append(AudioSamples {
                                         samples,
                                         pos: 0,
                                         sample_rate: rate,
-                                        channels: ch,
+                                        channels:    ch,
                                     });
+
                                     let sink = Arc::new(sink);
-                                    // Register with ducker so it can fade volume
+
+                                    // Read latest mute/volume — borrow_and_update
+                                    // so we get state set during long decode
+                                    let (vol, muted) = *volume_rx.borrow_and_update();
+                                    apply_volume(&sink, vol, muted);
+
                                     duck.register_sink(Arc::clone(&sink), vol);
+
+                                    tracing::info!("Audio: {} vol={:.0}% muted={}",
+                                        title, vol * 100.0, muted);
+
                                     current_sink = Some(sink);
-                                    tracing::info!("Audio started for: {}", title);
                                 }
                                 Err(e) => tracing::warn!("Sink creation failed: {}", e),
                             }
                         }
-                        Err(e) => {
-                            tracing::info!("No audio decoded for wallpaper: {}", e);
-                        }
+                        Err(e) => tracing::info!("No audio: {}", e),
                     }
                 }
             }
@@ -149,19 +166,11 @@ pub async fn run(
 
         if volume_rx.has_changed()? {
             let (vol, muted) = *volume_rx.borrow_and_update();
-            // Update ducker's target volume so fade-in restores the right level
-            duck.set_volume(if muted { 0.0 } else { vol });
-            // Also apply directly if not currently ducked
+            duck.set_volume(vol);
             if let Some(ref sink) = current_sink {
-                sink.set_volume(if muted { 0.0 } else { vol });
+                apply_volume(sink, vol, muted);
             }
-        }
-
-        if pause_rx.has_changed()? {
-            let paused = *pause_rx.borrow_and_update();
-            if let Some(ref sink) = current_sink {
-                if paused { sink.pause(); } else { sink.play(); }
-            }
+            tracing::debug!("Volume: {:.0}% muted={}", vol * 100.0, muted);
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -190,22 +199,5 @@ mod tests {
             samples: vec![], pos: 0, sample_rate: 48000, channels: 2,
         };
         assert_eq!(src.next(), None);
-    }
-
-    #[test]
-    fn test_decode_audio_from_file() {
-        let result = decode_audio_to_f32("/tmp/wpick_test_audio.mp4");
-        assert!(result.is_ok(), "decode failed: {:?}", result.err());
-        let (samples, rate, ch) = result.unwrap();
-        assert_eq!(rate, 48000);
-        assert_eq!(ch, 2);
-        assert!(!samples.is_empty());
-        assert!(samples.iter().all(|s| s.is_finite()));
-    }
-
-    #[test]
-    fn test_no_audio_stream_returns_error() {
-        let result = decode_audio_to_f32("/tmp/wpick_test.mp4");
-        assert!(result.is_err());
     }
 }

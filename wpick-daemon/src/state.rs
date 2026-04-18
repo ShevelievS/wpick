@@ -5,11 +5,9 @@ pub struct DaemonState {
     pub current:     Option<WallpaperInfo>,
     pub volume:      f32,
     pub muted:       bool,
-    pub paused:      bool,
     pub renderer_tx: watch::Sender<Option<WallpaperInfo>>,
     pub audio_tx:    watch::Sender<Option<WallpaperInfo>>,
     pub volume_tx:   watch::Sender<(f32, bool)>,
-    pub pause_tx:    watch::Sender<bool>,
     pub shutdown_tx: broadcast::Sender<()>,
 }
 
@@ -37,8 +35,4 @@ impl DaemonState {
         let _ = self.volume_tx.send((self.volume, self.muted));
     }
 
-    pub fn set_paused(&mut self, paused: bool) {
-        self.paused = paused;
-        let _ = self.pause_tx.send(paused);
-    }
 }
