@@ -33,10 +33,10 @@
 | 6 | ipc.rs | `CORE.md` §ipc | round-trip тест всіх варіантів | ✅ |
 | 7 | state.rs | `DAEMON.md` §state | компілюється | ✅ |
 | 8 | ipc_server.rs | `DAEMON.md` §ipc_server | `echo '{"type":"List"}' \| nc -U ~/.wpick.sock` | ✅ |
-| 9 | video.rs | `DAEMON.md` §video | decode 10 frames від тестового mp4 | ⬜ |
-| 10 | audio.rs | `DAEMON.md` §audio | AudioSamples::next() не паніки | ⬜ |
-| 11 | renderer.rs | `DAEMON.md` §renderer | layer surface з'являється на моніторі | ⬜ |
-| 12 | daemon main.rs | `DAEMON.md` §main | `wpick-daemon` стартує, сокет є, SIGTERM прибирає | ⬜ |
+| 9 | video.rs | `DAEMON.md` §video | decode 10 frames від тестового mp4 | ✅ |
+| 10 | audio.rs | `DAEMON.md` §audio | AudioSamples::next() не паніки | ✅ |
+| 11 | renderer.rs | `DAEMON.md` §renderer | layer surface з'являється на моніторі | ✅ |
+| 12 | daemon main.rs | `DAEMON.md` §main | `wpick-daemon` стартує, сокет є, SIGTERM прибирає | ✅ |
 | 13 | client.rs | `TUI.md` §client | connect + List command | ⬜ |
 | 14 | app.rs | `TUI.md` §app | всі keys обробляються | ⬜ |
 | 15 | ui.rs | `TUI.md` §ui | рендер без паніки | ⬜ |

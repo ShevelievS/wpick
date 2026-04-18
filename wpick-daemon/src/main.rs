@@ -1,4 +1,5 @@
 mod audio;
+mod ducking;
 mod ipc_server;
 mod renderer;
 mod state;
@@ -41,13 +42,13 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // 4. Watch/broadcast channels
-    let (renderer_tx, _renderer_rx) = tokio::sync::watch::channel(None::<WallpaperInfo>);
-    let (audio_tx,    _audio_rx)    = tokio::sync::watch::channel(None::<WallpaperInfo>);
-    let (volume_tx,   _volume_rx)   = tokio::sync::watch::channel(
+    let (renderer_tx, renderer_rx) = tokio::sync::watch::channel(None::<WallpaperInfo>);
+    let (audio_tx,    audio_rx)    = tokio::sync::watch::channel(None::<WallpaperInfo>);
+    let (volume_tx,   volume_rx)   = tokio::sync::watch::channel(
         (config.general.volume, config.general.muted),
     );
-    let (pause_tx, _pause_rx)               = tokio::sync::watch::channel(false);
-    let (shutdown_tx, mut shutdown_rx)       = tokio::sync::broadcast::channel::<()>(1);
+    let (pause_tx,  pause_rx)      = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
     // 5. DaemonState
     let state = Arc::new(Mutex::new(DaemonState {
@@ -79,16 +80,15 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to bind Unix socket")?;
     tracing::info!("Listening on {:?}", socket_path);
 
-    // 8. Signal handlers
+    // 8. Cleanup helper (used on graceful shutdown path)
     let cleanup = {
         let sp = socket_path.clone();
         move || {
             let _ = std::fs::remove_file(&sp);
-            tracing::info!("Socket removed");
         }
     };
 
-    // SIGINT
+    // 9. Signal handlers
     {
         let sp = socket_path.clone();
         let sd = shutdown_tx.clone();
@@ -100,8 +100,6 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(0);
         });
     }
-
-    // SIGTERM
     #[cfg(unix)]
     {
         let sp = socket_path.clone();
@@ -118,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 9. IPC server task
+    // 10. IPC server task (worker thread)
     {
         let state = Arc::clone(&state);
         let cache = Arc::clone(&cache);
@@ -130,9 +128,32 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 10. Renderer stub — wait for shutdown signal
-    tracing::info!("Renderer not started (Phase 4)");
-    let _ = shutdown_rx.recv().await;
+    // 11. Audio task — runs on a dedicated OS thread with its own runtime so
+    //     rodio::OutputStream never needs to be Send.
+    {
+        std::thread::Builder::new()
+            .name("audio".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("audio runtime");
+                if let Err(e) = rt.block_on(audio::run(ducking::start(), audio_rx, volume_rx, pause_rx)) {
+                    tracing::error!("Audio task: {}", e);
+                }
+            })
+            .context("Failed to spawn audio thread")?;
+    }
+
+    // 12. Renderer — must run on this thread (Wayland is not Send).
+    //     LocalSet pins the !Send future to the current thread.
+    eprintln!("DEBUG: about to start renderer");  // тимчасово
+    tracing::info!("Starting renderer");
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(renderer::run(renderer_rx, shutdown_rx))
+        .await
+        .context("Renderer error")?;
 
     cleanup();
     Ok(())

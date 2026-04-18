@@ -117,16 +117,59 @@ fn extract_pkg(pkg_path: &Path, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// ─── Direct (non-PKG) wallpaper parser ───────────────────────────────────────
+
+fn parse_direct_wallpaper(wallpaper_dir: &WallpaperDir) -> Result<Option<WallpaperInfo>> {
+    let project_json_path = wallpaper_dir.path.join("project.json");
+    if !project_json_path.exists() {
+        return Ok(None);
+    }
+
+    let json_content = std::fs::read_to_string(&project_json_path)?;
+    let project: ProjectJson = serde_json::from_str(&json_content)
+        .map_err(|e| crate::error::WpickError::Io(std::io::Error::other(e)))?;
+
+    if project.wallpaper_type.to_lowercase() != "video" {
+        return Ok(None);
+    }
+
+    let file_name = match &project.file {
+        Some(f) => f.clone(),
+        None    => return Ok(None),
+    };
+    let video_path = wallpaper_dir.path.join(&file_name);
+    if !video_path.exists() {
+        return Ok(None);
+    }
+
+    let preview_path = project
+        .preview
+        .as_ref()
+        .map(|p| wallpaper_dir.path.join(p).to_string_lossy().into_owned());
+
+    let file_size_bytes = std::fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
+
+    Ok(Some(WallpaperInfo {
+        id:              wallpaper_dir.id,
+        title:           project.title,
+        wallpaper_type:  WallpaperType::Video,
+        file_path:       video_path.to_string_lossy().into_owned(),
+        preview_path,
+        has_audio:       project.sound_enabled,
+        file_size_bytes,
+    }))
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Extract PKG (if stale) and parse project.json → WallpaperInfo.
 ///
-/// Returns `Ok(None)` when:
-/// - `scene.pkg` doesn't exist in the wallpaper dir
-/// - `wallpaper_type` is not "video" after parsing
-/// - `project.json` is missing after extraction
-/// - The file referenced in project.json doesn't exist on disk
+/// Two cases:
+/// 1. No `scene.pkg` → Video wallpapers store the mp4 directly in the dir.
+///    Parse project.json from the wallpaper dir itself.
+/// 2. `scene.pkg` exists → Extract (if stale), parse from cache dir.
 ///
+/// Returns `Ok(None)` when the wallpaper is not a supported Video type.
 /// Returns `Err` only on genuine I/O or corrupt PKG.
 pub fn extract_and_parse(
     wallpaper_dir: &WallpaperDir,
@@ -135,7 +178,8 @@ pub fn extract_and_parse(
     let pkg_path = wallpaper_dir.path.join("scene.pkg");
 
     if !pkg_path.exists() {
-        return Ok(None);
+        // Direct-file video wallpaper: project.json + mp4 in the same directory.
+        return parse_direct_wallpaper(wallpaper_dir);
     }
 
     // mtime check
