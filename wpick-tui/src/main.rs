@@ -20,6 +20,8 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Launch TUI (don't auto-start daemon)
+    Tui,
     /// List all wallpapers
     List,
     /// Set wallpaper by ID
@@ -30,7 +32,7 @@ enum Commands {
     Mute,
     /// Show wallpaper info
     Info { id: u64 },
-    /// Start daemon in background
+    /// Start daemon in foreground (replaces current process)
     Daemon,
     /// Kill daemon
     Kill,
@@ -47,21 +49,33 @@ async fn main() -> Result<()> {
     let dirs   = config.app_dirs().context("Failed to resolve app dirs")?;
 
     match cli.command {
-        None           => run_tui(config, dirs).await,
-        Some(cmd)      => run_cli(cmd, &dirs).await,
+        None => {
+            if !is_daemon_running(&dirs.socket_path).await {
+                start_daemon()?;
+                wait_for_socket(&dirs.socket_path, std::time::Duration::from_secs(3))
+                    .await
+                    .context("Daemon started but socket didn't appear within 3s")?;
+            }
+            run_tui(config, dirs).await
+        }
+        Some(cmd) => run_cli(cmd, config, dirs).await,
     }
 }
 
 // ── CLI mode ──────────────────────────────────────────────────────────────────
 
-async fn run_cli(cmd: Commands, dirs: &AppDirs) -> Result<()> {
-    // Daemon subcommand doesn't need a socket connection
-    if let Commands::Daemon = cmd {
-        std::process::Command::new("wpick-daemon")
-            .spawn()
-            .context("Failed to start wpick-daemon")?;
-        println!("\u{2713} Daemon started");
-        return Ok(());
+async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()> {
+    match cmd {
+        Commands::Tui => return run_tui(config, dirs).await,
+        Commands::Daemon => {
+            println!("Starting wpick-daemon in foreground...");
+            println!("Use 'wpick' (without arguments) to start daemon in background + TUI");
+            let err = std::os::unix::process::CommandExt::exec(
+                &mut std::process::Command::new("wpick-daemon"),
+            );
+            return Err(anyhow::anyhow!("Failed to exec wpick-daemon: {err}"));
+        }
+        _ => {}
     }
 
     let mut client = IpcClient::connect(&dirs.socket_path)
@@ -74,11 +88,13 @@ async fn run_cli(cmd: Commands, dirs: &AppDirs) -> Result<()> {
             println!("{:<14} {:<8} {:<6} TITLE", "ID", "TYPE", "AUDIO");
             println!("{}", "-".repeat(62));
             for w in &items {
-                println!("{:<14} {:<8} {:<6} {}",
+                println!(
+                    "{:<14} {:<8} {:<6} {}",
                     w.id,
                     w.wallpaper_type.to_string(),
                     if w.has_audio { "\u{266a}" } else { "-" },
-                    w.title);
+                    w.title
+                );
             }
             println!("\n{} wallpapers found", items.len());
         }
@@ -99,8 +115,6 @@ async fn run_cli(cmd: Commands, dirs: &AppDirs) -> Result<()> {
             println!("\u{2713} Mute toggled");
         }
 
-
-
         Commands::Info { id } => {
             match client.send(&ClientCommand::Info { id }).await? {
                 DaemonResponse::WallpaperInfo { item } => {
@@ -108,8 +122,7 @@ async fn run_cli(cmd: Commands, dirs: &AppDirs) -> Result<()> {
                     println!("Title: {}", item.title);
                     println!("Type:  {}", item.wallpaper_type);
                     println!("Audio: {}", if item.has_audio { "Yes" } else { "No" });
-                    println!("Size:  {:.1} MB",
-                        item.file_size_bytes as f64 / 1_048_576.0);
+                    println!("Size:  {:.1} MB", item.file_size_bytes as f64 / 1_048_576.0);
                     println!("File:  {}", item.file_path);
                 }
                 DaemonResponse::Error { message } => {
@@ -124,10 +137,45 @@ async fn run_cli(cmd: Commands, dirs: &AppDirs) -> Result<()> {
             println!("\u{2713} Daemon killed");
         }
 
-        Commands::Daemon => unreachable!("handled above"),
+        Commands::Tui | Commands::Daemon => unreachable!("handled above"),
     }
 
     Ok(())
+}
+
+// ── Daemon helpers ────────────────────────────────────────────────────────────
+
+/// Returns true if daemon is reachable on the socket.
+async fn is_daemon_running(socket_path: &std::path::Path) -> bool {
+    tokio::net::UnixStream::connect(socket_path).await.is_ok()
+}
+
+/// Spawns wpick-daemon as a detached background process.
+fn start_daemon() -> anyhow::Result<()> {
+    std::process::Command::new("wpick-daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn wpick-daemon. Is it in PATH?")?;
+    Ok(())
+}
+
+/// Polls socket path until it exists and is connectable, or timeout.
+async fn wait_for_socket(
+    socket_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if tokio::net::UnixStream::connect(socket_path).await.is_ok() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("Timeout waiting for daemon socket at {:?}", socket_path);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 // ── TUI mode ──────────────────────────────────────────────────────────────────
