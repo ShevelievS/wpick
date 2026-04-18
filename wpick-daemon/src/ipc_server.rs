@@ -121,23 +121,30 @@ async fn dispatch(
 
         ClientCommand::Volume { level } => {
             state.lock().await.set_volume(level);
+            let mut cfg = WpickConfig::load().unwrap_or_default();
+            cfg.general.volume = level.clamp(0.0, 1.0);
+            if let Err(e) = cfg.save() {
+                tracing::warn!("Config save failed: {}", e);
+            }
             DaemonResponse::Ok
         }
 
         ClientCommand::Mute => {
             state.lock().await.toggle_mute();
+            let (vol, muted) = {
+                let s = state.lock().await;
+                (s.volume, s.muted)
+            };
+            let mut cfg = WpickConfig::load().unwrap_or_default();
+            cfg.general.volume = vol;
+            cfg.general.muted  = muted;
+            if let Err(e) = cfg.save() {
+                tracing::warn!("Config save failed: {}", e);
+            }
             DaemonResponse::Ok
         }
 
-        ClientCommand::Pause => {
-            state.lock().await.set_paused(true);
-            DaemonResponse::Ok
-        }
 
-        ClientCommand::Resume => {
-            state.lock().await.set_paused(false);
-            DaemonResponse::Ok
-        }
 
         ClientCommand::Info { id } => {
             let guard = cache.lock().await;
