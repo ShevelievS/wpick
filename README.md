@@ -22,8 +22,8 @@ wpick-tui     — terminal UI: wallpaper browser, keyboard control
 | 1 | Foundation: config, error types, models | ✅ Done |
 | 2 | Data pipeline: Steam discovery, PKG extraction, SQLite cache, IPC types | ✅ Done |
 | 3 | Daemon core: IPC server, Unix socket, signal handling | ✅ Done |
-| 4 | Media: video decode (ffmpeg), audio (rodio), Wayland renderer (wgpu) | 🔄 In progress |
-| 5 | TUI: ratatui interface | ⬜ Planned |
+| 4 | Media: video decode (ffmpeg), audio (rodio), Wayland renderer (wgpu) | ✅ Done |
+| 5 | TUI: ratatui interface | ✅ Done |
 | 6 | Integration & release | ⬜ Planned |
 
 ## Requirements
