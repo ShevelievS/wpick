@@ -2,8 +2,6 @@
 
 A native Wayland live wallpaper manager for Wallpaper Engine (Steam) content, written in Rust.
 
-> **Status**: Phase 3 complete — IPC daemon working. Renderer in progress.
-
 ## What it does
 
 Plays Wallpaper Engine video wallpapers natively on Wayland without Wine or linux-wallpaperengine.
