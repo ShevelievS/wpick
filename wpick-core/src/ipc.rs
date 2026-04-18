@@ -14,8 +14,6 @@ pub enum ClientCommand {
     Set    { id: u64 },
     Volume { level: f32 },
     Mute,
-    Pause,
-    Resume,
     Info   { id: u64 },
     Kill,
 }
@@ -105,8 +103,6 @@ mod tests {
             ClientCommand::Set    { id: 42 },
             ClientCommand::Volume { level: 0.5 },
             ClientCommand::Mute,
-            ClientCommand::Pause,
-            ClientCommand::Resume,
             ClientCommand::Info   { id: 99 },
             ClientCommand::Kill,
         ];
