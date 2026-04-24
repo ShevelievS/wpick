@@ -90,15 +90,17 @@ impl Shared {
 // ─── Public handle ────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
-pub struct DuckHandle(Shared);
+pub struct DuckHandle {
+    shared: Option<Shared>,
+}
 
 impl DuckHandle {
     pub fn register_sink(&self, sink: Arc<rodio::Sink>, volume: f32) {
-        self.0.set_sink(sink, volume);
+        if let Some(ref s) = self.shared { s.set_sink(sink, volume); }
     }
 
     pub fn set_volume(&self, v: f32) {
-        self.0.set_volume(v);
+        if let Some(ref s) = self.shared { s.set_volume(v); }
     }
 }
 
@@ -106,21 +108,30 @@ impl DuckHandle {
 
 pub fn start() -> DuckHandle {
     let shared = Shared::new();
-    let handle = DuckHandle(shared.clone());
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+    let shared_clone = shared.clone();
     std::thread::Builder::new()
         .name("wpick-ducking".into())
         .spawn(move || {
-            if let Err(e) = pa_loop(shared) {
+            if let Err(e) = pa_loop(shared_clone, tx) {
                 tracing::warn!("Ducking loop: {}", e);
             }
         })
         .expect("ducking thread");
-    handle
+
+    match rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(_) => DuckHandle { shared: Some(shared) },
+        Err(_) => {
+            tracing::warn!("Ducking unavailable: PulseAudio not responding");
+            DuckHandle { shared: None }
+        }
+    }
 }
 
 // ─── PA mainloop ──────────────────────────────────────────────────────────────
 
-fn pa_loop(shared: Shared) -> anyhow::Result<()> {
+fn pa_loop(shared: Shared, connected_tx: std::sync::mpsc::SyncSender<()>) -> anyhow::Result<()> {
     let mut ml = Mainloop::new()
         .ok_or_else(|| anyhow::anyhow!("PA mainloop init failed"))?;
 
@@ -134,7 +145,7 @@ fn pa_loop(shared: Shared) -> anyhow::Result<()> {
     ctx.connect(None, CtxFlagSet::NOFLAGS, None)
         .map_err(|e| anyhow::anyhow!("PA connect failed: {:?}", e))?;
 
-    // Wait for Ready state
+    // Wait for Ready state; signal start() via channel once connected
     loop {
         match ml.iterate(false) {
             IterateResult::Quit(_) => anyhow::bail!("PA mainloop quit during connect"),
@@ -142,10 +153,14 @@ fn pa_loop(shared: Shared) -> anyhow::Result<()> {
             IterateResult::Success(_) => {}
         }
         match ctx.get_state() {
-            pulse::context::State::Ready      => break,
+            pulse::context::State::Ready => {
+                connected_tx.send(()).ok();
+                break;
+            }
             pulse::context::State::Failed
             | pulse::context::State::Terminated =>
                 anyhow::bail!("PA context failed to connect"),
+            // connected_tx is dropped when bail! returns, unblocking recv_timeout
             _ => {}
         }
     }
