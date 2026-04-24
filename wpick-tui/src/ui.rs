@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use wpick_core::model::{WallpaperInfo, WallpaperType};
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, FilterType};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     if frame.area().width < 80 || frame.area().height < 20 {
@@ -102,69 +102,107 @@ fn render_header(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 // ── List (left panel) ─────────────────────────────────────────────────────────
 
 fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
-    let title = format!("Wallpapers ({})", app.wallpapers.len());
-
-    let items: Vec<ListItem> = if app.loading {
-        app.list_state.select(None);
-        vec![ListItem::new(" Loading\u{2026}")]
-    } else if app.wallpapers.is_empty() {
-        app.list_state.select(None);
-        vec![ListItem::new(" No wallpapers found.")]
+    // Carve out one line above the list block for the live search bar
+    let (list_area, maybe_search_area) = if app.search_active {
+        let [search, list] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ]).areas(area);
+        (list, Some(search))
     } else {
-        let list_idx = wallpaper_idx_to_list_idx(&app.wallpapers, app.selected);
-        app.list_state.select(Some(list_idx));
-
-        let mut v: Vec<ListItem> = Vec::new();
-
-        let videos: Vec<&WallpaperInfo> = app.wallpapers.iter()
-            .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
-            .collect();
-        let others: Vec<&WallpaperInfo> = app.wallpapers.iter()
-            .filter(|w| !matches!(w.wallpaper_type, WallpaperType::Video))
-            .collect();
-
-        if !videos.is_empty() {
-            v.push(separator("  \u{2500}\u{2500} video \u{2500}\u{2500}"));
-            for w in &videos {
-                v.push(make_wallpaper_item(w, app.current_wallpaper_id));
-            }
-        }
-        if !others.is_empty() {
-            v.push(separator("  \u{2500}\u{2500} scene \u{00b7} web \u{2500}\u{2500}"));
-            for w in &others {
-                v.push(make_wallpaper_item(w, app.current_wallpaper_id));
-            }
-        }
-
-        v
+        (area, None)
     };
+
+    if let Some(sa) = maybe_search_area {
+        let text = format!("/ {}\u{2588}", app.search_query);
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(Color::Yellow))),
+            sa,
+        );
+    }
+
+    // Build title and items while holding the filtered borrow, then drop it
+    // before calling app.list_state.select() (avoids simultaneous mut + immut borrow)
+    let (title, items, maybe_list_idx) = {
+        let filtered = app.filtered_wallpapers();
+        let total = app.wallpapers.len();
+        let fc = filtered.len();
+
+        let title = match (&app.filter_type, app.search_query.is_empty()) {
+            (FilterType::All, true)  => format!("Wallpapers ({})", total),
+            (FilterType::All, false) => format!("Search: {} ({})", app.search_query, fc),
+            (f, true)                => format!("{:?} ({})", f, fc),
+            (f, false)               => format!("{:?}: {} ({})", f, app.search_query, fc),
+        };
+
+        if app.loading {
+            (title, vec![ListItem::new(" Loading\u{2026}")], None)
+        } else if filtered.is_empty() {
+            let msg = if app.wallpapers.is_empty() {
+                " No wallpapers found."
+            } else {
+                " No matches."
+            };
+            (title, vec![ListItem::new(msg)], None)
+        } else {
+            let idx = app.selected.min(filtered.len().saturating_sub(1));
+            let list_idx = filtered_wallpaper_idx_to_list_idx(&filtered, idx);
+
+            let mut v: Vec<ListItem> = Vec::new();
+
+            let videos: Vec<&WallpaperInfo> = filtered.iter()
+                .copied()
+                .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
+                .collect();
+            let others: Vec<&WallpaperInfo> = filtered.iter()
+                .copied()
+                .filter(|w| !matches!(w.wallpaper_type, WallpaperType::Video))
+                .collect();
+
+            if !videos.is_empty() {
+                v.push(separator("  \u{2500}\u{2500} video \u{2500}\u{2500}"));
+                for w in &videos {
+                    v.push(make_wallpaper_item(w, app.current_wallpaper_id));
+                }
+            }
+            if !others.is_empty() {
+                v.push(separator("  \u{2500}\u{2500} scene \u{00b7} web \u{2500}\u{2500}"));
+                for w in &others {
+                    v.push(make_wallpaper_item(w, app.current_wallpaper_id));
+                }
+            }
+
+            (title, v, Some(list_idx))
+        }
+        // `filtered` drops here, releasing the immutable borrow of app
+    };
+
+    app.list_state.select(maybe_list_idx);
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    frame.render_stateful_widget(list, list_area, &mut app.list_state);
 }
 
-fn wallpaper_idx_to_list_idx(wallpapers: &[WallpaperInfo], wp_idx: usize) -> usize {
-    let n_videos = wallpapers.iter()
+fn filtered_wallpaper_idx_to_list_idx(filtered: &[&WallpaperInfo], idx: usize) -> usize {
+    let n_videos = filtered.iter()
         .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
         .count();
 
-    let w = &wallpapers[wp_idx];
+    let w = filtered[idx];
     if matches!(w.wallpaper_type, WallpaperType::Video) {
-        let video_rank = wallpapers[..wp_idx].iter()
+        let video_rank = filtered[..idx].iter()
             .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
             .count();
-        // +1 for the "── video ──" separator at index 0
         1 + video_rank
     } else {
-        let non_video_rank = wallpapers[..wp_idx].iter()
+        let non_video_rank = filtered[..idx].iter()
             .filter(|w| !matches!(w.wallpaper_type, WallpaperType::Video))
             .count();
         let video_sep = if n_videos > 0 { 1 } else { 0 };
-        // video_sep + all_videos + 1 (scene·web separator) + rank
         video_sep + n_videos + 1 + non_video_rank
     }
 }
@@ -245,7 +283,8 @@ fn render_detail(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let content = match app.wallpapers.get(app.selected) {
+    let filtered = app.filtered_wallpapers();
+    let content = match filtered.get(app.selected) {
         None => Text::raw(""),
         Some(w) => match &w.preview_path {
             Some(path) => {
@@ -271,8 +310,9 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let w = match app.wallpapers.get(app.selected) {
-        Some(w) => w,
+    let filtered = app.filtered_wallpapers();
+    let w = match filtered.get(app.selected) {
+        Some(w) => *w,
         None    => return,
     };
 
@@ -339,7 +379,8 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
         key("+/-"),                 lbl(" vol  "),
         mkey,                       lbl(" mute  "),
         key("r"),                   lbl(" refresh  "),
-        key("/"),                   lbl(" search"),
+        key("/"),                   lbl(" search  "),
+        key("Tab"),                 lbl(" filter"),
     ]);
     let line2 = Line::from(vec![
         key("i"),     lbl(" detail  "),

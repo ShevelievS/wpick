@@ -110,8 +110,12 @@ pub async fn run(
     mut wallpaper_rx: tokio::sync::watch::Receiver<Option<WallpaperInfo>>,
     mut volume_rx:    tokio::sync::watch::Receiver<(f32, bool)>,
 ) -> anyhow::Result<()> {
+    tracing::info!("Audio task started");
+
     let (_output_stream, stream_handle) = rodio::OutputStream::try_default()
         .map_err(|e| anyhow::anyhow!("Audio output init failed: {}", e))?;
+
+    tracing::info!("Audio OutputStream ready");
 
     let mut current_sink: Option<Arc<rodio::Sink>> = None;
 

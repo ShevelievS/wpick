@@ -124,11 +124,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 11. Audio task — dedicated OS thread (rodio OutputStream is !Send)
+    // ducking::start() is called here so PulseAudio init doesn't block the
+    // main thread and a slow/absent PA doesn't delay IPC or renderer startup
     {
-        let duck = ducking::start();
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
+                let duck = ducking::start();
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

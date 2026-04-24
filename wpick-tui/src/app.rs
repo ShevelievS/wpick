@@ -7,10 +7,18 @@ use std::io::Stdout;
 use std::time::Duration;
 use wpick_core::config::{AppDirs, WpickConfig};
 use wpick_core::ipc::{ClientCommand, DaemonResponse};
-use wpick_core::model::WallpaperInfo;
+use wpick_core::model::{WallpaperInfo, WallpaperType};
 
 use crate::client::IpcClient;
 use crate::ui;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterType {
+    All,
+    Video,
+    Scene,
+    Web,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -34,6 +42,9 @@ pub struct App {
     pub loading:                 bool,
     pub should_quit:             bool,
     pub last_reconnect_attempt:  Option<std::time::Instant>,
+    pub search_query:            String,
+    pub search_active:           bool,
+    pub filter_type:             FilterType,
 }
 
 impl App {
@@ -54,6 +65,9 @@ impl App {
             loading:                 false,
             should_quit:             false,
             last_reconnect_attempt:  None,
+            search_query:            String::new(),
+            search_active:           false,
+            filter_type:             FilterType::All,
         }
     }
 
@@ -69,8 +83,25 @@ impl App {
         self.status_clear_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
     }
 
+    pub fn filtered_wallpapers(&self) -> Vec<&WallpaperInfo> {
+        self.wallpapers.iter().filter(|w| {
+            let type_ok = match self.filter_type {
+                FilterType::All   => true,
+                FilterType::Video => matches!(w.wallpaper_type, WallpaperType::Video),
+                FilterType::Scene => matches!(w.wallpaper_type, WallpaperType::Scene),
+                FilterType::Web   => matches!(w.wallpaper_type, WallpaperType::Web),
+            };
+            let search_ok = if self.search_query.is_empty() {
+                true
+            } else {
+                w.title.to_lowercase().contains(&self.search_query.to_lowercase())
+            };
+            type_ok && search_ok
+        }).collect()
+    }
+
     fn select_next(&mut self) {
-        let len = self.wallpapers.len();
+        let len = self.filtered_wallpapers().len();
         if len > 0 {
             self.selected = (self.selected + 1).min(len - 1);
             self.list_state.select(Some(self.selected));
@@ -116,6 +147,34 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) {
+        if self.search_active {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.cmd_kill().await;
+                self.should_quit = true;
+                return;
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.search_active = false;
+                }
+                KeyCode::Backspace => {
+                    if self.search_query.pop().is_some() {
+                        self.selected = 0;
+                        let empty = self.filtered_wallpapers().is_empty();
+                        self.list_state.select(if empty { None } else { Some(0) });
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.search_query.push(c);
+                    self.selected = 0;
+                    let empty = self.filtered_wallpapers().is_empty();
+                    self.list_state.select(if empty { None } else { Some(0) });
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -143,7 +202,7 @@ impl App {
             KeyCode::Char('-') => {
                 self.cmd_volume_down().await;
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('m') => {
                 self.cmd_mute().await;
             }
             KeyCode::Char('r') => {
@@ -155,12 +214,30 @@ impl App {
                     AppMode::Detail => AppMode::Browse,
                 };
             }
+            KeyCode::Char('/') => {
+                self.search_active = true;
+                self.search_query = String::new();
+                self.selected = 0;
+                let empty = self.filtered_wallpapers().is_empty();
+                self.list_state.select(if empty { None } else { Some(0) });
+            }
+            KeyCode::Tab => {
+                self.filter_type = match self.filter_type {
+                    FilterType::All   => FilterType::Video,
+                    FilterType::Video => FilterType::Scene,
+                    FilterType::Scene => FilterType::Web,
+                    FilterType::Web   => FilterType::All,
+                };
+                self.selected = 0;
+                let empty = self.filtered_wallpapers().is_empty();
+                self.list_state.select(if empty { None } else { Some(0) });
+            }
             _ => {}
         }
     }
 
     async fn cmd_set(&mut self) {
-        let id = match self.wallpapers.get(self.selected) {
+        let id = match self.filtered_wallpapers().get(self.selected) {
             Some(w) => w.id,
             None => return,
         };
@@ -212,21 +289,23 @@ impl App {
 
     pub async fn refresh_list(&mut self) {
         self.loading = true;
-        let prev_id = self.wallpapers.get(self.selected).map(|w| w.id);
+        let prev_id = self.filtered_wallpapers().get(self.selected).map(|w| w.id);
 
-        match self.send(ClientCommand::List).await {
+        match self.send(ClientCommand::Scan).await {
             Ok(DaemonResponse::WallpaperList { items }) => {
                 self.wallpapers = items;
                 if let Some(id) = prev_id {
-                    if let Some(pos) = self.wallpapers.iter().position(|w| w.id == id) {
+                    if let Some(pos) = self.filtered_wallpapers().iter().position(|w| w.id == id) {
                         self.selected = pos;
-                        self.list_state.select(if self.wallpapers.is_empty() { None } else { Some(self.selected) });
+                        let empty = self.filtered_wallpapers().is_empty();
+                        self.list_state.select(if empty { None } else { Some(pos) });
                         self.loading = false;
                         return;
                     }
                 }
-                self.selected = self.selected.min(self.wallpapers.len().saturating_sub(1));
-                self.list_state.select(if self.wallpapers.is_empty() { None } else { Some(self.selected) });
+                let filtered_len = self.filtered_wallpapers().len();
+                self.selected = self.selected.min(filtered_len.saturating_sub(1));
+                self.list_state.select(if filtered_len == 0 { None } else { Some(self.selected) });
             }
             Ok(DaemonResponse::Error { message }) => {
                 self.set_status_error(message);

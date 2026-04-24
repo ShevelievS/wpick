@@ -22,6 +22,7 @@ pub async fn run(
     cache:    Arc<Mutex<Cache>>,
     dirs:     AppDirs,
 ) -> anyhow::Result<()> {
+
     loop {
         let (stream, _) = listener.accept().await?;
         let state = Arc::clone(&state);
@@ -75,25 +76,17 @@ async fn dispatch(
 ) -> DaemonResponse {
     match cmd {
         ClientCommand::List => {
-            let count = {
-                let guard = cache.lock().await;
-                match guard.count() {
-                    Ok(n)  => n,
-                    Err(e) => return DaemonResponse::Error { message: e.to_string() },
-                }
-            };
+            let guard = cache.lock().await;
+            match guard.get_all() {
+                Ok(items) => DaemonResponse::WallpaperList { items },
+                Err(e)    => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
 
-            if count == 0 {
-                match scan_and_populate(Arc::clone(cache), (*dirs).clone()).await {
-                    Ok(items)  => DaemonResponse::WallpaperList { items },
-                    Err(e)     => DaemonResponse::Error { message: e.to_string() },
-                }
-            } else {
-                let guard = cache.lock().await;
-                match guard.get_all() {
-                    Ok(items)  => DaemonResponse::WallpaperList { items },
-                    Err(e)     => DaemonResponse::Error { message: e.to_string() },
-                }
+        ClientCommand::Scan => {
+            match scan_and_populate(Arc::clone(cache), (*dirs).clone()).await {
+                Ok(items) => DaemonResponse::WallpaperList { items },
+                Err(e)    => DaemonResponse::Error { message: e.to_string() },
             }
         }
 
@@ -184,7 +177,7 @@ async fn scan_and_populate(
         for wd in wallpaper_dirs {
             match wpick_core::pkg::extract_and_parse(&wd, &dirs.wallpapers_dir) {
                 Ok(Some(info)) => {
-                    let mtime = std::fs::metadata(wd.path.join("scene.pkg"))
+                    let mtime = std::fs::metadata(wd.path.join("project.json"))
                         .and_then(|m| m.modified())
                         .map(|t| {
                             t.duration_since(UNIX_EPOCH)
@@ -207,7 +200,13 @@ async fn scan_and_populate(
             }
         }
 
-        Ok::<Vec<WallpaperInfo>, anyhow::Error>(results)
+        let active_ids: Vec<u64> = results.iter().map(|w| w.id).collect();
+        if let Err(e) = cache_guard.prune(&active_ids) {
+            tracing::warn!("Cache prune failed: {}", e);
+        }
+
+        let all = cache_guard.get_all().context("get_all after scan")?;
+        Ok::<Vec<WallpaperInfo>, anyhow::Error>(all)
     })
     .await?
 }

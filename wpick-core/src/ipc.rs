@@ -11,6 +11,7 @@ use crate::model::WallpaperInfo;
 #[serde(tag = "type")]
 pub enum ClientCommand {
     List,
+    Scan,
     Set    { id: u64 },
     Volume { level: f32 },
     Mute,
@@ -100,6 +101,7 @@ mod tests {
     fn test_all_client_commands_roundtrip() -> crate::error::Result<()> {
         let commands = vec![
             ClientCommand::List,
+            ClientCommand::Scan,
             ClientCommand::Set    { id: 42 },
             ClientCommand::Volume { level: 0.5 },
             ClientCommand::Mute,
@@ -115,6 +117,7 @@ mod tests {
 
         // Spot-check wire format
         assert_eq!(serde_json::to_string(&ClientCommand::List)?, r#"{"type":"List"}"#);
+        assert_eq!(serde_json::to_string(&ClientCommand::Scan)?, r#"{"type":"Scan"}"#);
         assert_eq!(serde_json::to_string(&ClientCommand::Set { id: 42 })?, r#"{"type":"Set","id":42}"#);
         assert_eq!(serde_json::to_string(&ClientCommand::Volume { level: 0.5 })?, r#"{"type":"Volume","level":0.5}"#);
 
