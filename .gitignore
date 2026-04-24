@@ -1,3 +1,13 @@
 /target
 .env
 *.log
+.md
+/skills/
+/docs/
+
+# Internal process files
+/PROMPTS.md
+/PROMPTS_V0.2.md
+/SEQUENCE.md
+/ERRORS_TO_AVOID.md
+/COMPAT.md
