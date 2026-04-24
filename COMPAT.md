@@ -1,192 +1,154 @@
-# COMPAT.md — Версії крейтів що точно працюють разом
+# COMPAT.md — version compatibility
 
-> Це найважливіший файл для уникнення втрат часу на версійні конфлікти.  
-> raw-window-handle — найчастіша причина проблем: він повинен бути однаковим  
-> у всіх крейтах що торкаються Wayland/wgpu.
-
----
-
-## Перевірена комбінація (MVP)
-
-```toml
-# Workspace root Cargo.toml
-[workspace.dependencies]
-serde       = { version = "1",      features = ["derive"] }
-serde_json  = "1"
-thiserror   = "2"
-anyhow      = "1"
-tokio       = { version = "1",      features = ["full"] }
-tracing     = "0.1"
-
-# wpick-core
-toml              = "0.8"
-dirs              = "5"
-rusqlite          = { version = "0.32", features = ["bundled"] }
-keyvalues-serde   = "0.2"
-walkdir           = "2"
-# depkg: перевір актуальну версію на crates.io (може бути під іншою назвою)
-# Fallback: реалізувати парсер вручну за форматом PKGV0001/PKGV0005
-
-# wpick-daemon
-wayland-client          = "0.31"
-wayland-protocols-wlr   = { version = "0.3", features = ["client"] }
-wgpu                    = "22"
-raw-window-handle       = "0.6"      # ← МАЄ збігатися з тим що використовує wgpu 22
-bytemuck                = { version = "1", features = ["derive"] }
-ffmpeg-next             = "8"        # потребує system ffmpeg 8.x (Arch 2025+); для ffmpeg 7.x використовуй "7"
-rodio                   = "0.19"
-parking_lot             = "0.12"
-tracing-subscriber      = { version = "0.3", features = ["env-filter"] }
-tracing-appender        = "0.2"
-
-# wpick-tui
-ratatui     = "0.29"
-crossterm   = "0.28"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-```
+> Verified version combinations for building wpick. If a dependency
+> is missing here, it's not a hard pin — add it in `Cargo.toml` at a
+> reasonable version and document the result in this file.
 
 ---
 
-## Критичні залежності версій
+## Workspace
 
-### raw-window-handle ↔ wgpu
-
-| wgpu | raw-window-handle | Статус |
-|------|------------------|--------|
-| 22.x | 0.6 | ✅ Перевірено |
-| 21.x | 0.6 | ✅ |
-| 20.x | 0.6 | ✅ |
-| 19.x | 0.5 | ⚠️ Старе API |
-| 23.x | 0.6 | 🔍 Ймовірно ОК — перевір при появі |
-
-**Правило**: Перевіряй `wgpu/Cargo.toml` на GitHub щоб знати яку версію rwh очікує.
-
-### wayland-client ↔ wayland-protocols-wlr
-
-| wayland-client | wayland-protocols-wlr | Статус |
-|----------------|----------------------|--------|
-| 0.31 | 0.3 | ✅ |
-| 0.30 | 0.2 | ✅ але застарілі |
-| 0.31 | 0.2 | ❌ не сумісні |
-
-### ratatui ↔ crossterm
-
-| ratatui | crossterm | Статус |
-|---------|-----------|--------|
-| 0.29 | 0.28 | ✅ |
-| 0.28 | 0.27 | ✅ |
-| 0.29 | 0.27 | ❌ |
+| Setting          | Value                                |
+|------------------|--------------------------------------|
+| Rust edition     | `2021`                               |
+| MSRV             | `1.75`                               |
+| Tokio runtime    | `multi_thread` for daemon, `full` for TUI |
+| License          | `MIT OR Apache-2.0`                  |
 
 ---
 
-## Як перевірити конфлікти до build
+## Third-party crate versions (v0.2.0)
 
-```bash
-# Перевірка дерева залежностей:
-cargo tree -p wpick-daemon | grep raw-window-handle
-# Всі рядки мають показувати ОДНАКОВУ версію rwh
+### wpick-core
 
-# Перевірка дублікатів:
-cargo tree --duplicates
-# Ідеально: порожній вивід
-# Прийнятно: дублікати тільки по patch версіях (0.6.0 vs 0.6.1)
-# Проблема: дублікати по minor версіях (0.5.x vs 0.6.x)
-```
+| Crate              | Version | Features                             | Notes                                         |
+|--------------------|---------|--------------------------------------|-----------------------------------------------|
+| `thiserror`        | `1`     | —                                    |                                               |
+| `serde`            | `1`     | `derive`                             |                                               |
+| `serde_json`       | `1`     | —                                    |                                               |
+| `keyvalues-serde`  | `0.2`   | —                                    | Steam VDF parser                              |
+| `toml`             | `0.8`   | —                                    |                                               |
+| `rusqlite`         | `0.31`  | `bundled`                            | Bundled so we don't fight libsqlite versions |
+| `tokio`            | `1`     | `io-util`, `fs`, `sync`, `macros`    | Narrow subset — core is a library             |
+| `tracing`          | `0.1`   | —                                    |                                               |
+| `dirs`             | `5`     | —                                    | XDG path resolution                           |
+| `flate2`           | `1`     | —                                    | Used by some PKG variants                     |
+| `byteorder`        | `1`     | —                                    | PKG header parsing                            |
 
----
+Dev:
 
-## Проблема з depkg
+| Crate       | Version | Features                        |
+|-------------|---------|---------------------------------|
+| `tempfile`  | `3`     | —                               |
+| `tokio`     | `1`     | `macros`, `rt`, `io-util`       |
 
-На момент написання специфікації, `depkg` може бути:
-- Назва крейту відрізняється
-- Не опублікований на crates.io
-- Тільки як git dependency
+### wpick-daemon
 
-**Пошук:**
-```bash
-cargo search wallpaper
-cargo search pkgv
-```
+| Crate                      | Version | Features                                                        | Notes                       |
+|----------------------------|---------|-----------------------------------------------------------------|------------------------------|
+| `wpick-core`               | path    | —                                                               |                              |
+| `anyhow`                   | `1`     | —                                                               |                              |
+| `tokio`                    | `1`     | `full`                                                          |                              |
+| `tracing`                  | `0.1`   | —                                                               |                              |
+| `tracing-subscriber`       | `0.3`   | `env-filter`, `fmt`                                             |                              |
+| `tracing-appender`         | `0.2`   | —                                                               | File rotation (standalone)   |
+| `wayland-client`           | `0.31`  | —                                                               |                              |
+| `wayland-protocols`        | `0.31`  | `client`, `staging`                                             | xdg-output lives in staging  |
+| `wayland-protocols-wlr`    | `0.2`   | `client`                                                        | layer-shell                  |
+| `raw-window-handle`        | `0.6`   | —                                                               |                              |
+| `wgpu`                     | `0.20`  | `wgsl`                                                          | Default backends: Vulkan + GL|
+| `pollster`                 | `0.3`   | —                                                               | Block on wgpu init futures   |
+| `bytemuck`                 | `1`     | `derive`                                                        | Uniform buffer pod           |
+| `ffmpeg-next`              | `8`     | —                                                               | See §System ffmpeg below     |
+| `rodio`                    | `0.19`  | `wav`, `vorbis`, `flac`, `mp3`, `symphonia-all`, `no-default-features` | symphonia-all = broad codec support |
+| `libpulse-binding`         | `2`     | —                                                               | Ducking (v0.2 unchanged)     |
+| `libpulse-simple-binding`  | `2`     | —                                                               |                              |
 
-**Fallback — самостійна реалізація PKG парсера:**
+Dev:
 
-Формат PKGV0001 (спрощено):
-```
-Magic: "PKGV0001" або "PKGV0005" (8 bytes)
-Header: кількість файлів (u32 little-endian)
-Для кожного файлу:
-  - filename length (u32 le)
-  - filename (UTF-8 bytes)
-  - file data length (u32 le)
-  - file data (bytes)
-```
+| Crate       | Version |
+|-------------|---------|
+| `tempfile`  | `3`     |
 
-Мінімальна реалізація:
-```rust
-pub fn extract_pkg(pkg_path: &Path, out_dir: &Path) -> anyhow::Result<()> {
-    let data = std::fs::read(pkg_path)?;
-    let magic = &data[0..8];
-    
-    anyhow::ensure!(
-        magic == b"PKGV0001" || magic == b"PKGV0005",
-        "Not a valid PKG file: {:?}", pkg_path
-    );
-    
-    let mut pos = 8usize;
-    let file_count = u32::from_le_bytes(data[pos..pos+4].try_into()?) as usize;
-    pos += 4;
-    
-    for _ in 0..file_count {
-        let name_len = u32::from_le_bytes(data[pos..pos+4].try_into()?) as usize;
-        pos += 4;
-        let name = std::str::from_utf8(&data[pos..pos+name_len])?;
-        pos += name_len;
-        
-        let data_len = u32::from_le_bytes(data[pos..pos+4].try_into()?) as usize;
-        pos += 4;
-        let file_data = &data[pos..pos+data_len];
-        pos += data_len;
-        
-        let out_path = out_dir.join(name);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&out_path, file_data)?;
-    }
-    
-    Ok(())
-}
-```
+### wpick-tui
 
-**Увага**: Реальний формат складніший — textures (.tex) потребують конвертації.  
-Якщо `depkg` не знайдено, шукай `wpengine` або `we_pkg` на crates.io.
+| Crate                | Version | Features                       | Notes                           |
+|----------------------|---------|--------------------------------|---------------------------------|
+| `wpick-core`         | path    | —                              |                                 |
+| `anyhow`             | `1`     | —                              |                                 |
+| `clap`               | `4`     | `derive`, `env`                |                                 |
+| `clap_complete`      | `4`     | —                              | **v0.2** — shell completions    |
+| `clap_mangen`        | `0.2`   | —                              | **v0.2** — man page generation  |
+| `tokio`              | `1`     | `full`                         |                                 |
+| `tracing`            | `0.1`   | —                              |                                 |
+| `tracing-subscriber` | `0.3`   | `env-filter`, `fmt`            |                                 |
+| `ratatui`            | `0.28`  | —                              |                                 |
+| `crossterm`          | `0.28`  | —                              | Must match ratatui's crossterm  |
 
 ---
 
-## System ffmpeg версії
+## System ffmpeg
 
-| ffmpeg-next | System ffmpeg | Статус |
-|-------------|---------------|--------|
-| 8.x | 8.x | ✅ Перевірено (Arch 2025) |
-| 7.x | 7.x, 6.x | ✅ |
-| 6.x | 6.x, 5.x | ✅ |
-| 7.x | 8.x | ❌ avfft.h removed, struct size mismatch |
-| 7.x | 4.x | ❌ |
+`ffmpeg-next` is pinned to major version `8`. This requires ffmpeg
+**8.x** headers and libraries at build time.
 
-```bash
-# Перевірка версії system ffmpeg:
-ffmpeg -version | head -1
-pkg-config --modversion libavcodec
-```
+| Distro                     | ffmpeg version in 2026 | Compatible pin          |
+|----------------------------|-------------------------|--------------------------|
+| Arch Linux                 | 8.x                     | `ffmpeg-next = "8"`     |
+| NixOS unstable             | 8.x                     | `ffmpeg-next = "8"`     |
+| Ubuntu 24.04 LTS           | 6.x                     | pin to `"6"` (rebuild)  |
+| Ubuntu 25.10+              | 7.x                     | pin to `"7"` (rebuild)  |
+| Fedora 40+                 | 7.x                     | pin to `"7"` (rebuild)  |
+| Debian 12 stable           | 5.x                     | unsupported — backport or use AppImage |
 
-Arch Linux завжди має останній ffmpeg — зазвичай 7.x.  
-Ubuntu LTS може мати старіший — використовуй PPA або збирай вручну.
+See `ERRORS_TO_AVOID.md` E-26 for what a version mismatch looks like
+and how to recover.
 
 ---
 
-## Оновлення версій
+## Verified combinations (2026-04)
 
-При оновленні будь-якого крейту з цієї таблиці:
-1. Запусти `cargo tree --duplicates` — перевір нові конфлікти
-2. Оновлюй версії в парі (наприклад, wgpu + raw-window-handle разом)
-3. Зафіксуй нову перевірену комбінацію в цьому файлі
+| OS                  | Kernel  | Compositor | GPU          | ffmpeg | Rust    | Status                |
+|---------------------|---------|------------|---------------|--------|---------|-----------------------|
+| Arch Linux          | 6.13    | Hyprland   | AMD RDNA3     | 8.0    | 1.86    | ✅ primary dev target |
+| Arch Linux          | 6.13    | Hyprland   | NVIDIA 565+   | 8.0    | 1.86    | ✅ (tested)           |
+| Arch Linux          | 6.13    | Sway       | AMD RDNA3     | 8.0    | 1.86    | ✅ (tested)           |
+| NixOS unstable      | 6.13    | Hyprland   | AMD RDNA3     | 8.0    | 1.86    | ✅ (flake build)      |
+| Fedora 40           | 6.11    | Hyprland   | Intel Arc     | 7.0    | 1.83    | ⚠  rebuild with ffmpeg-next="7" |
+| Ubuntu 24.04 LTS    | 6.8     | Hyprland   | NVIDIA 550    | 6.0    | 1.78    | ⚠  rebuild with ffmpeg-next="6" |
+
+Update this table whenever a combination is tested.
+
+---
+
+## Breaking protocol versions
+
+`wpick` communicates with two unstable Wayland extensions:
+
+| Protocol                   | Version  | Used for                              |
+|----------------------------|----------|----------------------------------------|
+| `zwlr_layer_shell_v1`      | v4+      | Layer-shell wallpaper surface          |
+| `zxdg_output_manager_v1`   | v3+      | Fallback for `wl_output` name         |
+| `wl_output`                | v4+      | Preferred; has `name` event           |
+
+Compositors:
+
+- **Hyprland** — tested with 0.46+. Fullscreen IPC uses socket2 protocol.
+- **Sway** — tested with 1.10+. No fullscreen IPC integration (pause
+  source `on_fullscreen` becomes a no-op).
+- **river** — tested briefly; appears to work, not a CI target.
+- **GNOME Mutter** — not supported (no layer-shell).
+- **KDE KWin** — not supported (no layer-shell).
+
+---
+
+## Breaking IPC versions
+
+v0.2 adds an optional `monitor` field to `ClientCommand::Set`.
+Because `#[serde(default)]` makes the field optional, v0.1 client
+payloads still deserialise. We do **not** version-stamp IPC
+messages; the contract is implicit via serde defaults.
+
+Going forward, all new fields must be additive and default-able.
+Breaking the wire requires a major version bump (v1.0) and a
+compat shim.

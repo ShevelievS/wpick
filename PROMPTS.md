@@ -1,388 +1,604 @@
-# PROMPTS.md — Готові промпти для Claude Code
+# PROMPTS_V0.2.md — Claude Code prompts for v0.2.0
 
-> Копіюй промпт для потрібного блоку, вставляй в Claude Code.  
-> Кожен промпт вже включає всі необхідні обмеження.  
-> НЕ додавай "будь ласка" або розширені пояснення — промпти вже оптимальні.
-
----
-
-## Як використовувати
-
-```
-1. Відкрий потрібний промпт нижче
-2. Перевір що відповідні .md файли відкриті в контексті
-3. Вставляй ПОВНІСТЮ — не скорочуй
-4. Якщо Claude Code зробив не те — використай промпт-корекцію внизу блоку
-```
+> Copy-paste prompts, one per block. Each prompt is self-contained and
+> tells Claude Code exactly which files to read, what to change, and
+> what the gate is. Blocks 18–26 in `SEQUENCE.md` map 1:1 to sections
+> below.
+>
+> Use `PROMPTS.md` for v0.1 blocks (0–17); that file is unchanged.
 
 ---
 
-## Блок 0 — Scaffold
+## Block 18 — Extended config schema
 
 ```
-Контекст: wpick — Rust Wayland live wallpaper manager.
+Контекст: wpick v0.2.0, Block 18 — расширение config schema.
+Читай целиком: docs/PROJECT.md, docs/CORE.md §config.rs,
+skills/wpick-core.md, COMPAT.md, ERRORS_TO_AVOID.md, docs/CONFIG.md.
 
-Прочитай skills/wpick-scaffold.md повністю.
+Цель: расширить WpickConfig до схемы, которая покроет multi-monitor,
+pause triggers, streaming audio, autostart.
 
-Виконай наступне ТОЧНО за інструкцією в skills/wpick-scaffold.md:
-1. Створи root Cargo.toml з workspace конфігурацією і [workspace.dependencies]
-2. Створи wpick-core як lib crate з Cargo.toml і src/lib.rs (тільки pub mod + pub use)
-3. Створи wpick-tui як bin crate, binary name "wpick", з Cargo.toml і порожніми src/{app,ui,client}.rs
-4. Створи wpick-daemon як bin crate, binary name "wpick-daemon", з Cargo.toml і порожніми src/{state,ipc_server,renderer,video,audio}.rs
+Реализуй в wpick-core/src/config.rs:
 
-Після кожного файлу запускай: cargo check --workspace
+1. Новые структуры (все с #[serde(default)] на уровне struct):
+   - FitMode { Fill, Fit, Stretch, Center } с
+     #[serde(rename_all = "lowercase")], Default = Fill.
+   - MonitorConfig { wallpaper_id: Option<u64>, fit: FitMode, mute: bool }
+   - PauseConfig { on_fullscreen, on_battery, on_lid_close }
+   - AudioConfig { chunk_frames, max_preload_mb, ducking_enabled }
 
-Фінальна перевірка:
-- grep "anyhow" wpick-core/Cargo.toml → має бути порожньо
-- grep "wpick-daemon" wpick-tui/Cargo.toml → має бути порожньо
-```
+2. Defaults:
+   - PauseConfig::default() → on_fullscreen: true, остальное false.
+   - AudioConfig::default() → chunk_frames: 2048, max_preload_mb: 50,
+     ducking_enabled: true.
+   - FitMode::default() → Fill.
+   - autostart: false.
 
----
+3. Добавь в WpickConfig:
+   pub monitors:  HashMap<String, MonitorConfig>,
+   pub pause:     PauseConfig,
+   pub audio:     AudioConfig,
+   pub autostart: bool,
 
-## Блок 1 — error.rs + model.rs
+   Все с #[serde(default)]. Это критично — без этого старые config.toml
+   сломаются.
 
-```
-Контекст: wpick-core library crate.
-Прочитай: CORE.md §error.rs, CORE.md §model.rs, ERRORS.md §"WpickError — Complete Definition"
+4. Тесты (в том же файле):
+   - test_default_config_volume (уже есть — не трогай)
+   - test_save_and_reload расширь: новые поля должны round-trip-нуться.
+   - Новый test_v01_config_forward_compat: запиши минимальный TOML
+     (только [general]), загрузи, проверь что monitors пуст,
+     pause.on_fullscreen = true, audio.chunk_frames = 2048.
+   - Новый test_v02_full_config_roundtrip: полный TOML со всеми
+     секциями → save → load → identical.
 
-Реалізуй wpick-core/src/error.rs:
-- Повний WpickError enum з усіма варіантами за CORE.md
-- #[from] тільки для: std::io::Error, rusqlite::Error, serde_json::Error, toml::de::Error
-- pub type Result<T> = std::result::Result<T, WpickError>
-- Жодного anyhow
+5. Обнови skills/wpick-core.md §config.rs — добавь подсекцию
+   "v0.2 extended schema" со всеми новыми структурами и defaults.
 
-Реалізуй wpick-core/src/model.rs:
-- WallpaperType enum з #[serde(rename_all = "lowercase")]
-- WallpaperInfo struct з усіма полями за CORE.md
-- impl WallpaperType: Display
-- impl WallpaperInfo: type_icon() -> &'static str, is_supported() -> bool
+6. Обнови docs/CORE.md §config.rs если расхождение со спецификацией.
 
-Запусти: cargo check -p wpick-core
-Очікувано: 0 errors, допустимі warnings про unused
-```
+7. Обнови docs/CONFIG.md если где-то расходится с реализацией (должно
+   уже совпадать — сверь).
 
----
+Gate:
+  cargo test -p wpick-core config::tests → все зелёные
+  cargo test -p wpick-core → регрессии отсутствуют
+  cargo clippy -p wpick-core -- -D warnings → 0
 
-## Блок 2 — config.rs
-
-```
-Контекст: wpick-core library crate.
-Прочитай: CORE.md §config.rs повністю, особливо "Implementation Notes"
-
-Реалізуй wpick-core/src/config.rs:
-- WpickConfig, GeneralConfig, PathsConfig, WaylandConfig з #[serde(default)]
-- GeneralConfig::default() → volume: 0.8, muted: false
-- AppDirs struct з усіма 6 полями
-- WpickConfig::load() → читає ~/.config/wpick/config.toml, повертає Default якщо нема файлу
-- WpickConfig::save() → атомарний запис через .tmp + rename
-- WpickConfig::app_dirs() → обчислює всі шляхи через dirs crate, викликає create_dir_all
-
-Важливо: socket_path = HOME/.wpick.sock (не в підпапці)
-
-Напиши unit test:
-#[test] fn test_config_default_volume() — перевіряє що default volume = 0.8
-
-Запусти: cargo test -p wpick-core
+Новые ошибки → в ERRORS_TO_AVOID.md (E-28+) ДО исправления.
 ```
 
 ---
 
-## Блок 3 — discovery.rs
+## Block 19 — Frame buffer reuse
 
 ```
-Контекст: wpick-core library crate.
-Прочитай: CORE.md §discovery.rs повністю, включаючи "VDF Parsing" і "Edge cases"
+Контекст: wpick v0.2.0, Block 19 — оптимизация video.rs (frame buffer reuse).
+Читай: skills/wpick-daemon.md §video.rs, docs/DAEMON.md §video.rs,
+ERRORS_TO_AVOID.md (E-10, E-11, E-15), wpick-daemon/src/video.rs,
+wpick-daemon/src/renderer.rs.
 
-Реалізуй wpick-core/src/discovery.rs:
-- pub struct WallpaperDir { pub id: u64, pub path: PathBuf }
-- pub fn find_wallpaper_dirs(config: &WpickConfig) -> crate::Result<Vec<WallpaperDir>>
+Проблема: next_frame_rgba() делает rgba.data(0).to_vec() на каждый кадр.
+При 1920×1080@30fps это ~240 МБ/с allocator churn.
 
-Алгоритм пошуку Steam root: 5 стандартних шляхів + config.paths.extra_steam_libraries
-Парсинг VDF: keyvalues_serde::from_str з LibraryFolders/LibraryEntry structs
-Шлях до обоїв: {library_path}/steamapps/workshop/content/431960/
+Изменения в wpick-daemon/src/video.rs:
 
-Edge cases (не panic, не error — просто skip + tracing::warn):
-- VDF не існує → skip
-- Dir name не є u64 → skip  
-- 431960/ не існує → skip
+1. В struct VideoDecoder добавь: frame_buf: Vec<u8>.
+2. В Self::open() инициализируй Vec::with_capacity(width*height*4).
+3. Измени сигнатуру:
+   pub fn next_frame_rgba(&mut self) -> anyhow::Result<Option<(&[u8], u32, u32)>>
+4. В теле: self.frame_buf.clear(); затем extend_from_slice
+   (учитывая padded stride — см. паттерн в docs/DAEMON.md §video.rs).
+5. Возвращай &self.frame_buf[..].
+6. Адаптируй tests — сигнатура сменилась, но логика test_decoder_reads_frame
+   остаётся той же.
 
-Напиши 2 unit tests:
-1. test_parse_vdf_single() — парсинг VDF з одним шляхом (використай тимчасовий файл)
-2. test_skip_non_numeric_dir() — перевіряє що "thumbnails" папка ігнорується
+Изменения в wpick-daemon/src/renderer.rs:
 
-Запусти: cargo test -p wpick-core
-```
+7. В render_loop (или render-функции Output-рендерера) — upload_frame уже
+   принимает &[u8], новая сигнатура совместима без правок на месте
+   вызова.
+8. Если borrow checker ругается на использование frame через .await —
+   сначала extract (width, height), upload перед await, потом await.
 
----
+Обнови skills/wpick-daemon.md §video.rs — новый checklist содержит правило
+"frame_buf переиспользуется".
 
-## Блок 4 — pkg.rs
+Обнови docs/DAEMON.md §video.rs — новая сигнатура next_frame_rgba
+уже задокументирована; сверь что совпадает.
 
-```
-Контекст: wpick-core library crate.
-Прочитай: CORE.md §pkg.rs повністю, включаючи весь "Implementation" алгоритм 10 кроків
+Если появится новая ошибка (например borrow conflict в renderer) —
+добавь E-36 в ERRORS_TO_AVOID.md.
 
-Реалізуй wpick-core/src/pkg.rs:
-- pub struct ProjectJson з усіма полями, #[serde(rename_all = "camelCase")]
-- pub fn extract_and_parse(wallpaper_dir: &WallpaperDir, wallpapers_cache: &Path) -> crate::Result<Option<WallpaperInfo>>
-
-Логіка mtime invalidation:
-- .pkg_mtime файл у out_dir зберігає u64 seconds
-- Якщо mtime збігся → skip extraction
-- Якщо ні → remove_dir_all + create_dir_all + depkg::extract + write new mtime
-
-Повертай Ok(None) (не error) коли:
-- scene.pkg відсутній
-- wallpaper_type ≠ "video"
-- file path всередині не існує
-
-Запусти: cargo check -p wpick-core (тести для цього модуля потребують реального PKG)
+Gate:
+  cargo test -p wpick-daemon video::tests → зелёные
+  cargo clippy -p wpick-daemon -- -D warnings → 0 в video.rs/renderer.rs
+  cargo run -p wpick-daemon + wpick set <id> → видео играет 60+ сек
+  (опционально) heaptrack ./target/release/wpick-daemon → <1 аллокация/frame
 ```
 
 ---
 
-## Блок 5 — cache.rs
+## Block 20 — Streaming audio
 
 ```
-Контекст: wpick-core library crate.
-Прочитай: CORE.md §cache.rs, включаючи SQL schema і "Row mapping" приклад
+Контекст: wpick v0.2.0, Block 20 — streaming audio decoder.
+Читай: skills/wpick-daemon.md §audio.rs, docs/DAEMON.md §audio.rs,
+ERRORS_TO_AVOID.md (E-16, E-17, E-28, E-29), wpick-daemon/src/audio.rs,
+wpick-daemon/src/ducking.rs (не менять, только понять), docs/CONFIG.md §audio.
 
-Реалізуй wpick-core/src/cache.rs:
-- pub struct Cache { conn: rusqlite::Connection }
-- const SCHEMA_SQL: &str — CREATE TABLE IF NOT EXISTS wallpapers + meta, з STRICT
-- Cache::open() → відкриває БД, execute_batch(SCHEMA_SQL), WAL mode
-- Cache::get_all() → SELECT * ORDER BY title ASC, map rows до WallpaperInfo
-- Cache::get_by_id() → SELECT WHERE id = ?
-- Cache::upsert() → INSERT OR REPLACE з pkg_mtime_secs
-- Cache::get_pkg_mtime() → SELECT pkg_mtime_secs WHERE id = ?
-- Cache::prune() → DELETE WHERE id NOT IN (...)
-- Cache::count() → SELECT COUNT(*)
+Цель: заменить pre-load полного трека на streaming source.
+Архитектура: [ffmpeg thread] --(SyncSender cap=4)--> [StreamingSource iter] -> rodio::Sink.
 
-Напиши 3 unit tests (використовуй tempfile::TempDir):
-1. test_open_creates_schema() — після open, таблиця wallpapers існує
-2. test_upsert_and_retrieve() — upsert + get_by_id повертає ті самі дані
-3. test_prune() — після prune, видалений ID відсутній
+Реализуй в wpick-daemon/src/audio.rs:
 
-Запусти: cargo test -p wpick-core
-```
+1. struct StreamingSource {
+     rx:            std::sync::mpsc::Receiver<Vec<f32>>,
+     current:       Vec<f32>,
+     pos:           usize,
+     sample_rate:   u32,
+     channels:      u16,
+     _shutdown_tx:  std::sync::mpsc::Sender<()>,
+   }
 
----
+2. impl Iterator for StreamingSource — см. docs/DAEMON.md §audio.rs.
+   КРИТИЧНО: underrun возвращает Some(0.0), НЕ None (E-28).
 
-## Блок 6 — ipc.rs
+3. impl rodio::Source — total_duration None, channels/sample_rate
+   из поля.
 
-```
-Контекст: wpick-core library crate.
-Прочитай: CORE.md §ipc.rs, PROJECT.md §"IPC Protocol Specification"
+4. fn spawn_audio_decoder(path, chunk_frames, shutdown_rx)
+     -> anyhow::Result<(Receiver<Vec<f32>>, u32, u16)>
+   — тред с именем "wpick-audio-dec-<id>". Внутри loop: read_packets
+   → decode → resample → накопление → send по chunk_frames.
+   EOF → seek_to_start + decoder.flush (E-15 аналог для audio).
+   Shutdown: try_recv().is_err() OR tx.send failed → return.
 
-Реалізуй wpick-core/src/ipc.rs:
-- ClientCommand enum з #[serde(tag = "type")] — всі 8 варіантів
-- DaemonResponse enum з #[serde(tag = "type")] — всі 5 варіантів
-- send_command<W: AsyncWrite + Unpin>() — to_string + \n + write_all + flush
-- recv_response<R: AsyncBufRead + Unpin>() — read_line + перевірка EOF + from_str
-- send_response і recv_command — аналогічно
+5. Адаптируй build_audio_source() — возвращает StreamingSource.
 
-Критично: 
-- Після write_all ЗАВЖДИ flush
-- При read_line: якщо n == 0 → WpickError::IpcClosed
+6. Удали AudioSamples и decode_audio_to_f32 — больше не нужны.
 
-Напиши round-trip тест для КОЖНОГО варіанту (в #[tokio::test]):
-- Всі 8 ClientCommand варіантів: serialize → deserialize → рівні
-- Всі 5 DaemonResponse варіантів: serialize → deserialize → рівні
+7. Тесты:
+   - test_streaming_source_plays_chunks: синтетический канал, 3 chunks,
+     проверяем правильный порядок семплов.
+   - test_streaming_source_silence_on_underrun: закрытый канал → next()
+     возвращает Some(0.0) бесконечно.
 
-Запусти: cargo test -p wpick-core -- --nocapture
-Очікувано: мінімум 13 тестів зелені
-```
+8. В pub async fn run() добавь parameter paused_rx: watch::Receiver<bool>
+   и audio_cfg: AudioConfig. На paused_rx.has_changed() → sink.pause()/play()
+   с last_pause_sent guard.
 
----
+9. main.rs: прочти config.audio.chunk_frames, передай в audio::run.
+   ducking::start не меняется.
 
-## Блок 7+8 — state.rs + ipc_server.rs
+Обнови skills/wpick-daemon.md §audio.rs:
+- Удали checklist про pre-load.
+- Новая секция "Streaming decoder architecture" со схемой.
+- Правило: "StreamingSource::next() НИКОГДА не возвращает None"
 
-```
-Контекст: wpick-daemon binary crate.
-Прочитай: DAEMON.md §state.rs, §ipc_server.rs, §main.rs — "Signal Handling"
+Обнови docs/DAEMON.md §audio.rs — сверь что реализация совпадает со
+спецификацией; если расходится — обнови либо документ, либо код.
 
-Реалізуй wpick-daemon/src/state.rs:
-- DaemonState struct з watch/broadcast Sender полями
-- Методи: set_wallpaper(), stop(), set_volume(), toggle_mute(), set_paused()
-- Правило: НІКОЛИ не тримати Mutex guard через .await
+Добавь в ERRORS_TO_AVOID.md:
+  E-28 уже описан (StreamingSource None → rodio стоп) — обнови если
+    что-то прояснилось.
+  E-29 уже описан (shutdown не наблюдается) — обнови по факту.
 
-Реалізуй wpick-daemon/src/ipc_server.rs:
-- pub async fn run(listener, state, cache, dirs) — loop accept + spawn
-- handle_connection() — loop recv_command + dispatch + send_response
-- dispatch() — match по всіх ClientCommand варіантах
-- scan_and_populate_cache() — spawn_blocking, ітерує wallpaper_dirs, кешує
-
-Реалізуй wpick-daemon/src/main.rs (тільки IPC частина — без renderer):
-- Config::load + AppDirs
-- Stale socket detection
-- UnixListener::bind
-- Signal handlers (SIGINT + SIGTERM) що видаляють сокет
-- spawn ipc_server task
-
-Перевірка:
-cargo run -p wpick-daemon &
-sleep 1
-echo '{"type":"List"}' | nc -U ~/.wpick.sock
-# Очікувано: {"type":"WallpaperList","items":[...]}
+Gate:
+  cargo test -p wpick-daemon audio::tests → зелёные
+  cargo run -p wpick-daemon + wpick set <video_id_with_audio>
+    → звук за <500ms
+  ps -o rss= -p $(pidof wpick-daemon) до и после Set:
+    ожидаемо ≤ 80 MB на длинных треках (v0.1: 150+).
 ```
 
 ---
 
-## Блок 9 — video.rs
+## Block 21 — Multi-monitor support
 
 ```
-Контекст: wpick-daemon binary crate.
-Прочитай: DAEMON.md §video.rs повністю, включаючи "Handle non-contiguous frames"
+Контекст: wpick v0.2.0, Block 21 — multi-monitor support.
+Это самый большой блок. При возможности разделить на 21a (IPC+state)
+и 21b (renderer refactor + hotplug).
 
-Реалізуй wpick-daemon/src/video.rs:
-- pub struct VideoDecoder { input_ctx, video_stream_idx, decoder, scaler, fps }
-- VideoDecoder::open(path: &str) → ffmpeg::init() + best video stream + RGBA scaler
-- next_frame_rgba() → Option<(Vec<u8>, u32, u32)> — None на EOF
-- seek_to_start() → seek(0) + decoder.flush()
-- frame_duration() → Duration від fps (guard: .max(1.0))
-- dimensions() → (u32, u32)
+Читай: docs/PROJECT.md, docs/DAEMON.md §renderer.rs + §state.rs,
+skills/wpick-daemon.md, ERRORS_TO_AVOID.md §Wayland (E-05..E-08, E-30..E-32),
+docs/CONFIG.md §monitors, docs/MULTIMONITOR.md ЦЕЛИКОМ,
+wpick-daemon/src/renderer.rs, state.rs, ipc_server.rs,
+wpick-core/src/ipc.rs, wpick-core/src/model.rs.
 
-Критично для scaler: output format = Pixel::RGBA (не RGB24)
-Критично для frame data: перевіряй stride(0) == width*4, інакше strip padding
+Этап 1 — IPC расширение (wpick-core):
+1. В model.rs добавь OutputInfo { name, width, height, scale,
+   current_wallpaper_id }.
+2. В ipc.rs:
+   - ClientCommand::Set { id, #[serde(default)] monitor: Option<String> }
+   - ClientCommand::ListOutputs
+   - ClientCommand::Status, Pause, Resume
+   - DaemonResponse::OutputList { items }
+   - DaemonResponse::Status { paused, reasons, monitors: Vec<MonitorStatus> }
+   - struct MonitorStatus { name, current_wallpaper_id }
+3. Round-trip тесты для всех новых вариантов.
+4. Тест v01_set_forward_compat: {"type":"Set","id":1} без monitor
+   десериализуется в Set { id: 1, monitor: None }.
 
-Напиши тест (потребує тестовий mp4):
-#[test] fn test_decode_first_frame() {
-    // Генеруй тест-відео: ffmpeg -f lavfi -i testsrc=duration=1:size=320x240:rate=30 /tmp/test.mp4
-    let mut dec = VideoDecoder::open("/tmp/test.mp4").unwrap();
-    let frame = dec.next_frame_rgba().unwrap();
-    assert!(frame.is_some());
-    let (data, w, h) = frame.unwrap();
-    assert_eq!(w, 320);
-    assert_eq!(h, 240);
-    assert_eq!(data.len(), 320 * 240 * 4);
-}
-```
+Этап 2 — state.rs:
+5. DaemonState: HashMap<String, Option<WallpaperInfo>> monitors_current
+   вместо одиночного current_wallpaper.
+6. monitors_tx: watch::Sender<HashMap<..>>.
+7. pub fn set_wallpaper(&mut self, monitor: Option<String>, info, known_outputs: &[String]).
+   monitor=None → apply to all known_outputs.
+8. outputs_tx: watch::Sender<Vec<OutputInfo>> — renderer публикует, ipc_server читает.
+9. pause_override_tx: watch::Sender<Option<bool>>.
 
----
+Этап 3 — renderer.rs (ядро блока):
+10. RendererManager { Connection, EventQueue, WaylandState, shared wgpu,
+    HashMap<OutputKey, OutputRenderer> }.
+11. OutputRenderer — см. docs/MULTIMONITOR.md §Renderer structure.
+12. Общие wgpu::Instance/Adapter/Device/Queue создаются один раз.
+13. Pipeline общий когда SurfaceFormat совпадает.
+14. Per-output: Surface, bind_group, video_texture, VideoDecoder, frame clock.
+15. Hotplug:
+    - wl_registry::Event::Global interface=="wl_output" → bind + subscribe.
+    - wl_output events Name/Mode/Scale/Done → populate OutputBinding.
+    - Done первый раз → promote to OutputRenderer.
+    - GlobalRemove → drop OutputRenderer (идемпотентно, E-32).
+16. Фильтрация Mode: только с CURRENT flag (E-31).
+17. render_loop: diff monitors_rx против renderers map; for each output
+    try_render_frame; dispatch_pending для Wayland.
+18. FitMode uniform buffer обновляется только при изменении размеров.
+19. Publish outputs_tx при hotplug/resize.
 
-## Блок 10 — audio.rs
+Этап 4 — ipc_server.rs:
+20. Dispatch Set { id, monitor } → state.set_wallpaper с known из outputs_rx.
+21. Dispatch ListOutputs → outputs_rx.borrow().clone().
+22. Dispatch Status → собрать paused (через pause::current_reasons()
+    — будет в Block 22; пока возвращать empty), monitors из state.
+23. Dispatch Pause/Resume → state.set_pause_override.
 
-```
-Контекст: wpick-daemon binary crate.
-Прочитай: DAEMON.md §audio.rs повністю
+Этап 5 — wpick-tui:
+24. В CLI добавь subcommands outputs, status. В set добавь --monitor.
+25. app.rs: outputs: Vec<OutputInfo>, refresh_outputs() после connect + на 'r'.
+26. ui.rs: footer помечает multi-monitor (например "2 monitors").
+    TUI monitor selector — отложен в v0.3.
 
-Реалізуй wpick-daemon/src/audio.rs:
-- AudioSamples struct: { samples: Vec<f32>, pos: usize, sample_rate: u32, channels: u16 }
-- impl Iterator for AudioSamples — wrap-around loop (pos % len)
-- impl rodio::Source for AudioSamples — channels, sample_rate, total_duration: None
-- fn build_audio_source(path) → anyhow::Result<impl Source<Item=f32>>
-  - ffmpeg decode + resample до stereo f32 48000Hz
-  - повертає AudioSamples
-- pub async fn run(wallpaper_rx, volume_rx, pause_rx) — watch polling loop
+Обнови skills/wpick-daemon.md §renderer — новая секция "Multi-monitor
+rules" с правилами 10-19.
 
-Критично:
-- _output_stream живе весь час циклу
-- sink.set_volume(if muted { 0.0 } else { vol })
-- Якщо файл не має аудіо → tracing::info!, не panic
+Обнови skills/wpick-tui.md — новые команды в cli.rs.
 
-Тест:
-#[test] fn test_audio_samples_loops() {
-    let src = AudioSamples { samples: vec![1.0, 2.0, 3.0], pos: 0, sample_rate: 48000, channels: 2 };
-    let samples: Vec<f32> = src.take(7).collect();
-    assert_eq!(samples, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0]);
-}
-```
+Обнови docs/DAEMON.md §renderer.rs если реализация расходится со
+спецификацией.
 
----
+Добавь в ERRORS_TO_AVOID.md всё новое по мере встречи (E-36+).
+E-30, E-31, E-32 уже описаны — по факту работы сверь и обнови.
 
-## Блок 11 — renderer.rs
-
-```
-Контекст: wpick-daemon binary crate.
-Прочитай: DAEMON.md §renderer.rs ПОВНІСТЮ — кожен підрозділ.
-Окремо: "Wayland Threading Rule" — обов'язково.
-Окремо: ERRORS_TO_AVOID.md E-05, E-06, E-07, E-08, E-09, E-10, E-11
-
-Реалізуй wpick-daemon/src/renderer.rs:
-- RendererContext struct: wl_display, wl_surface, layer_surface, device, queue, surface, pipeline, video_texture, bind_group
-- RendererContext::init(config) → повна Wayland + wgpu ініціалізація
-- fn upload_frame(queue, texture, rgba_data, width, height)
-- pub async fn run(wallpaper_rx, config, shutdown_rx) → render loop
-
-Wayland init ТОЧНА послідовність (з DAEMON.md):
-1. connect → 2. registry → 3. bind globals → 4. create_surface → 5. get_layer_surface
-6. set_anchor(all) → 7. set_size(0,0) → 8. commit → 9. roundtrip
-→ отримай configure(serial, w, h) → 10. ack_configure(serial) → 11. commit
-→ тільки після цього ініціалізуй wgpu
-
-wgpu: Backends::VULKAN, формат з surface.get_capabilities().formats[0]
-Шейдери: читай з assets/vertex.wgsl і assets/fragment.wgsl
-
-Перевірка: запусти daemon, встанови обої — layer surface має з'явитися на моніторі
-```
-
----
-
-## Блоки 13–16 — wpick-tui
-
-```
-Контекст: wpick-tui binary crate.
-Прочитай: TUI.md повністю, PROJECT.md §IPC Protocol
-
-Реалізуй в такому порядку:
-
-1. wpick-tui/src/client.rs:
-   IpcClient { reader: BufReader<OwnedReadHalf>, writer: BufWriter<OwnedWriteHalf> }
-   connect(socket_path) → корисне повідомлення про помилку
-   send(&cmd) → DaemonResponse
-   list_wallpapers() → Vec<WallpaperInfo>
-
-2. wpick-tui/src/app.rs:
-   App struct з усіма полями (CORE.md §app.rs)
-   App::run() → terminal setup + event loop
-   handle_key() → всі клавіші з TUI.md §Key Handler
-   Всі cmd_* методи
-   try_reconnect() → timeout 200ms
-
-3. wpick-tui/src/ui.rs:
-   render(frame, app) → перевірка мін. розміру 80×20
-   Vertical layout: [1, fill, 2]
-   Horizontal: [30%, 70%]
-   render_list() → render_stateful_widget (не render_widget!)
-   render_detail() → empty state коли немає обоїв
-
-4. wpick-tui/src/main.rs:
-   enable_raw_mode → run_app → ЗАВЖДИ disable_raw_mode + LeaveAlternateScreen
-
-Перевірки:
-- Без daemon: показує "Disconnected", не крашиться
-- Ctrl+C: термінал відновлений
-- Q: daemon зупиняється, сокет видаляється
+Gate:
+  cargo build --workspace --release → без ошибок
+  Подключи второй монитор (или nested sway/Hyprland).
+  wpick-daemon → оба монитора показывают видео
+  wpick outputs → список мониторов
+  wpick set <id2> --monitor HDMI-A-1 → только этот
+  wpick set <id1> → все (когда config пуст)
+  Отключить HDMI → renderer дропает; daemon жив.
+  Подключить назад → renderer поднимается; wallpaper из config применяется.
 ```
 
 ---
 
-## Промпти-корекції (коли результат не той)
+## Block 22 — Pause manager
 
-### Якщо Claude Code написав занадто складно
 ```
-Спрости реалізацію. Видали всі абстракції що не потрібні для MVP.
-Кожна функція має робити одну річ. Максимум 50 рядків на функцію.
-Без trait objects де можна уникнути. Без зайвих generics.
+Контекст: wpick v0.2.0, Block 22 — pause manager.
+Читай: docs/PROJECT.md, docs/DAEMON.md §pause.rs + §renderer.rs + §audio.rs,
+skills/wpick-daemon.md, docs/CONFIG.md §pause, docs/PAUSE.md ЦЕЛИКОМ,
+wpick-daemon/src/{renderer.rs,audio.rs,state.rs}.
+
+Цель: daemon автоматически паузит рендер+аудио на fullscreen / battery /
+lid, с manual override через IPC Pause/Resume.
+
+Реализуй wpick-daemon/src/pause.rs:
+
+1. pub async fn run(
+     config: PauseConfig,
+     paused_tx: watch::Sender<bool>,
+     override_rx: watch::Receiver<Option<bool>>,
+     shutdown_rx: broadcast::Receiver<()>,
+   ) -> anyhow::Result<()>
+
+2. Внутри: Sources { fullscreen: AtomicBool, on_battery, lid_closed }
+   в Arc. tokio::spawn три sub-tasks (только при соответствующем cfg).
+
+3. Hyprland task:
+   - $HYPRLAND_INSTANCE_SIGNATURE отсутствует → log info, не стартовать (E-33).
+   - Подключись к $XDG_RUNTIME_DIR/hypr/$SIG/.socket2.sock.
+   - На hyprctl activewindow (через тот же IPC), заполни initial state.
+   - Loop: read_line, match "fullscreen>>0"/"fullscreen>>1" → обнови
+     src.fullscreen.
+   - EOF/Err → sleep 5s, reconnect (E-35).
+
+4. Battery task:
+   - Найди /sys/class/power_supply/*/online через glob. Пусто → log info,
+     не стартовать (E-34).
+   - Poll каждые 2s. Content "0" → on_battery=true.
+
+5. Lid task:
+   - /proc/acpi/button/lid/*/state. Пусто → log info, не стартовать.
+   - Poll каждые 2s. "closed" → lid_closed=true.
+
+6. Aggregator task: select! на re-eval signal + override_rx changes +
+   shutdown. На каждое событие: compute auto_paused, final_paused через
+   override.unwrap_or(auto). Publish в paused_tx ТОЛЬКО при изменении
+   (E-13).
+
+7. pub fn current_reasons() -> Vec<String> — читает из
+   OnceLock<ArcSwap<Vec<String>>>, обновляется aggregator-ом.
+
+Интеграция:
+
+8. renderer.rs: в render_loop, перед декодированием:
+   if *paused_rx.borrow() { dispatch_pending; flush; sleep 100ms; continue; }
+
+9. audio.rs: уже добавлено в Block 20 — last_pause_sent guard.
+
+10. main.rs:
+    - watch::channel для paused, pause_override.
+    - tokio::spawn(pause::run(...)).
+    - Передай paused_rx в renderer и audio.
+
+11. ipc_server.rs Status теперь возвращает реальные данные:
+    paused = *paused_rx.borrow(),
+    reasons = pause::current_reasons().
+
+Обнови skills/wpick-daemon.md — новая секция "pause.rs — rules".
+
+Обнови docs/DAEMON.md §pause.rs если реализация расходится.
+
+Добавь новые записи в ERRORS_TO_AVOID.md (E-33..E-35 уже описаны;
+обнови по факту).
+
+Gate:
+  cargo build --workspace → без ошибок
+  cargo run -p wpick-daemon + wpick set <id> + fullscreen YouTube
+    → pidstat 1 показывает <0.5% CPU daemon
+  Закрытие fullscreen → рендеринг возобновляется.
+  Отключение AC при on_battery=true → паузится за ≤2s.
+  wpick status → показывает paused=true, reasons=["fullscreen"].
+  wpick pause → manual pause; wpick resume → возврат к auto.
 ```
 
-### Якщо є unwrap() в продакшн коді
+---
+
+## Block 23 — CLI completions + man pages
+
 ```
-Замінь всі .unwrap() і .expect() в не-тестовому коді.
-Використовуй ? для propagation, .ok_or(WpickError::...) для Option→Result,
-.map_err(|e| WpickError::Config(e.to_string())) для зовнішніх помилок.
+Контекст: wpick v0.2.0, Block 23 — shell completions + man pages.
+Читай: wpick-tui/src/main.rs, skills/wpick-tui.md, COMPAT.md.
+
+Цель: completions и man генерируются из clap defs; zero duplication.
+
+1. wpick-tui/Cargo.toml: добавь
+     clap_complete = "4"
+     clap_mangen   = "0.2"
+
+2. Раздели CLI определение: создай wpick-tui/src/cli.rs с struct Cli
+   и enum Commands. main.rs импортирует из crate::cli. Это нужно чтобы
+   (в будущем) build.rs мог include!-нуть определение.
+
+3. Добавь в Commands:
+     #[command(hide = true)] Completions { shell: clap_complete::Shell },
+     #[command(hide = true)] Man,
+
+4. Добавь subcommand `wpick-daemon man` → создай в wpick-daemon минимальный
+   clap::Parser (сейчас там нет clap) с --version, --help, hidden `man`.
+
+5. Обработчики:
+     Commands::Completions { shell } => {
+         let mut cmd = Cli::command();
+         let name    = cmd.get_name().to_string();
+         clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+     }
+     Commands::Man => {
+         clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+     }
+
+6. Long-about для Cli: добавь DESCRIPTION, FILES
+   (~/.config/wpick/config.toml, ~/.wpick.sock, ~/.cache/wpick),
+   EXAMPLES, SEE ALSO wpick-daemon(1).
+
+7. Тесты (опционально, но полезно):
+   - test_completions_bash_non_empty
+   - test_man_contains_TH_header
+
+Обнови skills/wpick-tui.md:
+- Новая секция "Shell completions & man pages".
+- Правило: "Cli struct — single source of truth, не дублировать".
+
+Обнови COMPAT.md — clap_complete="4", clap_mangen="0.2" в таблице
+зависимостей wpick-tui.
+
+Gate:
+  wpick completions bash | head             → bash completion script
+  wpick completions zsh  > /tmp/_wpick; source /tmp/_wpick; wpick <TAB>
+  wpick man > /tmp/wpick.1; man /tmp/wpick.1 → открывается
+  wpick --help                              → формат не сломан
+  wpick-daemon man > /tmp/wpick-daemon.1    → открывается
 ```
 
-### Якщо порушено залежності між крейтами
+---
+
+## Block 24 — Systemd user service
+
 ```
-Перевір: wpick-core не має імпортів з wayland-client, wgpu, ratatui, anyhow.
-wpick-tui не має імпортів з wpick-daemon.
-wpick-daemon не має імпортів з wpick-tui.
-Виправ порушення — перенеси код у відповідний крейт або в wpick-core.
+Контекст: wpick v0.2.0, Block 24 — systemd user service.
+Читай: wpick-daemon/src/main.rs, docs/PROJECT.md, docs/SYSTEMD.md.
+
+Задача: готовый user unit с harderning, логирование через journald.
+
+1. Создай dist/systemd/wpick-daemon.service — точное содержимое
+   в docs/SYSTEMD.md §Unit file.
+
+2. В wpick-daemon/src/main.rs: init_tracing должен детектить
+   $JOURNAL_STREAM и переключать writer:
+
+   let under_systemd = std::env::var_os("JOURNAL_STREAM").is_some();
+   if under_systemd {
+       tracing_subscriber::fmt()
+           .with_writer(std::io::stderr)
+           .with_ansi(false)
+           .with_env_filter(filter)
+           .init();
+   } else {
+       // существующий tracing_appender daily rotation
+   }
+
+3. SIGTERM handler: убедись что remove_file(socket) + exit(0)
+   — уже должно быть; просто проверь.
+
+Обнови skills/wpick-daemon.md — секция "Running under systemd" с
+правилом про JOURNAL_STREAM.
+
+Обнови docs/SYSTEMD.md если содержимое unit-файла или detection
+расходится с реализацией.
+
+Gate:
+  cp dist/systemd/wpick-daemon.service ~/.config/systemd/user/
+  systemctl --user daemon-reload
+  systemctl --user start wpick-daemon
+  systemctl --user status wpick-daemon     → active (running)
+  journalctl --user -u wpick-daemon -n 50  → логи видны
+  systemctl --user stop wpick-daemon       → выход <2s, код 0
 ```
 
-### Якщо blocking в async
+---
+
+## Block 25 — Multi-distro packaging
+
 ```
-Знайди всі виклики блокуючих функцій всередині async fn.
-Перенеси їх у tokio::task::spawn_blocking(|| { ... }).await?
-Блокуючі: будь-який файловий I/O (крім tokio::fs), rusqlite, depkg, serde на великих даних.
+Контекст: wpick v0.2.0, Block 25 — multi-distro packaging.
+Читай: текущий PKGBUILD, .github/workflows/release.yml,
+dist/systemd/wpick-daemon.service, docs/INSTALL.md.
+
+1. Обнови PKGBUILD — установка completions, man, systemd unit:
+   В package():
+     install -Dm755 target/release/wpick $pkgdir/usr/bin/wpick
+     install -Dm755 target/release/wpick-daemon $pkgdir/usr/bin/wpick-daemon
+     "$pkgdir/usr/bin/wpick" completions bash | install -Dm644 /dev/stdin \
+         $pkgdir/usr/share/bash-completion/completions/wpick
+     "$pkgdir/usr/bin/wpick" completions zsh  | install -Dm644 /dev/stdin \
+         $pkgdir/usr/share/zsh/site-functions/_wpick
+     "$pkgdir/usr/bin/wpick" completions fish | install -Dm644 /dev/stdin \
+         $pkgdir/usr/share/fish/vendor_completions.d/wpick.fish
+     "$pkgdir/usr/bin/wpick" man | install -Dm644 /dev/stdin \
+         $pkgdir/usr/share/man/man1/wpick.1
+     install -Dm644 dist/systemd/wpick-daemon.service \
+         $pkgdir/usr/lib/systemd/user/wpick-daemon.service
+   
+   depends+=(ffmpeg wayland systemd)
+
+2. Создай второй PKGBUILD aur/wpick-bin/PKGBUILD, который pull-ит
+   release tarball из GitHub Release (binary package).
+
+3. Создай flake.nix — см. docs/INSTALL.md §Nix и roadmap Block 25
+   в предыдущем плане. Используй rustPlatform.buildRustPackage,
+   installShellCompletion, installManPage.
+
+4. nix flake lock → закоммить flake.lock.
+
+5. Обнови .github/workflows/release.yml:
+   - cargo test на PR.
+   - В release job:
+     - apt install ffmpeg (убедись что версия совместима с pin;
+       если нет — docker archlinux:latest).
+     - Артефакты: wpick-x86_64-linux.tar.gz + checksums.txt.
+     - nix flake check step.
+     - (опционально) AUR auto-push через
+       KSXGitHub/github-actions-deploy-aur@v2 для wpick-bin.
+
+Обнови docs/INSTALL.md — синхронизируй любые расхождения.
+
+Обнови skills/wpick-index.md — добавь в конце секцию "Release process".
+
+Обнови README.md — install section ссылка на docs/INSTALL.md, badges:
+AUR version, Nix flake.
+
+Gate:
+  makepkg -si (в чистом docker:archlinux) → собирается, устанавливается.
+  pacman -Ql wpick → completions/man/service в правильных путях.
+  nix build . → успех.
+  nix run . -- list → работает (если daemon запущен).
+  Запушить тестовый tag v0.2.0-rc1 → workflow зелёный, Release создан.
+```
+
+---
+
+## Block 26 — Release sync
+
+```
+Контекст: wpick v0.2.0, Block 26 — release sync. Финальный блок.
+Читай: CHANGELOG.md, README.md, все docs/*.md, все skills/*.md,
+COMPAT.md, ERRORS_TO_AVOID.md, Cargo.toml всех трёх crates,
+PKGBUILD, flake.nix, dist/systemd/wpick-daemon.service.
+
+1. Version bump. В wpick-core/Cargo.toml, wpick-daemon/Cargo.toml,
+   wpick-tui/Cargo.toml, PKGBUILD, flake.nix:
+     version = "0.2.0"
+
+2. CHANGELOG.md [0.2.0] — финализируй дату и проверь что все
+   реальные изменения отражены:
+   - Added: extended config, multi-monitor, streaming audio,
+     frame reuse, auto-pause, CLI completions + man, systemd unit,
+     AUR + Nix, новые CLI команды.
+   - Changed: Set gains monitor (breaking для direct IPC),
+     audio no longer pre-loads, VideoDecoder signature.
+   - Fixed: реальные фиксы из процесса.
+   - Known limitations: Scene/Web → v0.3, TUI preview → v0.3,
+     TUI monitor selector → v0.3, Flatpak → v0.3, hardware decode → v0.3.
+
+3. README.md:
+   - Status table обнови (v0.2 фичи → ✅).
+   - Feature list обнови.
+   - Badges: AUR version, Nix flake.
+   - Install section ссылки на docs/INSTALL.md.
+
+4. SEQUENCE.md: под v0.2 блоками — "released as v0.2.0" маркер.
+
+5. COMPAT.md:
+   - Новые деп: clap_complete, clap_mangen.
+   - Verified combinations — обнови datestamp, добавь Nix row.
+
+6. ERRORS_TO_AVOID.md:
+   - Проверь что E-28..E-35 все на месте.
+   - Отсортируй индекс по категориям (должно быть уже).
+   - Добавь любые новые E-36+ полученные за v0.2.
+
+7. Full regression:
+     cargo test --workspace
+     cargo clippy --workspace -- -D warnings
+     cargo build --workspace --release
+   
+   Manual smoke:
+     1. systemctl --user start wpick-daemon
+     2. wpick list, set, volume, mute
+     3. wpick set <id2> --monitor HDMI-A-1 (если есть два монитора)
+     4. Fullscreen → daemon CPU падает
+     5. wpick status → корректно
+     6. htop RSS ≤ 100MB
+     7. man wpick, wpick completions zsh
+     8. systemctl --user status wpick-daemon → active
+
+8. Tag:
+     git add -A
+     git commit -m "Release v0.2.0"
+     git tag -a v0.2.0 -m "v0.2.0 — multi-monitor, auto-pause, streaming audio, distro packaging"
+     git push origin main v0.2.0
+   
+   CI подхватит тег, release workflow создаст GitHub Release.
+
+Gate:
+  Tag v0.2.0 на GitHub существует, Release с артефактами создан.
+  AUR: paru -Ss wpick показывает 0.2.0.
+  Nix: nix run github:ederadar/wpick — работает с чистого клона.
+  Журнал: journalctl --user -u wpick-daemon -g "0.2.0" показывает
+    правильную version string.
 ```

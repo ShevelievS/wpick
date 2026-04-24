@@ -1,276 +1,386 @@
-# ERRORS_TO_AVOID.md
+# ERRORS_TO_AVOID.md — catalogue of bugs hit, and how to avoid them
 
-> Оновлюй цей файл ОДРАЗУ як зустрів нову помилку — до того як виправив.  
-> Формат: **Що зробив** → **Що сталось** → **Як правильно**  
-> Переглядай перед кожним новим блоком.
+> Every entry is a real bug that was either hit during development
+> or explicitly reasoned about as "likely to be hit". Add a new entry
+> the moment a pattern bites you — before the fix is even written.
+> Entries are append-only. If an entry becomes obsolete (e.g. the API
+> changed upstream), mark it `OBSOLETE: <reason>` instead of removing it.
+
+Index by category:
+
+- **Cargo / workspace** — E-01, E-02, E-26
+- **Wayland** — E-05, E-06, E-07, E-08, E-31, E-32, E-35
+- **wgpu** — E-09, E-30
+- **ffmpeg** — E-10, E-11, E-15, E-26
+- **Audio / rodio** — E-16, E-17, E-28, E-29
+- **Async / tokio** — E-03, E-04, E-12, E-13
+- **IPC** — E-14
+- **ratatui / TUI** — E-18, E-19, E-20, E-21, E-22, E-23, E-24, E-25
+- **PKG parsing** — E-27
+- **Pause / system integration** — E-33, E-34
 
 ---
 
-## Async / Tokio
+## Cargo / workspace
 
-### E-01: Mutex через await
-**Зробив:** Тримав `tokio::sync::Mutex` guard через `.await` точку  
-**Сталось:** Дедлок або `MutexGuard is not Send` помилка компілятора  
-**Правильно:**
-```rust
-// WRONG:
-let guard = state.lock().await;
-some_async_fn().await;
+### E-01 — crate dependency rules violated
 
-// CORRECT:
-let value = state.lock().await.some_field.clone();
-// guard дропнувся тут ^
-some_async_fn(value).await;
-```
+**Symptom:** `wpick-core` fails CI grep for `anyhow`.
+**Cause:** Imported `anyhow::Result` in a core module.
+**Fix:** Use `crate::Result` (re-exported from `error.rs`). See
+`docs/ERRORS.md` for the style table.
 
-### E-02: std::sync::Mutex в async контексті
-**Зробив:** Використав `std::sync::Mutex` для стану що шариться між async задачами  
-**Сталось:** `MutexGuard<T> cannot be held across an await point`  
-**Правильно:** Тільки `tokio::sync::Mutex` для стану між async задачами
+### E-02 — workspace member not compiling standalone
 
-### E-03: Blocking I/O в async задачі
-**Зробив:** Виклик `depkg::extract()` або `serde_json::from_str` на великих даних прямо в async  
-**Сталось:** Блокував tokio worker thread — інші задачі зависали  
-**Правильно:**
-```rust
-tokio::task::spawn_blocking(|| {
-    depkg::extract(&pkg_path, &out_dir)
-}).await??;
-```
+**Symptom:** `cargo build -p wpick-tui` succeeds in the workspace
+but fails when checked in isolation.
+**Cause:** Features inherited from workspace weren't declared locally.
+**Fix:** `cargo check -p <crate>` per crate in CI, not just
+`--workspace`.
 
-### E-04: sleep(0) замість yield_now()
-**Зробив:** `tokio::time::sleep(Duration::from_millis(0)).await` для yield  
-**Сталось:** Не гарантує yield, може не дати іншим задачам виконатись  
-**Правильно:** `tokio::task::yield_now().await`
+### E-26 — ffmpeg-next version vs system ffmpeg mismatch
+
+**Symptom:** Link errors like `undefined reference to av_frame_alloc`
+or segfaults on first `ffmpeg::format::input()`.
+**Cause:** Cargo pin is `ffmpeg-next = "8"` but the system has
+ffmpeg 6/7.
+**Fix:** See `COMPAT.md §System ffmpeg`. Align the pin with the system
+version. ffmpeg-next 6/7/8 share 95% of the API; a single-line change
+in `Cargo.toml` is usually enough.
 
 ---
 
 ## Wayland
 
-### E-05: Рендер до ack_configure
-**Зробив:** Спробував рендерити на layer surface до отримання configure event  
-**Сталось:** Чорний екран, жодних помилок  
-**Правильно:** Суворий порядок:
+### E-05 — layer surface exclusive zone not set to -1
+
+**Symptom:** Wallpaper draws but compositor reserves space for it,
+shrinking other windows.
+**Cause:** `set_exclusive_zone` defaults to 0 which means "normal
+window"; for a wallpaper we want `-1` ("draw under everything and
+don't reserve space").
+**Fix:** `layer_surface.set_exclusive_zone(-1)` before the first
+`wl_surface.commit()`.
+
+### E-06 — missing second surface.commit() after ack_configure
+
+**Symptom:** Surface stays black; configure roundtrip completes but
+nothing renders.
+**Cause:** After `ack_configure(serial)` the surface needs another
+`wl_surface.commit()` to tell the compositor "yes, I'm ready".
+**Fix:** Always commit twice: once to request the surface, once to
+acknowledge after configure.
+
+### E-07 — layer_shell bound at wrong version
+
+**Symptom:** `zwlr_layer_shell_v1` creation fails or produces
+surfaces without `get_layer_surface` v4 features.
+**Cause:** Requested `version: 1` instead of `version: 4`.
+**Fix:** Bind `zwlr_layer_shell_v1` at version 4 when available.
+
+### E-08 — wgpu surface built from WlSurface pointer instead of raw handles
+
+**Symptom:** `Surface::get_current_texture` returns
+`Outdated` / `Lost` constantly.
+**Cause:** Passed a bare Wayland struct to wgpu. wgpu wants
+`raw-window-handle` types, not the wayland-client handles directly.
+**Fix:** Implement `HasWindowHandle` + `HasDisplayHandle` for a small
+newtype that wraps both pointers, then pass that to
+`Instance::create_surface`.
+
+### E-31 — acting on non-CURRENT wl_output::Mode events
+
+**Symptom:** Renderer repeatedly resizes textures and surfaces as the
+compositor announces multiple modes per output.
+**Cause:** `wl_output::Event::Mode` fires for every supported mode
+and for the preferred mode, not only the active one.
+**Fix:** Check the `CURRENT` flag and only apply the current mode:
+
+```rust
+if flags.contains(WEnum::Value(wl_output::Mode::Current)) { /* apply */ }
 ```
-commit() → roundtrip() → отримай configure(serial, w, h) → ack_configure(serial) → commit() → ТЕПЕР рендер
-```
 
-### E-06: wl_surface без commit після змін
-**Зробив:** Змінив параметри layer_surface але не викликав `wl_surface.commit()`  
-**Сталось:** Зміни ігноруються compositor'ом, поведінка непередбачувана  
-**Правильно:** Після будь-яких змін surface → завжди `wl_surface.commit()`
+### E-32 — non-idempotent renderer drop on GlobalRemove
 
-### E-07: Wayland dispatch в tokio::spawn
-**Зробив:** Запустив `EventQueue::dispatch()` в звичайному `tokio::spawn`  
-**Сталось:** Паніка або UB — `wl_surface` не є `Send`  
-**Правильно:** Renderer запускається або на main thread або в `tokio::task::spawn_local()` з `LocalSet`
+**Symptom:** Panic on `assertion failed: self.inner.is_alive()` when
+the compositor announces the output removal twice or when we already
+dropped due to a surface error.
+**Cause:** Destroy logic assumed first-time removal.
+**Fix:** Renderer `Drop` must be idempotent: `if let Some(r) =
+renderers.remove(&id) { drop(r) }`. Never `panic!` on "output already
+gone".
 
-### E-08: Не зареєстрував wl_output
-**Зробив:** Пропустив bind `wl_output` при реєстрації глобалів  
-**Сталось:** `configure` event приходить з розміром 0×0  
-**Правильно:** Обов'язково bind `wl_output` → дочекайся `mode` event → тоді отримуєш реальні розміри
+### E-35 — Hyprland socket drop on compositor reload
+
+**Symptom:** Pause stops responding to fullscreen events after a
+`hyprctl reload` or similar.
+**Cause:** The IPC socket closes when Hyprland reloads; our reader
+got EOF and the task exited.
+**Fix:** Wrap the socket read loop in a `loop { try_connect;
+read_until_eof; sleep 5s }` pattern. Log info on disconnect/reconnect
+exactly once per cycle.
 
 ---
 
 ## wgpu
 
-### E-09: Не той Backends на Linux
-**Зробив:** `wgpu::Backends::all()` або `wgpu::Backends::METAL`  
-**Сталось:** Fallback на GLES замість Vulkan, або взагалі немає адаптера  
-**Правильно:**
-```rust
-wgpu::Instance::new(wgpu::InstanceDescriptor {
-    backends: wgpu::Backends::VULKAN,
-    ..Default::default()
-})
-```
-Fallback: `VULKAN | GL` якщо треба підтримка старого заліза
+### E-09 — no compatible adapter found
 
-### E-10: Texture upload з padding
-**Зробив:** Передав `data(0)` від ffmpeg frame напряму до `write_texture`  
-**Сталось:** Відео з'їхало горизонтально — ffmpeg stride ≠ width×4  
-**Правильно:** Завжди перевіряй `stride(0)` і прибирай padding:
-```rust
-if rgba_frame.stride(0) == (width * 4) as usize {
-    // можна напряму
-} else {
-    // треба strip padding — дивись DAEMON.md §video
-}
-```
+**Symptom:** `Instance::request_adapter().await.unwrap()` panics on
+machines with only OpenGL available.
+**Cause:** Default `RequestAdapterOptions` requires a surface-compatible
+Vulkan adapter; Vulkan may not be installed.
+**Fix:** Fallback chain: Vulkan → GL (`Backends::VULKAN | Backends::GL`),
+plus a friendly error message pointing to `vulkan-radeon` /
+`nvidia-utils` / `vulkan-intel`.
 
-### E-11: Surface format mismatch
-**Зробив:** Hardcode `TextureFormat::Rgba8UnormSrgb` для swapchain  
-**Сталось:** Panic або некоректні кольори — деякі Wayland compositors хочуть `Bgra8UnormSrgb`  
-**Правильно:**
-```rust
-let format = surface.get_capabilities(&adapter).formats[0];
-// використай цей format для SurfaceConfiguration
-```
+### E-30 — per-surface wgpu::Device in multi-monitor
+
+**Symptom:** Slow startup with multiple monitors; each hotplug
+blocks for 200ms+. GPU memory usage doubles per output.
+**Cause:** Creating a `Device`/`Queue` per output instead of sharing.
+**Fix:** Construct `Instance`, `Adapter`, `Device`, `Queue` once in
+`RendererManager::init`. Each `OutputRenderer` gets a reference.
+Pipelines can also be shared when surface formats match, which they
+usually do.
 
 ---
 
-## ffmpeg-next
+## ffmpeg
 
-### E-12: ffmpeg::init() не викликаний
-**Зробив:** Пропустив `ffmpeg::init()` на початку  
-**Сталось:** Segfault або "No such decoder" при відкритті файлу  
-**Правильно:** Виклик `ffmpeg::init()?` — один раз, на початку `VideoDecoder::open()`
+### E-10 — per-frame Vec allocation in hot path
 
-### E-13: Не скинуто decoder buffer після seek
-**Зробив:** `input_ctx.seek(0, ..)` без `decoder.flush()`  
-**Сталось:** Перші кадри після seek — corrupted, "green garbage"  
-**Правильно:**
-```rust
-self.input_ctx.seek(0, ..)?;
-self.decoder.flush();  // обов'язково!
-```
+**Symptom:** Heaptrack shows 30 allocations/sec totalling ~240 MB/s
+during playback; `valgrind --tool=massif` agrees.
+**Cause:** `rgba.data(0).to_vec()` on every decoded frame.
+**Fix (v0.2):** `VideoDecoder` holds `frame_buf: Vec<u8>`. `next_frame_rgba`
+clears it, refills with slice/extend, and returns `&[u8]` borrowed from
+`self`. See `docs/DAEMON.md §video.rs`.
 
-### E-14: Пакети від аудіо-стріму потрапляли у відео-декодер
-**Зробив:** Передавав всі пакети в decoder без фільтрації по stream index  
-**Сталось:** `decode error: invalid data found when processing input`  
-**Правильно:**
-```rust
-for (stream, packet) in ctx.packets() {
-    if stream.index() != self.video_stream_idx { continue; }
-    self.decoder.send_packet(&packet)?;
-}
-```
+### E-11 — scaler output format RGB24 instead of RGBA
 
-### E-15: ffmpeg-next не бачить системний ffmpeg
-**Зробив:** `cargo build` без встановлених dev libraries  
-**Сталось:** `pkg-config: command not found` або `Could not find ffmpeg`  
-**Правильно:**
-```bash
-# Arch:
-sudo pacman -S ffmpeg pkgconf
-# Перевірка:
-pkg-config --libs libavcodec
-```
+**Symptom:** GPU texture upload fails with "size mismatch" or
+produces pink-tinted frames.
+**Cause:** wgpu textures are 4-byte-per-pixel; scaler configured for
+3.
+**Fix:** `Pixel::RGBA` as the scaler output format, `row_bytes = width * 4`.
+
+### E-15 — seek-to-start without decoder.flush()
+
+**Symptom:** First few frames after a video loop show green/pink
+garbage.
+**Cause:** Decoder internal buffers carry state from before the seek.
+**Fix:** Always `decoder.flush()` after `ctx.seek(0, ..)`.
 
 ---
 
-## rodio / Audio
+## Audio / rodio
 
-### E-16: OutputStream dropped раніше Sink
-**Зробив:** `let sink = Sink::try_new(&stream_handle)?` але `_output_stream` дропнувся  
-**Сталось:** Тиша — аудіо відтворюється в нікуди  
-**Правильно:** `_output_stream` і `stream_handle` мають жити весь час відтворення
-```rust
-let (_output_stream, stream_handle) = OutputStream::try_default()?;
-// обидва мають scope що включає весь audio loop
-```
+### E-16 — sink.append on empty source
 
-### E-17: AudioSamples повертає None
-**Зробив:** Реалізував `Iterator::next()` без wrap-around при досягненні кінця  
-**Сталось:** Аудіо грає один раз і зупиняється, rodio вважає Source вичерпаним  
-**Правильно:**
-```rust
-fn next(&mut self) -> Option<f32> {
-    if self.samples.is_empty() { return None; }
-    let val = self.samples[self.pos];
-    self.pos = (self.pos + 1) % self.samples.len();  // loop!
-    Some(val)
-}
-```
+**Symptom:** Silence with no error.
+**Cause:** Source iterator was consumed or `None` on first call.
+**Fix:** Sanity-check `Source::total_duration()` or preroll one chunk
+before `sink.append`.
+
+### E-17 — audio thread spawned without its own runtime
+
+**Symptom:** `tokio::sync::watch::Receiver::changed()` hangs forever
+inside the audio thread.
+**Cause:** `std::thread::spawn` gives a bare thread; watch channels
+need a tokio runtime context.
+**Fix:** Build a `current_thread` runtime inside the audio thread and
+`block_on` the async function.
+
+### E-28 — StreamingSource returns None on underrun
+
+**Symptom:** Audio plays for ~100 ms and stops. `rodio::Sink` reports
+empty even though the decoder thread is alive.
+**Cause:** `Iterator::next()` returned `None` instead of `Some(0.0)`
+during an underrun (channel empty).
+**Fix:** Never return `None` from `StreamingSource::next`. Return
+`Some(0.0)` (silence) when `rx.recv()` fails. rodio treats `None` as
+"source exhausted" and drops the sink.
+
+### E-29 — shutdown channel drop not observed by decoder thread
+
+**Symptom:** Decoder thread keeps running after the source is
+dropped; thread count grows monotonically.
+**Cause:** `shutdown_rx.try_recv()` only checked on each packet, but
+the decoder was blocked inside `ctx.packets()` reading a slow seek
+target.
+**Fix:** Also treat `tx.send(chunk).is_err()` as a shutdown signal
+(the consumer dropped the receiver). That covers the common case
+without needing async interrupts.
 
 ---
 
-## IPC / Serde
+## Async / tokio
 
-### E-18: Забутий flush після write
-**Зробив:** `writer.write_all(json.as_bytes()).await?` без `writer.flush().await?`  
-**Сталось:** Повідомлення застрягло в буфері `BufWriter`, інша сторона чекала нескінченно  
-**Правильно:** Завжди після кожного запису:
+### E-03 — spawn_blocking missing around CPU-bound work
+
+**Symptom:** TUI freezes for 5–15s during cache scan; daemon doesn't
+respond to other IPC connections.
+**Cause:** PKG extraction + SQLite writes run directly inside a
+`tokio::spawn`, blocking the worker thread.
+**Fix:** Wrap the scan body in `tokio::task::spawn_blocking`.
+
+### E-04 — mpsc::Sender dropped prematurely
+
+**Symptom:** `Receiver` gets `None` right after startup.
+**Cause:** Sender only held in a local scope; was dropped when the
+setup closure returned.
+**Fix:** Keep the sender in a long-lived owner (`DaemonState`).
+
+### E-12 — MutexGuard held across .await
+
+**Symptom:** Deadlock; `tokio::sync::Mutex` shows contention with no
+apparent holder; `tracing` logs stop.
+**Cause:** `let g = state.lock().await; do_io().await?;` — guard
+lives across the second await.
+**Fix:** Extract data and drop guard before awaiting:
+
 ```rust
-writer.write_all(json.as_bytes()).await?;
-writer.flush().await?;
+let value = {
+    let g = state.lock().await;
+    g.field.clone()
+};
+do_io(value).await?;
 ```
 
-### E-19: serde tag = "type" з одиночними варіантами
-**Зробив:** `#[serde(tag = "type")]` на enum де деякі варіанти не мають полів  
-**Сталось:** `{"type":"List"}` — OK, `{"type":"Ok"}` — OK  
-**Правильно:** Це ПРАВИЛЬНА поведінка для `tag = "type"`. Не потрібні `{}` після варіантів без полів.
+### E-13 — watch::Sender::send with identical value does not signal "unchanged"
 
-### E-20: EOF не перевірявся при read_line
-**Зробив:** `reader.read_line(&mut line).await?` без перевірки результату  
-**Сталось:** Нескінченний цикл при закритті з'єднання — `line` завжди порожня але помилки нема  
-**Правильно:**
-```rust
-let n = reader.read_line(&mut line).await?;
-if n == 0 { return Err(WpickError::IpcClosed); }
-```
+**Symptom:** Receiver sees `has_changed()` fire on every publish even
+when the value is the same.
+**Cause:** `send` always marks the channel as changed regardless of
+equality.
+**Fix:** Guard with `if new != old { tx.send(new) }` at the publish
+site. For `paused_tx`, this avoids redundant `sink.pause()` calls.
+
+---
+
+## IPC
+
+### E-14 — flush() missing after write_all
+
+**Symptom:** Client hangs on `read_line` forever; server thinks it
+wrote the response but it's stuck in `BufWriter`.
+**Cause:** `BufWriter::write_all` only fills the internal buffer.
+**Fix:** `writer.flush().await?` after every message. All send helpers
+in `wpick-core::ipc` do this; do the same in any hand-rolled code.
 
 ---
 
 ## ratatui / TUI
 
-### E-21: render_widget замість render_stateful_widget для List
-**Зробив:** `frame.render_widget(list, area)` для `List` віджету  
-**Сталось:** Список рендериться але виділення (highlight) не відображається  
-**Правильно:**
-```rust
-let mut state = ListState::default();
-state.select(Some(app.selected));
-frame.render_stateful_widget(list, area, &mut state);
-```
+### E-18 — render_widget instead of render_stateful_widget for List
 
-### E-22: Термінал не відновлений після паніки
-**Зробив:** `enable_raw_mode()` без гарантованого cleanup  
-**Сталось:** Після паніки термінал залишився в raw mode — клавіші не відображались  
-**Правильно:** Обгорни `run_app()` в catch_unwind або використай pattern з main.rs в TUI.md
+**Symptom:** Selected item not highlighted.
+**Cause:** `render_widget` ignores list state.
+**Fix:** `frame.render_stateful_widget(list, area, &mut app.list_state)`.
 
-### E-23: crossterm events блокують event loop
-**Зробив:** `crossterm::event::read()` без попереднього `poll(timeout)`  
-**Сталось:** UI зависав до натискання клавіші — не оновлювався стан з'єднання  
-**Правильно:**
+### E-19 — println! from inside TUI
+
+**Symptom:** Garbled terminal after a log message.
+**Cause:** `println!` writes to stdout which the alternate-screen
+captures.
+**Fix:** `tracing::info!` etc. goes to stderr by default.
+
+### E-20 — terminal state not restored after panic
+
+**Symptom:** Terminal left in raw mode with cursor hidden after a
+crash.
+**Cause:** No panic hook; teardown only runs on normal exit.
+**Fix:** Set a `std::panic::set_hook` that calls `disable_raw_mode`
+and `LeaveAlternateScreen`.
+
+### E-21 — crash on empty wallpaper list
+
+**Symptom:** Panic: "index out of bounds: the len is 0".
+**Cause:** `wallpapers[selected]` without bounds check.
+**Fix:** Always branch on `wallpapers.is_empty()` before indexing.
+
+### E-22 — missing arm in crossterm Event match
+
+**Symptom:** `unreachable!` panic on mouse move.
+**Cause:** `match Event { Key(..) => ... }` with no catch-all.
+**Fix:** Add `_ => {}`.
+
+### E-23 — holding &mut IpcClient across .await
+
+**Symptom:** Borrow checker errors; or at runtime, serialisation
+corruption when two futures write concurrently.
+**Cause:** `self.client.as_mut()` held while awaiting something else.
+**Fix:** Scope the `as_mut` borrow tightly; clone outputs before
+awaiting on other things.
+
+### E-24 — reconnect not attempted after daemon restart
+
+**Symptom:** TUI shows "Disconnected" forever until user quits and
+restarts.
+**Cause:** `try_reconnect` gated by `last_attempt < 2s` but never
+reset after a successful connect.
+**Fix:** Set `last_reconnect_attempt = None` on successful reconnect.
+
+### E-25 — MouseCapture enabled without handling mouse
+
+**Symptom:** Mouse events spam the event queue; poll returns busy.
+**Cause:** `EnableMouseCapture` in setup but no mouse branch.
+**Fix:** Either handle mouse events or don't capture them.
+
+---
+
+## PKG parsing
+
+### E-27 — length-prefixed PKG variant not detected
+
+**Symptom:** Extraction consumes file names and produces zero-byte
+outputs.
+**Cause:** Some tools prefix the archive with `u32_le(total_len)`
+before the `PKGV` magic; our reader started parsing the length as if
+it were the header.
+**Fix:** Peek first 8 bytes; if the magic is `"PKGV"` directly, use
+format A; if it's `u32 + "PKGV"`, return `Ok(None)` (unsupported,
+usually Scene-type). Log as `debug!`.
+
+---
+
+## Pause / system integration
+
+### E-33 — missing HYPRLAND_INSTANCE_SIGNATURE crashes pause task
+
+**Symptom:** Daemon exits immediately under non-Hyprland sessions
+with `thread panicked: NotPresent` from `std::env::var`.
+**Cause:** `PauseManager` called `.unwrap()` on the env var.
+**Fix:** Treat absence as "fullscreen source disabled":
+
 ```rust
-if crossterm::event::poll(Duration::from_millis(250))? {
-    // тільки тоді read()
-    let event = crossterm::event::read()?;
+match std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+    Ok(sig) => spawn_hyprland_task(sig, flag),
+    Err(_)  => {
+        tracing::info!("pause: source fullscreen disabled (not under Hyprland)");
+    }
 }
-// інакше просто перемалюй
 ```
+
+### E-34 — sysfs `online` file missing on desktops
+
+**Symptom:** On a PC without a battery, `on_battery` source's first
+read fails and the whole pause task returns error.
+**Cause:** `/sys/class/power_supply/*/online` glob returns empty.
+**Fix:** Check the glob at startup; if empty, disable the source
+with a single `info!` and continue.
+
+### E-35 — Hyprland socket drop on compositor reload
+
+See E-35 in the Wayland section above.
 
 ---
 
-## Cargo / Залежності
+## Appending new entries
 
-### E-24: Версії raw-window-handle не збігаються
-**Зробив:** `wayland-client` 0.31 + `raw-window-handle` 0.5  
-**Сталось:** `expected RawWindowHandle from version 0.5, found 0.6` — тип помилка  
-**Правильно:** Перевір `COMPAT.md` — версії мають бути з одного рядка таблиці
-
-### E-25: depkg не знайдено на crates.io
-**Зробив:** Спробував `cargo add depkg` — пакет не існує або інша назва  
-**Сталось:** `error: package 'depkg' not found`  
-**Правильно:** Перевір актуальну назву: `cargo search wallpaper engine` або шукай на crates.io.  
-Fallback: реалізувати PKG парсер вручну (формат описаний в CORE.md)
-
-### E-26: ffmpeg-next "7" несумісне з system FFmpeg 8.x (Arch 2025+)
-**Зробив:** `ffmpeg-next = "7"` в wpick-daemon/Cargo.toml на Arch Linux з FFmpeg n8.1  
-**Сталось:** `fatal error: '/usr/include/libavcodec/avfft.h' file not found` — avfft.h було видалено у FFmpeg 7.1, struct size mismatch у bindings  
-**Правильно:** Використовуй `ffmpeg-next = "8"` для system FFmpeg 8.x.  
-Перевірка: `ffmpeg -version | head -1` → якщо `n8.x` → потрібна `ffmpeg-next = "8"`
-
-### E-27: Newer PKG format with length-prefixed magic (`\x08\0\0\0PKGV`)
-**Зробив:** PKG extractor перевіряв тільки `PKGV0001` / `PKGV0005` magic  
-**Сталось:** `Unknown magic: "\u{8}\0\0\0PKGV"` — деякі wallpapers мають формат з u32 length-prefix перед `PKGV`  
-**Правильно:** При перевірці magic bytes також перевіряй байти 4..12 на `PKGV`:
-```rust
-let is_pkgv = magic == b"PKGV0001" || magic == b"PKGV0005"
-    || (data.len() >= 12 && &data[4..8] == b"PKGV");
-```
-Якщо знайдено length-prefix варіант — offset `pos = 4` (skip u32), тоді читай версію.  
-Або: gracefully skip як `Ok(None)` — ці wallpapers скоріш за все не video type.
-
----
-
-## Шаблон для нового запису
-
-```
-### E-XX: [Коротка назва]
-**Зробив:** [що саме зробив]
-**Сталось:** [що пішло не так]
-**Правильно:**
-[код або опис правильного рішення]
-```
+- Use the next available `E-NN` number (do not reuse).
+- Include: Symptom (what a user/dev sees), Cause (root mechanism),
+  Fix (exact pattern), cross-reference to doc if relevant.
+- Keep examples tight. The point is pattern recognition next time,
+  not a full tutorial.
