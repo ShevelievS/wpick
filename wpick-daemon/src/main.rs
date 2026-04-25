@@ -1,5 +1,6 @@
 mod audio;
 mod ducking;
+mod hw_decode;
 mod ipc_server;
 mod renderer;
 mod state;
@@ -150,7 +151,6 @@ async fn main() -> anyhow::Result<()> {
 
     // 12. Renderer — must run on this thread (Wayland is !Send)
     tracing::info!("Starting renderer");
-    eprintln!("DEBUG: about to start renderer");
     let local = tokio::task::LocalSet::new();
     local
         .run_until(renderer::run(renderer_rx, shutdown_rx))

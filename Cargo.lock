@@ -3186,6 +3186,8 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "ffmpeg-next",
+ "ffmpeg-sys-next",
+ "libc",
  "libpulse-binding",
  "parking_lot",
  "pollster",
