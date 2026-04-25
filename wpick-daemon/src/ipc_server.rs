@@ -113,9 +113,14 @@ async fn dispatch(
         }
 
         ClientCommand::Volume { level } => {
-            state.lock().await.set_volume(level);
+            let muted = {
+                let mut s = state.lock().await;
+                s.set_volume(level);
+                s.muted
+            };
             let mut cfg = WpickConfig::load().unwrap_or_default();
             cfg.general.volume = level.clamp(0.0, 1.0);
+            cfg.general.muted  = muted;
             if let Err(e) = cfg.save() {
                 tracing::warn!("Config save failed: {}", e);
             }
@@ -123,9 +128,12 @@ async fn dispatch(
         }
 
         ClientCommand::Mute => {
-            state.lock().await.toggle_mute();
+            // Toggle and read state in one lock so a concurrent Mute command
+            // cannot interleave between the toggle and the state read, which
+            // would cause the wrong muted value to be written to config.
             let (vol, muted) = {
-                let s = state.lock().await;
+                let mut s = state.lock().await;
+                s.toggle_mute();
                 (s.volume, s.muted)
             };
             let mut cfg = WpickConfig::load().unwrap_or_default();

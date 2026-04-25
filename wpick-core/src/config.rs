@@ -1,5 +1,6 @@
 use crate::error::{Result, WpickError};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 // ─── Config structs ───────────────────────────────────────────────────────────
@@ -9,9 +10,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct WpickConfig {
-    pub general: GeneralConfig,
-    pub paths:   PathsConfig,
-    pub wayland: WaylandConfig,
+    pub general:   GeneralConfig,
+    pub paths:     PathsConfig,
+    pub wayland:   WaylandConfig,
+    // v0.2 additions:
+    pub monitors:  HashMap<String, MonitorConfig>,  // keyed by wl_output name
+    pub pause:     PauseConfig,
+    pub audio:     AudioConfig,
+    pub autostart: bool,
 }
 
 /// Playback / audio settings.
@@ -40,6 +46,60 @@ pub struct PathsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WaylandConfig {
     pub preferred_gpu: String,
+}
+
+/// Per-monitor wallpaper configuration, keyed by wl_output name in `WpickConfig::monitors`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct MonitorConfig {
+    pub wallpaper_id: Option<u64>,
+    pub fit:          FitMode,
+    pub mute:         bool,
+}
+
+/// How the wallpaper video is scaled to fill the monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FitMode {
+    #[default]
+    Fill,
+    Fit,
+    Stretch,
+    Center,
+}
+
+/// Auto-pause triggers — all default-off except `on_fullscreen`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PauseConfig {
+    pub on_fullscreen: bool,
+    pub on_battery:    bool,
+    pub on_lid_close:  bool,
+}
+
+impl Default for PauseConfig {
+    fn default() -> Self {
+        Self { on_fullscreen: true, on_battery: false, on_lid_close: false }
+    }
+}
+
+/// Audio pipeline tuning parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Frames per streaming chunk sent from decoder thread to rodio sink.
+    /// 2048 @ 48 kHz stereo ≈ 42 ms of audio per chunk.
+    pub chunk_frames:    usize,
+    /// Hard cap on total in-flight audio RAM, MB.
+    pub max_preload_mb:  u64,
+    /// Fade out wpick audio when another app plays sound.
+    pub ducking_enabled: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self { chunk_frames: 2048, max_preload_mb: 50, ducking_enabled: true }
+    }
 }
 
 // ─── AppDirs ─────────────────────────────────────────────────────────────────
@@ -181,6 +241,17 @@ mod tests {
         let cfg = WpickConfig::load_from(&non_existent)?;
         assert_eq!(cfg.general.volume, 0.8_f32);
         assert!(!cfg.general.muted);
+
+        // v0.2 defaults present even when no file exists
+        assert!(cfg.pause.on_fullscreen);
+        assert!(!cfg.pause.on_battery);
+        assert!(!cfg.pause.on_lid_close);
+        assert_eq!(cfg.audio.chunk_frames, 2048);
+        assert_eq!(cfg.audio.max_preload_mb, 50);
+        assert!(cfg.audio.ducking_enabled);
+        assert!(cfg.monitors.is_empty());
+        assert!(!cfg.autostart);
+        assert_eq!(cfg.audio.chunk_frames, 2048);
         Ok(())
     }
 
@@ -191,10 +262,109 @@ mod tests {
 
         let mut cfg = WpickConfig::default();
         cfg.general.volume = 0.5;
+        cfg.pause.on_battery = true;
+        cfg.audio.chunk_frames = 4096;
+        cfg.autostart = true;
+        cfg.monitors.insert("HDMI-A-1".into(), MonitorConfig {
+            wallpaper_id: Some(12345),
+            fit: FitMode::Stretch,
+            mute: true,
+        });
         cfg.save_to(&path)?;
 
         let reloaded = WpickConfig::load_from(&path)?;
         assert_eq!(reloaded.general.volume, 0.5_f32);
+        assert!(reloaded.pause.on_battery);
+        assert_eq!(reloaded.audio.chunk_frames, 4096);
+        assert!(reloaded.autostart);
+
+        let mon = reloaded.monitors.get("HDMI-A-1").expect("HDMI-A-1 missing");
+        assert_eq!(mon.wallpaper_id, Some(12345));
+        assert_eq!(mon.fit, FitMode::Stretch);
+        assert!(mon.mute);
         Ok(())
+    }
+
+    #[test]
+    fn test_v01_config_forward_compat() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("config.toml");
+
+        // Minimal v0.1-era config — only [general] section
+        std::fs::write(&path, r#"
+[general]
+volume = 0.5
+muted  = true
+
+[paths]
+cache_dir = ""
+"#)?;
+
+        let cfg = WpickConfig::load_from(&path)?;
+
+        // v0.1 fields preserved
+        assert_eq!(cfg.general.volume, 0.5_f32);
+        assert!(cfg.general.muted);
+
+        // v0.2 fields all have correct defaults
+        assert!(cfg.pause.on_fullscreen,  "pause.on_fullscreen should default to true");
+        assert!(!cfg.pause.on_battery,    "pause.on_battery should default to false");
+        assert!(!cfg.pause.on_lid_close,  "pause.on_lid_close should default to false");
+        assert_eq!(cfg.audio.chunk_frames,   2048);
+        assert_eq!(cfg.audio.max_preload_mb, 50);
+        assert!(cfg.audio.ducking_enabled,   "audio.ducking_enabled should default to true");
+        assert!(cfg.monitors.is_empty(),     "monitors should be empty when not in config");
+        assert!(!cfg.autostart,              "autostart should default to false");
+        Ok(())
+    }
+
+    #[test]
+    fn test_v02_new_sections_round_trip() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("config.toml");
+
+        let mut cfg = WpickConfig::default();
+        cfg.pause = PauseConfig { on_fullscreen: false, on_battery: true, on_lid_close: true };
+        cfg.audio = AudioConfig { chunk_frames: 1024, max_preload_mb: 100, ducking_enabled: false };
+        cfg.autostart = true;
+        cfg.monitors.insert("DP-1".into(), MonitorConfig {
+            wallpaper_id: Some(99999),
+            fit: FitMode::Center,
+            mute: false,
+        });
+        cfg.save_to(&path)?;
+
+        let r = WpickConfig::load_from(&path)?;
+        assert!(!r.pause.on_fullscreen);
+        assert!(r.pause.on_battery);
+        assert!(r.pause.on_lid_close);
+        assert_eq!(r.audio.chunk_frames, 1024);
+        assert_eq!(r.audio.max_preload_mb, 100);
+        assert!(!r.audio.ducking_enabled);
+        assert!(r.autostart);
+
+        let dp1 = r.monitors.get("DP-1").expect("DP-1 missing");
+        assert_eq!(dp1.wallpaper_id, Some(99999));
+        assert_eq!(dp1.fit, FitMode::Center);
+        assert!(!dp1.mute);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fitmode_default_is_fill() {
+        assert_eq!(FitMode::default(), FitMode::Fill);
+    }
+
+    #[test]
+    fn test_fitmode_serde_lowercase() {
+        // TOML can't serialize a bare value at root (E-36) — wrap in a struct.
+        #[derive(Serialize, Deserialize)]
+        struct Wrap { fit: FitMode }
+
+        let s = toml::to_string(&Wrap { fit: FitMode::Stretch }).unwrap();
+        assert!(s.contains("stretch"), "FitMode::Stretch should serialize as 'stretch', got: {s}");
+
+        let back: Wrap = toml::from_str("fit = \"center\"").unwrap();
+        assert_eq!(back.fit, FitMode::Center);
     }
 }
