@@ -42,6 +42,12 @@ impl VideoDecoder {
         let fps = {
             let r = stream.avg_frame_rate();
             let v = r.numerator() as f64 / r.denominator().max(1) as f64;
+            if v < 1.0 {
+                tracing::warn!(
+                    "Video reports fps={:.3} (num={} den={}) — clamping to 1.0",
+                    v, r.numerator(), r.denominator()
+                );
+            }
             v.max(1.0)
         };
 
@@ -105,17 +111,35 @@ impl VideoDecoder {
 
                         if stride == row_bytes {
                             // Packed layout — one shot
-                            self.frame_buf.extend_from_slice(
-                                &src[..row_bytes * height as usize],
-                            );
+                            let needed = row_bytes * height as usize;
+                            if src.len() < needed {
+                                tracing::warn!(
+                                    "Corrupt frame: src.len()={} < needed={}, skipping",
+                                    src.len(), needed
+                                );
+                                continue;
+                            }
+                            self.frame_buf.extend_from_slice(&src[..needed]);
                         } else {
                             // ffmpeg added per-row padding — strip it
                             self.frame_buf.reserve(row_bytes * height as usize);
+                            let mut corrupt = false;
                             for row in 0..height as usize {
                                 let start = row * stride;
-                                self.frame_buf.extend_from_slice(
-                                    &src[start..start + row_bytes],
-                                );
+                                let end   = start + row_bytes;
+                                if end > src.len() {
+                                    tracing::warn!(
+                                        "Corrupt frame: stride={} row_bytes={} src.len()={} at row={}, skipping",
+                                        stride, row_bytes, src.len(), row
+                                    );
+                                    corrupt = true;
+                                    break;
+                                }
+                                self.frame_buf.extend_from_slice(&src[start..end]);
+                            }
+                            if corrupt {
+                                self.frame_buf.clear();
+                                continue;
                             }
                         }
 

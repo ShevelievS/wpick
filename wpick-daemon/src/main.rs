@@ -60,21 +60,27 @@ async fn main() -> anyhow::Result<()> {
         shutdown_tx: shutdown_tx.clone(),
     }));
 
-    // 6. Stale socket check
+    // 6 + 7. Atomic socket bind: try to bind first, then handle EADDRINUSE.
+    // This avoids the TOCTOU race of exists()→remove()→bind(). (C-3)
     let socket_path = dirs.socket_path.clone();
-    if socket_path.exists() {
-        if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
-            anyhow::bail!(
-                "Another wpick-daemon is already running at {:?}",
-                socket_path
-            );
+    let listener = match tokio::net::UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Socket file exists — check if a live daemon owns it
+            if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+                anyhow::bail!(
+                    "Another wpick-daemon is already running at {:?}",
+                    socket_path
+                );
+            }
+            // Stale socket (process gone) — remove and rebind
+            tracing::info!("Removing stale socket at {:?}", socket_path);
+            std::fs::remove_file(&socket_path).context("Failed to remove stale socket")?;
+            tokio::net::UnixListener::bind(&socket_path)
+                .context("Failed to bind socket after removing stale one")?
         }
-        std::fs::remove_file(&socket_path).context("Failed to remove stale socket")?;
-    }
-
-    // 7. Bind socket
-    let listener = tokio::net::UnixListener::bind(&socket_path)
-        .context("Failed to bind Unix socket")?;
+        Err(e) => return Err(e).context("Failed to bind Unix socket"),
+    };
     tracing::info!("Listening on {:?}", socket_path);
 
     // 8. Cleanup helper

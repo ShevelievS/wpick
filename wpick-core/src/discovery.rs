@@ -84,11 +84,17 @@ pub fn find_wallpaper_dirs(_config: &WpickConfig) -> Result<Vec<WallpaperDir>> {
             }
         };
 
-        let folders: LibraryFolders =
-            keyvalues_serde::from_str(&content).map_err(|e| WpickError::VdfParse {
-                path:   vdf_path.display().to_string(),
-                reason: e.to_string(),
-            })?;
+        let folders: LibraryFolders = match keyvalues_serde::from_str(&content) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    path = %vdf_path.display(),
+                    error = %e,
+                    "Failed to parse VDF — skipping this Steam root"
+                );
+                continue;
+            }
+        };
 
         for entry in folders.entries.values() {
             let library_root = PathBuf::from(&entry.path);

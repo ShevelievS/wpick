@@ -54,7 +54,7 @@ fn extract_pkg(pkg_path: &Path, out_dir: &Path) -> Result<()> {
     if magic != b"PKGV0001" && magic != b"PKGV0005" {
         return Err(WpickError::PkgExtract {
             id:     0,
-            reason: format!("Unknown magic: {:?}", std::str::from_utf8(magic).unwrap_or("?")),
+            reason: format!("Unknown magic: {}", magic.iter().map(|b| format!("{b:02x}")).collect::<String>()),
         });
     }
 
@@ -72,6 +72,13 @@ fn extract_pkg(pkg_path: &Path, out_dir: &Path) -> Result<()> {
             .map_err(|_| WpickError::PkgExtract { id: 0, reason: "Bad file count bytes".into() })?,
     ) as usize;
     pos += 4;
+
+    if file_count > 65_536 {
+        return Err(WpickError::PkgExtract {
+            id:     0,
+            reason: format!("Implausible file_count={file_count} — refusing to process"),
+        });
+    }
 
     for _ in 0..file_count {
         if pos + 4 > data.len() {
@@ -108,7 +115,28 @@ fn extract_pkg(pkg_path: &Path, out_dir: &Path) -> Result<()> {
         let file_data = &data[pos..pos + data_len];
         pos += data_len;
 
-        let out_path = out_dir.join(name);
+        // Sanitize: strip leading slashes and any ".." components to prevent
+        // path traversal (e.g. "../../.bashrc" in a crafted PKG). (H-6)
+        let safe_name = name
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|c| *c != ".." && !c.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if safe_name.is_empty() {
+            tracing::debug!("PKG: skipping empty/unsafe name {:?}", name);
+            continue;
+        }
+
+        let out_path = out_dir.join(&safe_name);
+        // Final guard: out_path must be inside out_dir
+        if !out_path.starts_with(out_dir) {
+            return Err(WpickError::PkgExtract {
+                id:     0,
+                reason: format!("Path traversal attempt: {name:?}"),
+            });
+        }
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -304,6 +332,46 @@ mod tests {
         assert!(stamp.exists(), ".pkg_mtime stamp should be written after extraction");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_path_traversal_rejected() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        // Build a PKG with a path-traversal filename
+        let mut pkg_bytes = b"PKGV0001".to_vec();
+        pkg_bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 file
+
+        let traversal = b"../../evil.sh";
+        pkg_bytes.extend_from_slice(&(traversal.len() as u32).to_le_bytes());
+        pkg_bytes.extend_from_slice(traversal);
+        let content = b"pwned";
+        pkg_bytes.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        pkg_bytes.extend_from_slice(content);
+
+        let pkg_path = tmp.path().join("scene.pkg");
+        std::fs::write(&pkg_path, &pkg_bytes)?;
+
+        let wd = make_wallpaper_dir(99998, tmp.path());
+        let _ = extract_and_parse(&wd, cache_dir.path()); // may succeed or fail
+
+        // The traversal target must NOT have been written
+        let evil = cache_dir.path().parent().unwrap().join("evil.sh");
+        assert!(!evil.exists(), "path traversal must be blocked");
+        Ok(())
+    }
+
+    #[test]
+    fn test_file_count_guard() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut pkg_bytes = b"PKGV0001".to_vec();
+        pkg_bytes.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // absurd count
+        std::fs::write(tmp.path().join("scene.pkg"), &pkg_bytes).unwrap();
+        let out = tempfile::TempDir::new().unwrap();
+        let wd = make_wallpaper_dir(99997, tmp.path());
+        let r = extract_and_parse(&wd, out.path());
+        assert!(r.is_err(), "absurd file_count must be rejected");
     }
 
     #[test]
