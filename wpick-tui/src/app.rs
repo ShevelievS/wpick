@@ -253,7 +253,7 @@ impl App {
     async fn cmd_volume_up(&mut self) {
         let new_vol = (self.config.general.volume + 0.05).clamp(0.0, 1.0);
         match self.send(ClientCommand::Volume { level: new_vol }).await {
-            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+            Ok(DaemonResponse::VolumeState { volume, muted, .. }) => {
                 self.config.general.volume = volume;
                 self.config.general.muted  = muted;
                 self.set_status_ok(format!("Vol {:.0}%", volume * 100.0));
@@ -269,7 +269,7 @@ impl App {
     async fn cmd_volume_down(&mut self) {
         let new_vol = (self.config.general.volume - 0.05).clamp(0.0, 1.0);
         match self.send(ClientCommand::Volume { level: new_vol }).await {
-            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+            Ok(DaemonResponse::VolumeState { volume, muted, .. }) => {
                 self.config.general.volume = volume;
                 self.config.general.muted  = muted;
                 self.set_status_ok(format!("Vol {:.0}%", volume * 100.0));
@@ -284,7 +284,7 @@ impl App {
 
     async fn cmd_mute(&mut self) {
         match self.send(ClientCommand::Mute).await {
-            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+            Ok(DaemonResponse::VolumeState { volume, muted, .. }) => {
                 // Use the authoritative daemon state — no client-side guessing.
                 self.config.general.volume = volume;
                 self.config.general.muted  = muted;
@@ -375,12 +375,15 @@ impl App {
         }
     }
 
-    /// Query the daemon for current volume/muted and update local config.
+    /// Query the daemon for current volume/muted/wallpaper and update local state.
     async fn sync_volume_state(&mut self) {
         match self.send(ClientCommand::Status).await {
-            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+            Ok(DaemonResponse::VolumeState { volume, muted, current_id }) => {
                 self.config.general.volume = volume;
                 self.config.general.muted  = muted;
+                if current_id.is_some() {
+                    self.current_wallpaper_id = current_id;
+                }
             }
             Ok(_) | Err(_) => {}
         }

@@ -116,33 +116,31 @@ async fn dispatch(
         }
 
         ClientCommand::Volume { level } => {
-            let (vol, muted) = {
+            let (vol, muted, current_id) = {
                 let mut s = state.lock().await;
                 s.set_volume(level);
-                (s.volume, s.muted)
+                (s.volume, s.muted, s.current.as_ref().map(|w| w.id))
             };
             save_volume_config(vol, muted);
-            DaemonResponse::VolumeState { volume: vol, muted }
+            DaemonResponse::VolumeState { volume: vol, muted, current_id }
         }
 
         ClientCommand::Mute => {
-            // Toggle and read state in one lock so a concurrent Mute command
-            // cannot interleave between the toggle and the state read. (fixed)
-            let (vol, muted) = {
+            let (vol, muted, current_id) = {
                 let mut s = state.lock().await;
                 s.toggle_mute();
-                (s.volume, s.muted)
+                (s.volume, s.muted, s.current.as_ref().map(|w| w.id))
             };
             save_volume_config(vol, muted);
-            DaemonResponse::VolumeState { volume: vol, muted }
+            DaemonResponse::VolumeState { volume: vol, muted, current_id }
         }
 
         ClientCommand::Status => {
-            let (vol, muted) = {
+            let (vol, muted, current_id) = {
                 let s = state.lock().await;
-                (s.volume, s.muted)
+                (s.volume, s.muted, s.current.as_ref().map(|w| w.id))
             };
-            DaemonResponse::VolumeState { volume: vol, muted }
+            DaemonResponse::VolumeState { volume: vol, muted, current_id }
         }
 
         ClientCommand::Info { id } => {
@@ -169,22 +167,18 @@ async fn dispatch(
 // ─── Config persistence helper ────────────────────────────────────────────────
 
 /// Persist volume and muted state to config.
-/// Loads the current config from disk first so unrelated fields are preserved.
-/// On load failure, logs a warning and uses an in-memory default rather than
-/// silently destroying the entire config. (F-3)
+/// Reads current config from disk once to preserve other fields, then saves.
+/// Errors are logged and swallowed — a failed volume save is not fatal.
 fn save_volume_config(volume: f32, muted: bool) {
-    let mut cfg = match WpickConfig::load() {
-        Ok(c)  => c,
-        Err(e) => {
-            tracing::warn!("Config load failed, saving volume/muted to default shell: {}", e);
-            WpickConfig::default()
+    // Spawn blocking I/O off the async executor.
+    tokio::task::spawn_blocking(move || {
+        let mut cfg = WpickConfig::load().unwrap_or_default();
+        cfg.general.volume = volume;
+        cfg.general.muted  = muted;
+        if let Err(e) = cfg.save() {
+            tracing::warn!("Config save failed: {}", e);
         }
-    };
-    cfg.general.volume = volume;
-    cfg.general.muted  = muted;
-    if let Err(e) = cfg.save() {
-        tracing::warn!("Config save failed: {}", e);
-    }
+    });
 }
 
 // ─── Cache population ─────────────────────────────────────────────────────────

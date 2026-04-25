@@ -30,7 +30,14 @@ pub enum DaemonResponse {
     WallpaperList { items: Vec<WallpaperInfo> },
     WallpaperInfo { item: WallpaperInfo },
     /// Returned by Volume, Mute, and Status — carries the authoritative runtime state.
-    VolumeState   { volume: f32, muted: bool },
+    /// `current_id` is the active wallpaper Workshop ID, or None when nothing is playing.
+    /// `#[serde(default)]` keeps it compatible with v0.1 daemons that don't send the field.
+    VolumeState {
+        volume:     f32,
+        muted:      bool,
+        #[serde(default)]
+        current_id: Option<u64>,
+    },
 }
 
 // ─── Send / Receive helpers ───────────────────────────────────────────────────
@@ -148,7 +155,7 @@ mod tests {
             DaemonResponse::Error { message: "oops".into() },
             DaemonResponse::WallpaperList { items: vec![sample_info.clone()] },
             DaemonResponse::WallpaperInfo { item: sample_info },
-            DaemonResponse::VolumeState { volume: 0.75, muted: false },
+            DaemonResponse::VolumeState { volume: 0.75, muted: false, current_id: None },
         ];
 
         for resp in &responses {

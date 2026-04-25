@@ -141,6 +141,12 @@ impl DuckHandle {
 
 // ─── Start ducking thread ─────────────────────────────────────────────────────
 
+/// No-op handle used when `audio.ducking_enabled = false` in config.
+/// All methods are safe to call — they simply do nothing.
+pub fn start_noop() -> DuckHandle {
+    DuckHandle { shared: None, stop: Arc::new(AtomicBool::new(false)) }
+}
+
 pub fn start() -> DuckHandle {
     let shared = Shared::new();
     let stop   = Arc::new(AtomicBool::new(false));
@@ -236,8 +242,9 @@ fn pa_loop(
 // ─── Count non-wpick sink-inputs ──────────────────────────────────────────────
 
 fn count_foreign(ml: &mut Mainloop, ctx: &Context) -> u32 {
-    let count: Arc<Mutex<u32>>  = Arc::new(Mutex::new(0));
-    let done:  Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    let count: Arc<AtomicU32>  = Arc::new(AtomicU32::new(0));
+    let done:  Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     let count_cb = count.clone();
     let done_cb  = done.clone();
@@ -249,23 +256,22 @@ fn count_foreign(ml: &mut Mainloop, ctx: &Context) -> u32 {
                     .get_str("application.name")
                     .unwrap_or_default();
                 if !name.contains(OUR_APP) && !info.corked {
-                    if let Ok(mut c) = count_cb.lock() { *c += 1; }
+                    count_cb.fetch_add(1, Ordering::Relaxed);
                 }
             }
             ListResult::End | ListResult::Error => {
-                if let Ok(mut d) = done_cb.lock() { *d = true; }
+                done_cb.store(true, Ordering::Release);
             }
         }
     });
 
     loop {
-        if *done.lock().unwrap() { break; }
+        if done.load(Ordering::Acquire) { break; }
         match ml.iterate(true) {
             IterateResult::Quit(_) | IterateResult::Err(_) => break,
             IterateResult::Success(_) => {}
         }
     }
 
-    let result = *count.lock().unwrap();
-    result
+    count.load(Ordering::Relaxed)
 }

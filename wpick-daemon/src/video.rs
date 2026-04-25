@@ -6,7 +6,6 @@ use ffmpeg_next::format::Pixel;
 use ffmpeg_next::media::Type;
 use ffmpeg_next::software::scaling::flag::Flags;
 
-#[allow(dead_code)]
 pub struct VideoDecoder {
     input_ctx:        ffmpeg::format::context::Input,
     video_stream_idx: usize,
@@ -18,7 +17,6 @@ pub struct VideoDecoder {
     frame_buf:        Vec<u8>,
 }
 
-#[allow(dead_code)]
 impl VideoDecoder {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         ffmpeg::init().context("ffmpeg::init failed")?;

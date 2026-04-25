@@ -132,17 +132,26 @@ async fn main() -> anyhow::Result<()> {
 
     // 11. Audio task — dedicated OS thread (rodio OutputStream is !Send)
     // ducking::start() is called here so PulseAudio init doesn't block the
-    // main thread and a slow/absent PA doesn't delay IPC or renderer startup
+    // main thread and a slow/absent PA doesn't delay IPC or renderer startup.
+    // A-4/A-5: AudioConfig (chunk_frames, max_preload_mb) and ducking_enabled
+    // are read from config and forwarded to the audio/ducking subsystems.
     {
+        let audio_cfg       = config.audio.clone();
+        let ducking_enabled = config.audio.ducking_enabled;
         std::thread::Builder::new()
             .name("audio".into())
             .spawn(move || {
-                let duck = ducking::start();
+                let duck = if ducking_enabled {
+                    ducking::start()
+                } else {
+                    tracing::info!("Ducking disabled by config");
+                    ducking::start_noop()
+                };
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("audio runtime");
-                if let Err(e) = rt.block_on(audio::run(duck, audio_rx, volume_rx)) {
+                if let Err(e) = rt.block_on(audio::run(duck, audio_rx, volume_rx, audio_cfg)) {
                     tracing::error!("Audio task: {}", e);
                 }
             })

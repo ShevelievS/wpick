@@ -129,8 +129,13 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<WaylandState>,
     ) {
-        if let wl_output::Event::Mode { width, height, .. } = event {
-            if width > 0 && height > 0 {
+        // E-31: only apply the CURRENT mode — compositors send multiple Mode events
+        // (one per supported resolution) before the active one; acting on any of them
+        // would set the wrong resolution.
+        if let wl_output::Event::Mode { flags, width, height, .. } = event {
+            use wayland_client::WEnum;
+            let is_current = matches!(flags, WEnum::Value(f) if f.contains(wl_output::Mode::Current));
+            if is_current && width > 0 && height > 0 {
                 state.output_width  = width  as u32;
                 state.output_height = height as u32;
             }
@@ -502,7 +507,9 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
         width:        surf_w,
         height:       surf_h,
         present_mode: wgpu::PresentMode::Fifo,
-        alpha_mode:   caps.alpha_modes[0],
+        // B-2: alpha_modes can be empty on some drivers — avoid panic.
+        alpha_mode:   caps.alpha_modes.first().copied()
+                          .unwrap_or(wgpu::CompositeAlphaMode::Auto),
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
     };
