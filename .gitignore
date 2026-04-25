@@ -1,13 +1,37 @@
-/target
-.env
-*.log
-.md
-/skills/
-/docs/
+# ── Build output ─────────────────────────────────────────────────────────────
+/target/
 
-# Internal process files
+# ── Environment / secrets ────────────────────────────────────────────────────
+.env
+.env.*
+
+# ── Editor artefacts ─────────────────────────────────────────────────────────
+*.save
+*.swp
+*.swo
+*.orig
+*~
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Temp archives / session dumps ────────────────────────────────────────────
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+*.zip
+*.bak
+
+# ── Log files ────────────────────────────────────────────────────────────────
+*.log
+
+# ── Internal dev / AI process docs (never public) ────────────────────────────
 /PROMPTS.md
 /PROMPTS_V0.2.md
 /SEQUENCE.md
 /ERRORS_TO_AVOID.md
 /COMPAT.md
+/skills/
+/docs/
+/reports/

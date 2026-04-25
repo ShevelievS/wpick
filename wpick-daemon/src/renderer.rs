@@ -29,6 +29,7 @@ struct WaylandState {
     configure_serial: u32,
     surf_width:       u32,
     surf_height:      u32,
+    needs_ack:        bool,
 }
 
 impl Default for WaylandState {
@@ -43,6 +44,7 @@ impl Default for WaylandState {
             configure_serial: 0,
             surf_width:       0,
             surf_height:      0,
+            needs_ack:        false,
         }
     }
 }
@@ -72,7 +74,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                     if state._output.is_none() {
                         state._output = Some(
                             registry.bind::<wl_output::WlOutput, _, _>(
-                                name, version.min(3), qh, (),
+                                name, version.min(4), qh, (),
                             ),
                         );
                     }
@@ -112,6 +114,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandState {
             state.surf_width       = width;
             state.surf_height      = height;
             state.configured       = true;
+            state.needs_ack        = true;
         }
     }
 }
@@ -206,15 +209,24 @@ fn upload_frame(
 }
 
 fn render_frame(
-    surface:    &wgpu::Surface,
-    device:     &wgpu::Device,
-    queue:      &wgpu::Queue,
-    pipeline:   &wgpu::RenderPipeline,
-    bind_group: &wgpu::BindGroup,
+    surface:        &wgpu::Surface,
+    device:         &wgpu::Device,
+    queue:          &wgpu::Queue,
+    pipeline:       &wgpu::RenderPipeline,
+    bind_group:     &wgpu::BindGroup,
+    surface_config: &wgpu::SurfaceConfiguration,
 ) -> anyhow::Result<bool> {
     let frame = match surface.get_current_texture() {
         Ok(f) => f,
-        Err(wgpu::SurfaceError::Timeout | wgpu::SurfaceError::Outdated) => return Ok(false),
+        // Lost and Outdated both mean the swap chain is invalid on Wayland/Vulkan.
+        // reconfigure rebuilds only the swap chain — Device/Queue/Pipeline untouched.
+        // See E-37, E-39.
+        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            surface.configure(device, surface_config);
+            return Ok(false);
+        }
+        // Timeout: compositor temporarily busy. Retry next frame without reconfigure.
+        Err(wgpu::SurfaceError::Timeout) => return Ok(false),
         Err(e) => return Err(anyhow::anyhow!("Surface error: {}", e)),
     };
     let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -264,6 +276,7 @@ struct RendererCtx {
     sampler:       wgpu::Sampler,
     surf_w:        u32,
     surf_h:        u32,
+    surface_config: wgpu::SurfaceConfiguration,
 }
 
 // ─── Blocking init ────────────────────────────────────────────────────────────
@@ -326,6 +339,8 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
     layer_surface.ack_configure(wls.configure_serial);
     wl_surface.commit();
     evq.flush().context("flush after ack_configure")?;
+    // Init already consumed the startup Configure — prevent render loop from re-acking it.
+    wls.needs_ack = false;
 
     eprintln!("DEBUG: Wayland surface ready: {}x{}", surf_w, surf_h);
 
@@ -377,7 +392,7 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
     let format = caps.formats[0];
     eprintln!("DEBUG: surface format = {:?}", format);
 
-    wgpu_surface.configure(&device, &wgpu::SurfaceConfiguration {
+    let surface_config = wgpu::SurfaceConfiguration {
         usage:        wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
         width:        surf_w,
@@ -386,7 +401,8 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
         alpha_mode:   caps.alpha_modes[0],
         view_formats: vec![],
         desired_maximum_frame_latency: 2,
-    });
+    };
+    wgpu_surface.configure(&device, &surface_config);
 
     // ── Pipeline ──────────────────────────────────────────────────────────────
     let shader_vert = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -477,6 +493,7 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
         sampler,
         surf_w,
         surf_h,
+        surface_config,
     })
 }
 
@@ -577,31 +594,61 @@ fn render_loop(
             }
         }
 
+        // ── Handle Wayland re-configure (e.g. after fullscreen exit) ─────────
+        if ctx.wls.needs_ack {
+            ctx.wls.needs_ack = false;
+
+            // Ack the configure event as required by the protocol
+            ctx.layer_surface.ack_configure(ctx.wls.configure_serial);
+
+            // Commit the surface so the compositor applies the new state (E-06)
+            ctx.wl_surface.commit();
+
+            // Flush to ensure ack+commit reach the compositor
+            if let Err(e) = ctx.evq.flush() {
+                tracing::warn!("flush after re-configure: {}", e);
+            }
+
+            // Reconfigure the wgpu swapchain to match the new surface dimensions.
+            // surf_width/surf_height are 0 when compositor delegates size to us —
+            // in that case keep the existing surface_config dimensions.
+            let new_w = if ctx.wls.surf_width  > 0 { ctx.wls.surf_width  } else { ctx.surface_config.width  };
+            let new_h = if ctx.wls.surf_height > 0 { ctx.wls.surf_height } else { ctx.surface_config.height };
+
+            if new_w != ctx.surface_config.width || new_h != ctx.surface_config.height {
+                ctx.surface_config.width  = new_w;
+                ctx.surface_config.height = new_h;
+                tracing::info!("Surface resized: {}x{}", new_w, new_h);
+            }
+
+            ctx.wgpu_surface.configure(&ctx.device, &ctx.surface_config);
+            tracing::info!("Re-configured after compositor event ({}x{})", new_w, new_h);
+        }
+
         // ── Decode + upload + render ──────────────────────────────────────────
         if let Some(ref mut dec) = decoder {
             if Instant::now() >= next_frame {
                 match dec.next_frame_rgba() {
                     Ok(Some((rgba, w, h))) => {
-                        upload_frame(&ctx.queue, &video_tex, &rgba, w, h);
+                        upload_frame(&ctx.queue, &video_tex, rgba, w, h);
 
                         match render_frame(
                             &ctx.wgpu_surface, &ctx.device, &ctx.queue,
-                            &ctx.pipeline, &bind_group,
+                            &ctx.pipeline, &bind_group, &ctx.surface_config,
                         ) {
-                            // FIX 2 applied here: NO wl_surface.commit() after present.
-                            // wgpu Vulkan backend (VK_KHR_wayland_surface) handles
-                            // buffer attachment and surface commit internally.
-                            // A manual commit here causes a double-commit that makes
-                            // the compositor discard the rendered buffer.
-                            Ok(true)  => {}
-                            Ok(false) => {} // Timeout/Outdated — compositor busy, retry
-                            Err(e)    => tracing::warn!("render_frame: {}", e),
+                            // Frame presented — advance timer by one frame duration.
+                            // Additive update avoids drift from decode+upload time (FIX 5).
+                            Ok(true) => {
+                                next_frame += dec.frame_duration();
+                            }
+                            // Frame NOT presented (Lost/Outdated reconfigured, or Timeout).
+                            // Reset timer to now+duration so the decoder does not race ahead
+                            // while the surface is dead, causing a freeze on recovery. See E-38.
+                            Ok(false) => {
+                                next_frame = Instant::now() + dec.frame_duration();
+                            }
+                            Err(e) => tracing::warn!("render_frame: {}", e),
                         }
-
-                        // FIX 5: Additive timing avoids drift accumulation over time.
-                        // next_frame = Instant::now() + duration would drift by the
-                        // time spent in decode+upload+render each frame.
-                        next_frame += dec.frame_duration();
                     }
                     Ok(None) => {
                         // EOF — seek to beginning for seamless loop
@@ -632,7 +679,9 @@ fn render_loop(
             if next_frame > now { (next_frame - now).min(Duration::from_millis(8)) }
             else                { Duration::ZERO }
         } else {
-            Duration::from_millis(16)
+            // No active wallpaper — poll slowly. 100ms latency on `wpick set`
+            // is imperceptible to the user; saves ~84 unnecessary wakeups/sec.
+            Duration::from_millis(100)
         };
 
         if wait > Duration::ZERO {
