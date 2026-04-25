@@ -143,10 +143,15 @@ impl Cache {
 
 fn row_to_info(row: &rusqlite::Row) -> rusqlite::Result<WallpaperInfo> {
     let type_str: String = row.get(2)?;
+    let id: i64 = row.get(0)?;
     let wallpaper_type = match type_str.as_str() {
         "video" => WallpaperType::Video,
         "web"   => WallpaperType::Web,
-        _       => WallpaperType::Scene,
+        "scene" => WallpaperType::Scene,
+        other   => {
+            tracing::warn!(id, type_str = other, "Unknown wallpaper_type in DB — treating as Scene");
+            WallpaperType::Scene
+        }
     };
     Ok(WallpaperInfo {
         id:              row.get::<_, i64>(0)? as u64,

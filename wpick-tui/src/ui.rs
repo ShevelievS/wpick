@@ -192,7 +192,10 @@ fn filtered_wallpaper_idx_to_list_idx(filtered: &[&WallpaperInfo], idx: usize) -
         .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
         .count();
 
-    let w = filtered[idx];
+    let w = match filtered.get(idx) {
+        Some(w) => w,
+        None    => return 0,
+    };
     if matches!(w.wallpaper_type, WallpaperType::Video) {
         let video_rank = filtered[..idx].iter()
             .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))

@@ -52,7 +52,10 @@ async fn handle_connection(
     loop {
         let cmd = match recv_command(&mut reader).await {
             Ok(cmd)  => cmd,
-            Err(_)   => break,
+            Err(e)   => {
+                tracing::debug!("IPC recv error (connection closed): {}", e);
+                break;
+            }
         };
         tracing::debug!("Command: {:?}", cmd);
 
@@ -113,39 +116,34 @@ async fn dispatch(
         }
 
         ClientCommand::Volume { level } => {
-            let muted = {
+            let (vol, muted) = {
                 let mut s = state.lock().await;
                 s.set_volume(level);
-                s.muted
+                (s.volume, s.muted)
             };
-            let mut cfg = WpickConfig::load().unwrap_or_default();
-            cfg.general.volume = level.clamp(0.0, 1.0);
-            cfg.general.muted  = muted;
-            if let Err(e) = cfg.save() {
-                tracing::warn!("Config save failed: {}", e);
-            }
-            DaemonResponse::Ok
+            save_volume_config(vol, muted);
+            DaemonResponse::VolumeState { volume: vol, muted }
         }
 
         ClientCommand::Mute => {
             // Toggle and read state in one lock so a concurrent Mute command
-            // cannot interleave between the toggle and the state read, which
-            // would cause the wrong muted value to be written to config.
+            // cannot interleave between the toggle and the state read. (fixed)
             let (vol, muted) = {
                 let mut s = state.lock().await;
                 s.toggle_mute();
                 (s.volume, s.muted)
             };
-            let mut cfg = WpickConfig::load().unwrap_or_default();
-            cfg.general.volume = vol;
-            cfg.general.muted  = muted;
-            if let Err(e) = cfg.save() {
-                tracing::warn!("Config save failed: {}", e);
-            }
-            DaemonResponse::Ok
+            save_volume_config(vol, muted);
+            DaemonResponse::VolumeState { volume: vol, muted }
         }
 
-
+        ClientCommand::Status => {
+            let (vol, muted) = {
+                let s = state.lock().await;
+                (s.volume, s.muted)
+            };
+            DaemonResponse::VolumeState { volume: vol, muted }
+        }
 
         ClientCommand::Info { id } => {
             let guard = cache.lock().await;
@@ -160,9 +158,32 @@ async fn dispatch(
 
         ClientCommand::Kill => {
             tracing::info!("Kill received — shutting down");
+            // Remove socket before exit so the next daemon start finds no stale file. (H-4)
+            let _ = std::fs::remove_file(&dirs.socket_path);
             let _ = state.lock().await.shutdown_tx.send(());
             std::process::exit(0);
         }
+    }
+}
+
+// ─── Config persistence helper ────────────────────────────────────────────────
+
+/// Persist volume and muted state to config.
+/// Loads the current config from disk first so unrelated fields are preserved.
+/// On load failure, logs a warning and uses an in-memory default rather than
+/// silently destroying the entire config. (F-3)
+fn save_volume_config(volume: f32, muted: bool) {
+    let mut cfg = match WpickConfig::load() {
+        Ok(c)  => c,
+        Err(e) => {
+            tracing::warn!("Config load failed, saving volume/muted to default shell: {}", e);
+            WpickConfig::default()
+        }
+    };
+    cfg.general.volume = volume;
+    cfg.general.muted  = muted;
+    if let Err(e) = cfg.save() {
+        tracing::warn!("Config save failed: {}", e);
     }
 }
 

@@ -253,6 +253,11 @@ impl App {
     async fn cmd_volume_up(&mut self) {
         let new_vol = (self.config.general.volume + 0.05).clamp(0.0, 1.0);
         match self.send(ClientCommand::Volume { level: new_vol }).await {
+            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+                self.config.general.volume = volume;
+                self.config.general.muted  = muted;
+                self.set_status_ok(format!("Vol {:.0}%", volume * 100.0));
+            }
             Ok(_) => {
                 self.config.general.volume = new_vol;
                 self.set_status_ok(format!("Vol {:.0}%", new_vol * 100.0));
@@ -264,6 +269,11 @@ impl App {
     async fn cmd_volume_down(&mut self) {
         let new_vol = (self.config.general.volume - 0.05).clamp(0.0, 1.0);
         match self.send(ClientCommand::Volume { level: new_vol }).await {
+            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+                self.config.general.volume = volume;
+                self.config.general.muted  = muted;
+                self.set_status_ok(format!("Vol {:.0}%", volume * 100.0));
+            }
             Ok(_) => {
                 self.config.general.volume = new_vol;
                 self.set_status_ok(format!("Vol {:.0}%", new_vol * 100.0));
@@ -274,6 +284,13 @@ impl App {
 
     async fn cmd_mute(&mut self) {
         match self.send(ClientCommand::Mute).await {
+            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+                // Use the authoritative daemon state — no client-side guessing.
+                self.config.general.volume = volume;
+                self.config.general.muted  = muted;
+                let label = if muted { "Muted" } else { "Unmuted" };
+                self.set_status_ok(label);
+            }
             Ok(_) => {
                 self.config.general.muted = !self.config.general.muted;
                 let label = if self.config.general.muted { "Muted" } else { "Unmuted" };
@@ -352,7 +369,20 @@ impl App {
             self.client = Some(client);
             self.daemon_connected = true;
             self.last_reconnect_attempt = None;
+            // Sync volume/muted from the daemon's authoritative runtime state. (F-7)
+            self.sync_volume_state().await;
             self.refresh_list().await;
+        }
+    }
+
+    /// Query the daemon for current volume/muted and update local config.
+    async fn sync_volume_state(&mut self) {
+        match self.send(ClientCommand::Status).await {
+            Ok(DaemonResponse::VolumeState { volume, muted }) => {
+                self.config.general.volume = volume;
+                self.config.general.muted  = muted;
+            }
+            Ok(_) | Err(_) => {}
         }
     }
 }

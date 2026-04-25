@@ -15,6 +15,8 @@ pub enum ClientCommand {
     Set    { id: u64 },
     Volume { level: f32 },
     Mute,
+    /// Query current volume and mute state without changing anything.
+    Status,
     Info   { id: u64 },
     Kill,
 }
@@ -27,6 +29,8 @@ pub enum DaemonResponse {
     Error         { message: String },
     WallpaperList { items: Vec<WallpaperInfo> },
     WallpaperInfo { item: WallpaperInfo },
+    /// Returned by Volume, Mute, and Status — carries the authoritative runtime state.
+    VolumeState   { volume: f32, muted: bool },
 }
 
 // ─── Send / Receive helpers ───────────────────────────────────────────────────
@@ -105,6 +109,7 @@ mod tests {
             ClientCommand::Set    { id: 42 },
             ClientCommand::Volume { level: 0.5 },
             ClientCommand::Mute,
+            ClientCommand::Status,
             ClientCommand::Info   { id: 99 },
             ClientCommand::Kill,
         ];
@@ -143,6 +148,7 @@ mod tests {
             DaemonResponse::Error { message: "oops".into() },
             DaemonResponse::WallpaperList { items: vec![sample_info.clone()] },
             DaemonResponse::WallpaperInfo { item: sample_info },
+            DaemonResponse::VolumeState { volume: 0.75, muted: false },
         ];
 
         for resp in &responses {
