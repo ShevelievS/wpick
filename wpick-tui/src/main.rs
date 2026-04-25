@@ -22,15 +22,19 @@ struct Cli {
 enum Commands {
     /// Launch TUI (don't auto-start daemon)
     Tui,
-    /// List all wallpapers
+    /// List cached wallpapers
     List,
+    /// Scan Steam Workshop dirs and rebuild cache
+    Scan,
     /// Set wallpaper by ID
     Set { id: u64 },
     /// Set volume (0-100)
     Volume { percent: u8 },
     /// Toggle mute
     Mute,
-    /// Show wallpaper info
+    /// Show current playback status (wallpaper, volume, mute)
+    Status,
+    /// Show wallpaper info by ID
     Info { id: u64 },
     /// Start daemon in foreground (replaces current process)
     Daemon,
@@ -127,6 +131,31 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
                 }
                 DaemonResponse::Error { message } => {
                     eprintln!("Error: {}", message);
+                }
+                _ => {}
+            }
+        }
+
+        Commands::Scan => {
+            println!("Scanning wallpaper library…");
+            match client.send(&ClientCommand::Scan).await? {
+                DaemonResponse::WallpaperList { items } => {
+                    println!("\u{2713} Scan complete: {} wallpapers found", items.len());
+                }
+                DaemonResponse::Error { message } => eprintln!("Scan error: {}", message),
+                _ => {}
+            }
+        }
+
+        Commands::Status => {
+            match client.send(&ClientCommand::Status).await? {
+                DaemonResponse::VolumeState { volume, muted, current_id } => {
+                    let playing = current_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    println!("wallpaper : {}", playing);
+                    println!("volume    : {:.0}%", volume * 100.0);
+                    println!("muted     : {}", muted);
                 }
                 _ => {}
             }

@@ -298,7 +298,7 @@ fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 Text::from(vec![
                     Line::from(format!("[ {} ]", filename)),
                     Line::from(""),
-                    Line::from("(image preview in v0.2)"),
+                    Line::from("(image preview not yet implemented)"),
                 ])
             }
             None => Text::raw("preview not available"),
@@ -346,7 +346,7 @@ fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if !w.is_supported() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "\u{26a0} not supported in v0.1",
+            "\u{26a0} video only — scene/web not yet supported",
             Style::default().fg(Color::Yellow),
         )));
     }

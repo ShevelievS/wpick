@@ -6,20 +6,16 @@
 ///   H-3 — set_sink ignored mute: muted state passed to DuckHandle on every sink creation/update.
 use std::sync::Arc;
 use std::time::Duration;
-
 use ffmpeg_next as ffmpeg;
+use wpick_core::config::AudioConfig;
 use wpick_core::model::WallpaperInfo;
 
 // ─── Streaming constants ──────────────────────────────────────────────────────
 
-/// Samples per chunk sent from the decode thread to StreamingSource.
-/// 8 192 samples ≈ 170 ms at 48 kHz stereo — small enough for quick startup,
-/// large enough to avoid excessive channel traffic.
-const CHUNK_SIZE: usize = 8_192;
-
-/// Channel capacity in chunks (backpressure bound).
-/// 16 chunks × 170 ms ≈ 2.7 s of audio buffer — ample margin for a decode thread.
-const CHANNEL_CAP: usize = 16;
+/// Default chunk size used when config is not provided (tests / legacy paths).
+const CHUNK_SIZE_DEFAULT: usize = 8_192;
+/// Default channel capacity (backpressure bound).
+const CHANNEL_CAP_DEFAULT: usize = 16;
 
 // ─── StreamingSource — rodio Source backed by a background decode thread ──────
 
@@ -70,14 +66,18 @@ impl rodio::Source for StreamingSource {
 /// H-1: No blocking await — returns immediately; decode runs in background.
 /// H-2: When the Receiver is dropped (sink stopped), the SyncSender gets an
 ///      error and the thread exits (E-29 pattern).
-fn start_streaming_decoder(path: String) -> std::sync::mpsc::Receiver<Vec<f32>> {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(CHANNEL_CAP);
+fn start_streaming_decoder(
+    path:       String,
+    chunk_size: usize,
+    chan_cap:   usize,
+) -> std::sync::mpsc::Receiver<Vec<f32>> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(chan_cap);
     std::thread::Builder::new()
         .name("wpick-audio-dec".into())
         .spawn(move || {
             ffmpeg::init().ok(); // idempotent
             loop {
-                match decode_and_send(&path, &tx) {
+                match decode_and_send(&path, &tx, chunk_size) {
                     Ok(())  => {} // EOF — loop seamlessly
                     Err(_)  => break, // E-29: channel closed or file error
                 }
@@ -88,11 +88,12 @@ fn start_streaming_decoder(path: String) -> std::sync::mpsc::Receiver<Vec<f32>> 
 }
 
 /// Decode one complete pass of `path` (any format with an audio stream),
-/// resampled to f32 stereo @ 48 kHz, and send CHUNK_SIZE-sized chunks to `tx`.
+/// resampled to f32 stereo @ 48 kHz, and send `chunk_size`-sized chunks to `tx`.
 /// Returns Err when the receiver has been dropped (time to stop looping).
 fn decode_and_send(
-    path: &str,
-    tx:   &std::sync::mpsc::SyncSender<Vec<f32>>,
+    path:       &str,
+    tx:         &std::sync::mpsc::SyncSender<Vec<f32>>,
+    chunk_size: usize,
 ) -> anyhow::Result<()> {
     use ffmpeg::software::resampling::context::Context as Resampler;
 
@@ -118,7 +119,7 @@ fn decode_and_send(
         48_000,
     )?;
 
-    let mut chunk = Vec::<f32>::with_capacity(CHUNK_SIZE);
+    let mut chunk = Vec::<f32>::with_capacity(chunk_size);
 
     // Flush a full chunk to the channel; returns Err if receiver dropped.
     let flush_chunk = |chunk: Vec<f32>| -> anyhow::Result<()> {
@@ -134,8 +135,8 @@ fn decode_and_send(
             resampler.run(&frame, &mut out).ok();
             for c in out.data(0).chunks_exact(4) {
                 chunk.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-                if chunk.len() >= CHUNK_SIZE {
-                    flush_chunk(std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE)))?;
+                if chunk.len() >= chunk_size {
+                    flush_chunk(std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size)))?;
                 }
             }
         }
@@ -146,8 +147,8 @@ fn decode_and_send(
     if resampler.flush(&mut out).is_ok() {
         for c in out.data(0).chunks_exact(4) {
             chunk.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-            if chunk.len() >= CHUNK_SIZE {
-                flush_chunk(std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK_SIZE)))?;
+            if chunk.len() >= chunk_size {
+                flush_chunk(std::mem::replace(&mut chunk, Vec::with_capacity(chunk_size)))?;
             }
         }
     }
@@ -177,8 +178,17 @@ pub async fn run(
     duck:             crate::ducking::DuckHandle,
     mut wallpaper_rx: tokio::sync::watch::Receiver<Option<WallpaperInfo>>,
     mut volume_rx:    tokio::sync::watch::Receiver<(f32, bool)>,
+    audio_cfg:        AudioConfig,
 ) -> anyhow::Result<()> {
-    tracing::info!("Audio task started");
+    let chunk_size = if audio_cfg.chunk_frames > 0 { audio_cfg.chunk_frames } else { CHUNK_SIZE_DEFAULT };
+    // Cap channel capacity so that chunk_size × cap stays under max_preload_mb.
+    let chan_cap = {
+        let bytes_per_chunk = chunk_size * 4; // f32 = 4 bytes
+        let max_bytes = (audio_cfg.max_preload_mb as usize).saturating_mul(1_048_576);
+        let cap = if max_bytes > 0 { max_bytes / bytes_per_chunk } else { CHANNEL_CAP_DEFAULT };
+        cap.clamp(2, 64)
+    };
+    tracing::info!("Audio task started (chunk={} cap={})", chunk_size, chan_cap);
 
     let (_output_stream, stream_handle) = rodio::OutputStream::try_default()
         .map_err(|e| anyhow::anyhow!("Audio output init failed: {}", e))?;
@@ -188,61 +198,65 @@ pub async fn run(
     let mut current_sink: Option<Arc<rodio::Sink>> = None;
 
     loop {
-        if wallpaper_rx.has_changed()? {
-            let new_wp = wallpaper_rx.borrow_and_update().clone();
+        // B-3: tokio::select! replaces the 50ms polling loop — events wake
+        // this task immediately, zero CPU burn between changes.
+        tokio::select! {
+            res = wallpaper_rx.changed() => {
+                res?; // Sender dropped → run() exits cleanly
+                let new_wp = wallpaper_rx.borrow_and_update().clone();
 
-            // Stop old sink — this drops StreamingSource's Receiver, signalling
-            // the decode thread to exit (E-29).
-            if let Some(sink) = current_sink.take() {
-                sink.stop();
-            }
+                // Stop old sink — drops StreamingSource's Receiver, signalling
+                // the decode thread to exit (E-29).
+                if let Some(sink) = current_sink.take() {
+                    sink.stop();
+                }
 
-            if let Some(ref info) = new_wp {
-                if info.has_audio {
-                    // H-1: Non-blocking — returns immediately, decode runs in background.
-                    // H-2: No .await here so watch-channel can't race with a blocking decode.
-                    let rx = start_streaming_decoder(info.file_path.clone());
+                if let Some(ref info) = new_wp {
+                    if info.has_audio {
+                        // H-1: Non-blocking — returns immediately, decode runs in background.
+                        // H-2: No .await here so watch-channel can't race with a blocking decode.
+                        let rx = start_streaming_decoder(
+                            info.file_path.clone(), chunk_size, chan_cap,
+                        );
 
-                    match rodio::Sink::try_new(&stream_handle) {
-                        Ok(sink) => {
-                            sink.append(StreamingSource {
-                                rx,
-                                buf: Vec::new(),
-                                pos: 0,
-                                sample_rate: 48_000,
-                                channels:    2,
-                            });
-                            let sink = Arc::new(sink);
+                        match rodio::Sink::try_new(&stream_handle) {
+                            Ok(sink) => {
+                                sink.append(StreamingSource {
+                                    rx,
+                                    buf: Vec::new(),
+                                    pos: 0,
+                                    sample_rate: 48_000,
+                                    channels:    2,
+                                });
+                                let sink = Arc::new(sink);
 
-                            // borrow_and_update clears the "changed" flag so the
-                            // volume branch below doesn't double-apply this tick.
-                            let (vol, muted) = *volume_rx.borrow_and_update();
-                            apply_volume(&sink, vol, muted);
-                            // H-3: pass muted so ducking never overrides mute.
-                            duck.register_sink(Arc::clone(&sink), vol, muted);
-                            tracing::info!(
-                                "Audio streaming: {} vol={:.0}% muted={}",
-                                info.title, vol * 100.0, muted,
-                            );
-                            current_sink = Some(sink);
+                                let (vol, muted) = *volume_rx.borrow_and_update();
+                                apply_volume(&sink, vol, muted);
+                                // H-3: pass muted so ducking never overrides mute.
+                                duck.register_sink(Arc::clone(&sink), vol, muted);
+                                tracing::info!(
+                                    "Audio streaming: {} vol={:.0}% muted={}",
+                                    info.title, vol * 100.0, muted,
+                                );
+                                current_sink = Some(sink);
+                            }
+                            Err(e) => tracing::warn!("Sink creation failed: {}", e),
                         }
-                        Err(e) => tracing::warn!("Sink creation failed: {}", e),
                     }
                 }
             }
-        }
 
-        if volume_rx.has_changed()? {
-            let (vol, muted) = *volume_rx.borrow_and_update();
-            // H-3: keep ducking and the sink in sync on every volume change.
-            duck.update_volume(vol, muted);
-            if let Some(ref sink) = current_sink {
-                apply_volume(sink, vol, muted);
+            res = volume_rx.changed() => {
+                res?;
+                let (vol, muted) = *volume_rx.borrow_and_update();
+                // H-3: keep ducking and the sink in sync on every volume change.
+                duck.update_volume(vol, muted);
+                if let Some(ref sink) = current_sink {
+                    apply_volume(sink, vol, muted);
+                }
+                tracing::debug!("Volume: {:.0}% muted={}", vol * 100.0, muted);
             }
-            tracing::debug!("Volume: {:.0}% muted={}", vol * 100.0, muted);
         }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
