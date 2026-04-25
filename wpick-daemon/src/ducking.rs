@@ -1,8 +1,14 @@
 /// Audio ducking via libpulse polling.
 ///
 /// Every POLL_MS ms we count non-wpick sink-inputs. If any exist → fade out.
-/// When none remain → fade in. Runs on a dedicated OS thread.
+/// When none remain → fade in.
+///
+/// Fixes applied here:
+///   C-1  — fade race: `fade_gen` counter cancels stale fade threads.
+///   H-3  — set_sink ignored mute: `SharedData.muted` respected everywhere.
+///   M-8  — ducking thread never stopped: `DuckHandle::Drop` sets stop flag.
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use libpulse_binding as pulse;
@@ -21,8 +27,10 @@ const POLL_MS:    u64  = 500;
 struct SharedData {
     sink:          Option<Arc<rodio::Sink>>,
     target_volume: f32,
+    muted:         bool,  // H-3: track mute state so fade/set_sink respect it
     ducked:        bool,
     foreign_count: u32,
+    fade_gen:      u64,   // C-1: each new fade increments; old threads exit on mismatch
 }
 
 #[derive(Clone)]
@@ -33,27 +41,35 @@ impl Shared {
         Self(Arc::new(Mutex::new(SharedData {
             sink:          None,
             target_volume: 0.8,
+            muted:         false,
             ducked:        false,
             foreign_count: 0,
+            fade_gen:      0,
         })))
     }
 
-    fn set_sink(&self, sink: Arc<rodio::Sink>, volume: f32) {
+    // H-3: muted is now passed so set_sink never overrides a muted state.
+    fn set_sink(&self, sink: Arc<rodio::Sink>, volume: f32, muted: bool) {
         let mut d = self.0.lock().unwrap();
         d.target_volume = volume;
-        if d.ducked { sink.set_volume(0.0); } else { sink.set_volume(volume); }
+        d.muted         = muted;
+        let effective = if d.ducked || muted { 0.0 } else { volume };
+        sink.set_volume(effective);
         d.sink = Some(sink);
     }
 
-    fn set_volume(&self, v: f32) {
+    // H-3: volume and muted updated together so they stay in sync.
+    fn update_volume(&self, vol: f32, muted: bool) {
         let mut d = self.0.lock().unwrap();
-        d.target_volume = v;
-        if !d.ducked {
-            if let Some(ref s) = d.sink { s.set_volume(v); }
+        d.target_volume = vol;
+        d.muted         = muted;
+        if let Some(ref s) = d.sink {
+            let effective = if d.ducked || muted { 0.0 } else { vol };
+            s.set_volume(effective);
         }
     }
 
-    /// Returns (should_fade_out, should_fade_in)
+    /// Returns (should_fade_out, should_fade_in).
     fn update(&self, new_foreign: u32) -> (bool, bool) {
         let mut d      = self.0.lock().unwrap();
         let was_ducked = d.ducked;
@@ -64,23 +80,33 @@ impl Shared {
 
     fn fade(&self, duck: bool) {
         let shared = self.clone();
+        // C-1: bump generation; old fade threads exit when they see a different gen.
+        let gen = {
+            let mut d = shared.0.lock().unwrap();
+            d.fade_gen += 1;
+            d.fade_gen
+        };
         std::thread::Builder::new()
             .name(if duck { "wpick-fade-out" } else { "wpick-fade-in" }.into())
             .spawn(move || {
-                let ms = (FADE_SECS * 1000.0 / FADE_STEPS as f32) as u64;
+                let step_ms = (FADE_SECS * 1000.0 / FADE_STEPS as f32) as u64;
                 for i in 0..=FADE_STEPS {
-                    let t = i as f32 / FADE_STEPS as f32;
+                    std::thread::sleep(Duration::from_millis(step_ms));
                     let d = shared.0.lock().unwrap();
-                    let v = if duck {
+                    // C-1: a newer fade started — stop immediately.
+                    if d.fade_gen != gen { break; }
+                    // H-3: if muted, keep volume at 0 regardless of duck direction.
+                    if d.muted {
+                        if let Some(ref s) = d.sink { s.set_volume(0.0); }
+                        continue;
+                    }
+                    let t   = i as f32 / FADE_STEPS as f32;
+                    let vol = if duck {
                         d.target_volume * (1.0 - t)
                     } else {
                         d.target_volume * t
                     };
-                    if let Some(ref s) = d.sink {
-                        s.set_volume(v.clamp(0.0, 1.0));
-                    }
-                    drop(d);
-                    std::thread::sleep(Duration::from_millis(ms));
+                    if let Some(ref s) = d.sink { s.set_volume(vol.clamp(0.0, 1.0)); }
                 }
             })
             .ok();
@@ -89,18 +115,27 @@ impl Shared {
 
 // ─── Public handle ────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
 pub struct DuckHandle {
     shared: Option<Shared>,
+    // M-8: stop flag; set by Drop so ducking thread exits within POLL_MS.
+    stop:   Arc<AtomicBool>,
+}
+
+impl Drop for DuckHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl DuckHandle {
-    pub fn register_sink(&self, sink: Arc<rodio::Sink>, volume: f32) {
-        if let Some(ref s) = self.shared { s.set_sink(sink, volume); }
+    // H-3: muted is now required so set_sink respects the current mute state.
+    pub fn register_sink(&self, sink: Arc<rodio::Sink>, volume: f32, muted: bool) {
+        if let Some(ref s) = self.shared { s.set_sink(sink, volume, muted); }
     }
 
-    pub fn set_volume(&self, v: f32) {
-        if let Some(ref s) = self.shared { s.set_volume(v); }
+    // H-3: replaces set_volume(vol); passes muted together with volume.
+    pub fn update_volume(&self, vol: f32, muted: bool) {
+        if let Some(ref s) = self.shared { s.update_volume(vol, muted); }
     }
 }
 
@@ -108,30 +143,38 @@ impl DuckHandle {
 
 pub fn start() -> DuckHandle {
     let shared = Shared::new();
+    let stop   = Arc::new(AtomicBool::new(false));
+
     let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
 
     let shared_clone = shared.clone();
+    let stop_clone   = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("wpick-ducking".into())
         .spawn(move || {
-            if let Err(e) = pa_loop(shared_clone, tx) {
+            if let Err(e) = pa_loop(shared_clone, tx, stop_clone) {
                 tracing::warn!("Ducking loop: {}", e);
             }
+            tracing::info!("Ducking thread exited");
         })
         .expect("ducking thread");
 
     match rx.recv_timeout(Duration::from_secs(1)) {
-        Ok(_) => DuckHandle { shared: Some(shared) },
+        Ok(_) => DuckHandle { shared: Some(shared), stop },
         Err(_) => {
             tracing::warn!("Ducking unavailable: PulseAudio not responding");
-            DuckHandle { shared: None }
+            DuckHandle { shared: None, stop }
         }
     }
 }
 
 // ─── PA mainloop ──────────────────────────────────────────────────────────────
 
-fn pa_loop(shared: Shared, connected_tx: std::sync::mpsc::SyncSender<()>) -> anyhow::Result<()> {
+fn pa_loop(
+    shared:       Shared,
+    connected_tx: std::sync::mpsc::SyncSender<()>,
+    stop:         Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let mut ml = Mainloop::new()
         .ok_or_else(|| anyhow::anyhow!("PA mainloop init failed"))?;
 
@@ -145,7 +188,7 @@ fn pa_loop(shared: Shared, connected_tx: std::sync::mpsc::SyncSender<()>) -> any
     ctx.connect(None, CtxFlagSet::NOFLAGS, None)
         .map_err(|e| anyhow::anyhow!("PA connect failed: {:?}", e))?;
 
-    // Wait for Ready state; signal start() via channel once connected
+    // Wait for Ready; signal start() once connected.
     loop {
         match ml.iterate(false) {
             IterateResult::Quit(_) => anyhow::bail!("PA mainloop quit during connect"),
@@ -160,7 +203,6 @@ fn pa_loop(shared: Shared, connected_tx: std::sync::mpsc::SyncSender<()>) -> any
             pulse::context::State::Failed
             | pulse::context::State::Terminated =>
                 anyhow::bail!("PA context failed to connect"),
-            // connected_tx is dropped when bail! returns, unblocking recv_timeout
             _ => {}
         }
     }
@@ -168,6 +210,12 @@ fn pa_loop(shared: Shared, connected_tx: std::sync::mpsc::SyncSender<()>) -> any
     tracing::info!("Ducking: PulseAudio connected");
 
     loop {
+        // M-8: exit cleanly when DuckHandle is dropped.
+        if stop.load(Ordering::Relaxed) {
+            tracing::info!("Ducking: stop requested");
+            break;
+        }
+
         let foreign = count_foreign(&mut ml, &ctx);
         let (fade_out, fade_in) = shared.update(foreign);
 
@@ -181,13 +229,13 @@ fn pa_loop(shared: Shared, connected_tx: std::sync::mpsc::SyncSender<()>) -> any
 
         std::thread::sleep(Duration::from_millis(POLL_MS));
     }
+
+    Ok(())
 }
 
 // ─── Count non-wpick sink-inputs ──────────────────────────────────────────────
 
 fn count_foreign(ml: &mut Mainloop, ctx: &Context) -> u32 {
-    // Use a simple counter protected by Mutex.
-    // We store count and done flag separately to avoid borrow issues.
     let count: Arc<Mutex<u32>>  = Arc::new(Mutex::new(0));
     let done:  Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
@@ -201,20 +249,15 @@ fn count_foreign(ml: &mut Mainloop, ctx: &Context) -> u32 {
                     .get_str("application.name")
                     .unwrap_or_default();
                 if !name.contains(OUR_APP) && !info.corked {
-                    if let Ok(mut c) = count_cb.lock() {
-                        *c += 1;
-                    }
+                    if let Ok(mut c) = count_cb.lock() { *c += 1; }
                 }
             }
             ListResult::End | ListResult::Error => {
-                if let Ok(mut d) = done_cb.lock() {
-                    *d = true;
-                }
+                if let Ok(mut d) = done_cb.lock() { *d = true; }
             }
         }
     });
 
-    // Drive mainloop until introspection callback completes
     loop {
         if *done.lock().unwrap() { break; }
         match ml.iterate(true) {
@@ -223,7 +266,6 @@ fn count_foreign(ml: &mut Mainloop, ctx: &Context) -> u32 {
         }
     }
 
-    // Read final count — use a local copy to avoid temporary borrow issue
     let result = *count.lock().unwrap();
     result
 }

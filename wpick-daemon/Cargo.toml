@@ -21,6 +21,8 @@ wayland-protocols-wlr   = { version = "0.3", features = ["client"] }
 wgpu                    = "22"
 bytemuck                = { version = "1", features = ["derive"] }
 ffmpeg-next             = "8"
+ffmpeg-sys-next         = "8"
+libc                    = "0.2"
 rodio                   = "0.19"
 parking_lot             = "0.12"
 raw-window-handle       = "0.6"
