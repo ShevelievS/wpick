@@ -514,12 +514,28 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
         .ok_or_else(|| anyhow::anyhow!("GPU reports no surface formats — check Vulkan driver"))?;
     tracing::debug!("surface format = {:?}", format);
 
+    // Prefer Mailbox > FifoRelaxed > Fifo.
+    // Mailbox (and Immediate) do NOT block on Wayland frame callbacks inside
+    // Mesa's Vulkan WSI. Fifo blocks — when Hyprland hides a layer surface
+    // behind a fullscreen window it stops sending frame callbacks, causing
+    // vkAcquireNextImageKHR to hang forever. With Mailbox the render loop
+    // keeps running; when fullscreen exits the compositor picks up our latest
+    // frame immediately. Our own next_frame + sleep pacing prevents CPU spin.
+    let present_mode = [
+        wgpu::PresentMode::Mailbox,
+        wgpu::PresentMode::FifoRelaxed,
+    ]
+    .into_iter()
+    .find(|m| caps.present_modes.contains(m))
+    .unwrap_or(wgpu::PresentMode::Fifo);
+    tracing::debug!("present mode = {:?}", present_mode);
+
     let surface_config = wgpu::SurfaceConfiguration {
         usage:        wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
         width:        surf_w,
         height:       surf_h,
-        present_mode: wgpu::PresentMode::Fifo,
+        present_mode,
         // B-2: alpha_modes can be empty on some drivers — avoid panic.
         alpha_mode:   caps.alpha_modes.first().copied()
                           .unwrap_or(wgpu::CompositeAlphaMode::Auto),
@@ -917,6 +933,8 @@ fn render_loop(
         if ctx.wls.needs_ack {
             ctx.wls.needs_ack = false;
             ctx.layer_surface.ack_configure(ctx.wls.configure_serial);
+            // Protocol-required ack commit. Commits no buffer — the compositor
+            // briefly sees a transparent surface until the next render below.
             ctx.wl_surface.commit();
             if let Err(e) = ctx.evq.flush() {
                 tracing::warn!("flush after re-configure: {}", e);
@@ -930,6 +948,9 @@ fn render_loop(
             }
             ctx.wgpu_surface.configure(&ctx.device, &ctx.surface_config);
             tracing::info!("Re-configured after compositor event ({}x{})", new_w, new_h);
+            // Force immediate re-render so the buffer is re-attached right away,
+            // minimising the blank window between the ack commit and the next frame.
+            next_frame = Instant::now();
         }
 
         // ── Layer surface closed (e.g. exclusive fullscreen, output removed) ──
