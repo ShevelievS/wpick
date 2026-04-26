@@ -156,10 +156,17 @@ async fn dispatch(
 
         ClientCommand::Kill => {
             tracing::info!("Kill received — shutting down");
-            // Remove socket before exit so the next daemon start finds no stale file. (H-4)
-            let _ = std::fs::remove_file(&dirs.socket_path);
-            let _ = state.lock().await.shutdown_tx.send(());
-            std::process::exit(0);
+            let socket_path = dirs.socket_path.clone();
+            // Delayed exit: give the caller 150 ms to receive the Ok response
+            // before we call process::exit(0). Without this delay the process
+            // exits instantly, closing the socket before the TUI reads the
+            // response — recv_response then blocks forever (Bug 2).
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let _ = std::fs::remove_file(&socket_path);
+                std::process::exit(0);
+            });
+            DaemonResponse::Ok
         }
     }
 }
