@@ -31,6 +31,9 @@ struct WaylandState {
     surf_width:       u32,
     surf_height:      u32,
     needs_ack:        bool,
+    /// Set when compositor sends zwlr_layer_surface_v1::Closed.
+    /// Render loop will reinitialise the renderer when it sees this.
+    closed:           bool,
 }
 
 impl Default for WaylandState {
@@ -46,6 +49,7 @@ impl Default for WaylandState {
             surf_width:       0,
             surf_height:      0,
             needs_ack:        false,
+            closed:           false,
         }
     }
 }
@@ -110,12 +114,21 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<WaylandState>,
     ) {
-        if let zwlr_layer_surface_v1::Event::Configure { serial, width, height } = event {
-            state.configure_serial = serial;
-            state.surf_width       = width;
-            state.surf_height      = height;
-            state.configured       = true;
-            state.needs_ack        = true;
+        match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
+                state.configure_serial = serial;
+                state.surf_width       = width;
+                state.surf_height      = height;
+                state.configured       = true;
+                state.needs_ack        = true;
+            }
+            // Compositor destroyed our layer surface (e.g. output removed, exclusive
+            // fullscreen took over, or compositor reload). Signal render_loop to reinit.
+            zwlr_layer_surface_v1::Event::Closed => {
+                tracing::warn!("Layer surface closed by compositor — will reinitialise");
+                state.closed = true;
+            }
+            _ => {}
         }
     }
 }
@@ -688,40 +701,71 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
 
 pub async fn run(
     mut wallpaper_rx: watch::Receiver<Option<WallpaperInfo>>,
-    mut shutdown_rx:  broadcast::Receiver<()>,
+    shutdown_rx:      broadcast::Receiver<()>,
 ) -> anyhow::Result<()> {
     tracing::debug!("renderer::run started");
 
-    let ctx = tokio::task::spawn_blocking(init_renderer)
-        .await
-        .context("renderer init thread panicked")?
-        .context("renderer init failed")?;
+    // Keep the original receiver so we can resubscribe on each restart.
+    // Moving would prevent re-subscribing after a layer-surface-closed restart.
+    let mut shutdown_rx = shutdown_rx;
 
-    tracing::debug!("renderer init complete");
-    tracing::info!("Renderer ready: {}x{}", ctx.surf_w, ctx.surf_h);
+    loop {
+        let ctx = tokio::task::spawn_blocking(init_renderer)
+            .await
+            .context("renderer init thread panicked")?
+            .context("renderer init failed")?;
 
-    let (wp_tx, wp_rx) = std::sync::mpsc::channel::<Option<WallpaperInfo>>();
-    let (sd_tx, sd_rx) = std::sync::mpsc::channel::<()>();
+        tracing::info!("Renderer ready: {}x{}", ctx.surf_w, ctx.surf_h);
 
-    let wp_forward = tokio::spawn(async move {
-        loop {
-            if wallpaper_rx.changed().await.is_err() { break; }
-            let val = wallpaper_rx.borrow_and_update().clone();
-            if wp_tx.send(val).is_err() { break; }
+        let (wp_tx, wp_rx) = std::sync::mpsc::channel::<Option<WallpaperInfo>>();
+        let (sd_tx, sd_rx) = std::sync::mpsc::channel::<()>();
+
+        // Seed render loop with current wallpaper (important on restart so the
+        // wallpaper reappears automatically without a new `wpick set`).
+        let _ = wp_tx.send(wallpaper_rx.borrow_and_update().clone());
+
+        let mut wallpaper_rx2 = wallpaper_rx.clone();
+        let wp_forward = tokio::spawn(async move {
+            loop {
+                if wallpaper_rx2.changed().await.is_err() { break; }
+                let val = wallpaper_rx2.borrow_and_update().clone();
+                if wp_tx.send(val).is_err() { break; }
+            }
+        });
+
+        // resubscribe() creates a fresh receiver on the same broadcast channel.
+        // The original shutdown_rx stays alive for the next iteration.
+        let mut sd_shutdown = shutdown_rx.resubscribe();
+        let sd_forward = tokio::spawn(async move {
+            let _ = sd_shutdown.recv().await;
+            let _ = sd_tx.send(());
+        });
+
+        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, sd_rx))
+            .await
+            .context("render loop thread panicked")?;
+
+        wp_forward.abort();
+        sd_forward.abort();
+
+        match result {
+            Ok(()) => break, // clean shutdown via sd_rx
+
+            Err(ref e) if e.to_string().contains("__layer_surface_closed__") => {
+                // Check if the daemon was asked to shut down while we were running
+                if shutdown_rx.try_recv().is_ok() { break; }
+
+                tracing::info!("Renderer: layer surface closed — reinitialising in 500 ms");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Check again after the sleep
+                if shutdown_rx.try_recv().is_ok() { break; }
+                continue;
+            }
+
+            Err(e) => return Err(e),
         }
-    });
-
-    let sd_forward = tokio::spawn(async move {
-        let _ = shutdown_rx.recv().await;
-        let _ = sd_tx.send(());
-    });
-
-    tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, sd_rx))
-        .await
-        .context("render loop thread panicked")??;
-
-    wp_forward.abort();
-    sd_forward.abort();
+    }
 
     Ok(())
 }
@@ -731,8 +775,12 @@ pub async fn run(
 /// What the render loop should do after decode_upload_render returns.
 /// No references into decoder/render_state — safe to act on after borrow ends.
 enum FrameAction {
-    /// Frame decoded, uploaded, and rendered. Timing was updated inside.
+    /// Frame decoded, uploaded, and rendered normally.
     Ok,
+    /// Frame decoded and uploaded, but the wgpu surface had to be reconfigured
+    /// (SurfaceError::Lost or Outdated). The render loop must call
+    /// `wl_surface.commit()` so the compositor picks up the new swapchain.
+    NeedWlCommit,
     /// EOF — call seek_to_start on the current decoder.
     Eof,
     /// HW decode error — try SW fallback for current_wp.
@@ -760,10 +808,10 @@ fn decode_upload_render(
             match hw.next_nv12_frame() {
                 Ok(Some(frame)) => {
                     upload_nv12(&ctx.queue, y_tex, uv_tex, &frame);
+                    // Returns Ok or NeedWlCommit depending on surface state
                     advance_timer_from_render(
                         ctx, &ctx.pipeline_nv12, bind_group, hw.frame_duration(), next_frame,
-                    );
-                    FrameAction::Ok
+                    )
                 }
                 Ok(None) => FrameAction::Eof,
                 Err(e) => {
@@ -777,10 +825,10 @@ fn decode_upload_render(
             match sw.next_frame_rgba() {
                 Ok(Some((rgba, w, h))) => {
                     upload_rgba(&ctx.queue, texture, rgba, w, h);
+                    // Returns Ok or NeedWlCommit depending on surface state
                     advance_timer_from_render(
                         ctx, &ctx.pipeline_rgba, bind_group, sw.frame_duration(), next_frame,
-                    );
-                    FrameAction::Ok
+                    )
                 }
                 Ok(None)  => FrameAction::Eof,
                 Err(e)    => { tracing::warn!("SW: next_frame_rgba: {}", e); FrameAction::Clear }
@@ -795,23 +843,27 @@ fn decode_upload_render(
 }
 
 /// Render a frame and update next_frame based on whether presentation succeeded.
+/// Returns `FrameAction::NeedWlCommit` when the wgpu surface had to be
+/// reconfigured (Lost/Outdated) — the render loop must then call
+/// `wl_surface.commit()` so the compositor applies the new swapchain.
 fn advance_timer_from_render(
     ctx:        &RendererCtx,
     pipeline:   &wgpu::RenderPipeline,
     bind_group: &wgpu::BindGroup,
     dur:        Duration,
     next_frame: &mut Instant,
-) {
+) -> FrameAction {
     match render_frame(
         &ctx.wgpu_surface, &ctx.device, &ctx.queue,
         pipeline, bind_group, &ctx.surface_config,
     ) {
-        // FIX 5: additive update avoids drift from decode+upload latency.
-        Ok(true)  => { *next_frame += dur; }
-        // FIX E-38: reset on Lost/Outdated/Timeout to prevent decoder
-        // racing ahead while the surface is dead.
-        Ok(false) => { *next_frame = Instant::now() + dur; }
-        Err(e)    => { tracing::warn!("render_frame: {}", e); }
+        // Additive update avoids drift from decode+upload latency (FIX 5).
+        Ok(true)  => { *next_frame += dur; FrameAction::Ok }
+        // E-38: reset so decoder doesn't race ahead while the surface is dead.
+        // NeedWlCommit tells the render loop to commit the Wayland surface so
+        // the compositor accepts the newly configured swapchain.
+        Ok(false) => { *next_frame = Instant::now() + dur; FrameAction::NeedWlCommit }
+        Err(e)    => { tracing::warn!("render_frame: {}", e); FrameAction::Ok }
     }
 }
 
@@ -869,6 +921,20 @@ fn render_loop(
             tracing::info!("Re-configured after compositor event ({}x{})", new_w, new_h);
         }
 
+        // ── Layer surface closed (e.g. exclusive fullscreen, output removed) ──
+        // The compositor destroyed our layer surface. We must drop it and
+        // recreate the entire renderer — signal renderer::run to restart.
+        if ctx.wls.closed {
+            tracing::warn!("Layer surface closed — requesting renderer restart");
+            // Drop Wayland objects in the correct order before returning
+            drop(ctx.layer_surface);
+            drop(ctx.wl_surface);
+            let _ = ctx.evq.flush();
+            // Return a sentinel error that renderer::run recognises as "restart"
+            // rather than a fatal failure.
+            anyhow::bail!("__layer_surface_closed__");
+        }
+
         // ── Decode + upload + render ──────────────────────────────────────────
         // Phase 1: decode_upload_render borrows decoder/render_state mutably.
         // No mutations of decoder/render_state happen inside — only the action
@@ -880,6 +946,14 @@ fn render_loop(
 
         // Phase 2: act on the result — borrows fully released, safe to mutate.
         match action {
+            FrameAction::NeedWlCommit => {
+                // wgpu surface was reconfigured (Lost/Outdated).
+                // Commit the Wayland surface so the compositor picks up the
+                // new swapchain — without this the surface stays broken forever.
+                ctx.wl_surface.commit();
+                let _ = ctx.evq.flush();
+                tracing::debug!("Surface reconfigured — committed Wayland surface");
+            }
             FrameAction::Eof => {
                 if let Some(ref mut dec) = decoder {
                     if let Err(e) = dec.seek_to_start() {

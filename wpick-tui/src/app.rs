@@ -335,19 +335,32 @@ impl App {
     }
 
     async fn send(&mut self, cmd: ClientCommand) -> anyhow::Result<DaemonResponse> {
-        match self.client.as_mut() {
+        let client = match self.client.as_mut() {
             None => {
                 self.daemon_connected = false;
-                anyhow::bail!("Not connected to daemon")
+                anyhow::bail!("Not connected to daemon");
             }
-            Some(client) => match client.send(&cmd).await {
-                Ok(resp) => Ok(resp),
-                Err(e) => {
-                    self.client = None;
-                    self.daemon_connected = false;
-                    Err(e)
-                }
-            },
+            Some(c) => c,
+        };
+
+        // 2-second timeout: if the daemon is unresponsive (e.g. after a Kill that
+        // closed the socket without sending a response), recv_response would block
+        // forever. The timeout drops the connection and shows an error instead.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.send(&cmd),
+        ).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => {
+                self.client = None;
+                self.daemon_connected = false;
+                Err(e)
+            }
+            Err(_timeout) => {
+                self.client = None;
+                self.daemon_connected = false;
+                anyhow::bail!("Daemon did not respond (timeout)")
+            }
         }
     }
 
