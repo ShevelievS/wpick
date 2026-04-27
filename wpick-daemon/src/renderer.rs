@@ -1,12 +1,31 @@
-use std::ffi::c_void;
-use std::ptr::NonNull;
+// Wallpaper renderer — wl_shm (CPU shared memory) path.
+//
+// Replaces the wgpu/Vulkan approach. Core insight: every blocking issue we
+// encountered (vkAcquireNextImageKHR hanging on NVIDIA when Hyprland hides
+// the surface during fullscreen) comes from the GPU synchronisation model.
+// With wl_shm we write directly to shared memory and the compositor reads it
+// at its own pace — no Vulkan fence, no frame callback starvation, no deadlock.
+//
+// Render model:
+//   decode frame → write BGRA to mmap'd canvas → attach + damage + frame(cb)
+//   + commit → wait for cb (compositor composited) → decode next frame …
+//
+// If the frame callback times out (surface hidden behind fullscreen) we stop
+// rendering but keep the Wayland event loop running.  Compositor sends
+// Configure when fullscreen exits; we ack it immediately (no GPU in the way)
+// and resume rendering on the next callback.
+
+use std::os::unix::io::{AsFd, AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::sync::{broadcast, watch};
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle,
-    protocol::{wl_compositor, wl_output, wl_registry, wl_surface},
+    protocol::{
+        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry,
+        wl_shm, wl_shm_pool, wl_surface,
+    },
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
@@ -22,7 +41,7 @@ use crate::video::VideoDecoder;
 struct WaylandState {
     compositor:       Option<wl_compositor::WlCompositor>,
     layer_shell:      Option<ZwlrLayerShellV1>,
-    // Kept alive to receive Mode events — never read directly
+    shm:              Option<wl_shm::WlShm>,
     _output:          Option<wl_output::WlOutput>,
     output_width:     u32,
     output_height:    u32,
@@ -31,25 +50,30 @@ struct WaylandState {
     surf_width:       u32,
     surf_height:      u32,
     needs_ack:        bool,
-    /// Set when compositor sends zwlr_layer_surface_v1::Closed.
-    /// Render loop will reinitialise the renderer when it sees this.
     closed:           bool,
+    /// Set by the wl_callback dispatcher when the compositor fires done.
+    frame_done:       bool,
+    /// Set by the wl_buffer dispatcher when the compositor releases the buffer.
+    buffer_released:  bool,
 }
 
 impl Default for WaylandState {
     fn default() -> Self {
         Self {
-            compositor:       None,
-            layer_shell:      None,
-            _output:          None,
-            output_width:     1920,
-            output_height:    1080,
-            configured:       false,
+            compositor:      None,
+            layer_shell:     None,
+            shm:             None,
+            _output:         None,
+            output_width:    1920,
+            output_height:   1080,
+            configured:      false,
             configure_serial: 0,
-            surf_width:       0,
-            surf_height:      0,
-            needs_ack:        false,
-            closed:           false,
+            surf_width:      0,
+            surf_height:     0,
+            needs_ack:       false,
+            closed:          false,
+            frame_done:      false,
+            buffer_released: true,
         }
     }
 }
@@ -68,19 +92,18 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
         if let wl_registry::Event::Global { name, interface, version } = event {
             match interface.as_str() {
                 "wl_compositor" => {
-                    state.compositor =
-                        Some(registry.bind(name, version.min(4), qh, ()));
+                    state.compositor = Some(registry.bind(name, version.min(4), qh, ()));
                 }
                 "zwlr_layer_shell_v1" => {
-                    state.layer_shell =
-                        Some(registry.bind(name, version.min(4), qh, ()));
+                    state.layer_shell = Some(registry.bind(name, version.min(4), qh, ()));
+                }
+                "wl_shm" => {
+                    state.shm = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "wl_output" => {
                     if state._output.is_none() {
                         state._output = Some(
-                            registry.bind::<wl_output::WlOutput, _, _>(
-                                name, version.min(4), qh, (),
-                            ),
+                            registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ()),
                         );
                     }
                 }
@@ -98,6 +121,46 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
     fn event(_: &mut Self, _: &wl_surface::WlSurface, _: wl_surface::Event,
              _: &(), _: &Connection, _: &QueueHandle<WaylandState>) {}
+}
+
+impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
+    fn event(_: &mut Self, _: &wl_shm::WlShm, _: wl_shm::Event,
+             _: &(), _: &Connection, _: &QueueHandle<WaylandState>) {}
+}
+
+impl Dispatch<wl_shm_pool::WlShmPool, ()> for WaylandState {
+    fn event(_: &mut Self, _: &wl_shm_pool::WlShmPool, _: wl_shm_pool::Event,
+             _: &(), _: &Connection, _: &QueueHandle<WaylandState>) {}
+}
+
+impl Dispatch<wl_buffer::WlBuffer, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wl_buffer::WlBuffer,
+        event: wl_buffer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<WaylandState>,
+    ) {
+        if matches!(event, wl_buffer::Event::Release) {
+            state.buffer_released = true;
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        event: wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<WaylandState>,
+    ) {
+        if matches!(event, wl_callback::Event::Done { .. }) {
+            state.frame_done = true;
+        }
+    }
 }
 
 impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState {
@@ -122,8 +185,6 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandState {
                 state.configured       = true;
                 state.needs_ack        = true;
             }
-            // Compositor destroyed our layer surface (e.g. output removed, exclusive
-            // fullscreen took over, or compositor reload). Signal render_loop to reinit.
             zwlr_layer_surface_v1::Event::Closed => {
                 tracing::warn!("Layer surface closed by compositor — will reinitialise");
                 state.closed = true;
@@ -142,13 +203,11 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
         _: &Connection,
         _: &QueueHandle<WaylandState>,
     ) {
-        // E-31: only apply the CURRENT mode — compositors send multiple Mode events
-        // (one per supported resolution) before the active one; acting on any of them
-        // would set the wrong resolution.
         if let wl_output::Event::Mode { flags, width, height, .. } = event {
             use wayland_client::WEnum;
-            let is_current = matches!(flags, WEnum::Value(f) if f.contains(wl_output::Mode::Current));
-            if is_current && width > 0 && height > 0 {
+            if matches!(flags, WEnum::Value(f) if f.contains(wl_output::Mode::Current))
+                && width > 0 && height > 0
+            {
                 state.output_width  = width  as u32;
                 state.output_height = height as u32;
             }
@@ -156,9 +215,95 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
     }
 }
 
+// ─── Shared memory canvas ─────────────────────────────────────────────────────
+
+struct ShmCanvas {
+    width:   u32,
+    height:  u32,
+    _fd:     OwnedFd,
+    ptr:     *mut u8,
+    size:    usize,
+    buffer:  wl_buffer::WlBuffer,
+    _pool:   wl_shm_pool::WlShmPool,
+}
+
+// SAFETY: ShmCanvas exclusively owns its fd and mmap region.
+unsafe impl Send for ShmCanvas {}
+
+impl Drop for ShmCanvas {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.size); }
+    }
+}
+
+impl ShmCanvas {
+    fn create(
+        shm:    &wl_shm::WlShm,
+        qh:     &QueueHandle<WaylandState>,
+        width:  u32,
+        height: u32,
+    ) -> anyhow::Result<Self> {
+        let stride = width * 4;
+        let size   = (stride * height) as usize;
+
+        // Anonymous backing file (works everywhere, no memfd_create dependency)
+        let path = format!(
+            "/tmp/.wpick-shm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+        );
+        let file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true)
+            .open(&path)
+            .context("create shm file")?;
+        // Unlink immediately — the fd keeps the backing store alive.
+        std::fs::remove_file(&path).ok();
+        file.set_len(size as u64).context("set_len")?;
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        anyhow::ensure!(ptr != libc::MAP_FAILED, "mmap failed: {}", std::io::Error::last_os_error());
+
+        let pool   = shm.create_pool(file.as_fd(), size as i32, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            width as i32, height as i32,
+            stride as i32,
+            wl_shm::Format::Argb8888,
+            qh, (),
+        );
+
+        Ok(Self {
+            width,
+            height,
+            _fd:   OwnedFd::from(file),
+            ptr:   ptr as *mut u8,
+            size,
+            buffer,
+            _pool: pool,
+        })
+    }
+
+    fn pixels_mut(&mut self) -> &mut [u8] {
+        // SAFETY: we own the mapping exclusively during this borrow.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+}
+
 // ─── Decoder abstraction ──────────────────────────────────────────────────────
 
-/// Wraps either a hardware (VA-API → NV12) or software (swscale → RGBA) decoder.
 enum AnyDecoder {
     Hw(HwDecoder),
     Sw(VideoDecoder),
@@ -171,244 +316,33 @@ impl AnyDecoder {
             AnyDecoder::Sw(d) => d.seek_to_start(),
         }
     }
-}
 
-// ─── Render state (per active wallpaper) ─────────────────────────────────────
-
-/// Per-frame GPU state — either RGBA (SW path) or NV12 (HW path).
-/// Recreated when the wallpaper or its dimensions change.
-enum RenderState {
-    Rgba {
-        texture:    wgpu::Texture,
-        // Kept alive so wgpu can track the view's lifetime in the bind group.
-        _view:      wgpu::TextureView,
-        bind_group: wgpu::BindGroup,
-    },
-    Nv12 {
-        y_tex:      wgpu::Texture,
-        uv_tex:     wgpu::Texture,
-        // Kept alive so wgpu can track view lifetimes in the bind group.
-        _y_view:    wgpu::TextureView,
-        _uv_view:   wgpu::TextureView,
-        bind_group: wgpu::BindGroup,
-    },
-}
-
-// ─── wgpu helpers ─────────────────────────────────────────────────────────────
-
-fn make_rgba_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    // FIX 1: Rgba8UnormSrgb matches ffmpeg RGBA output. Surface is Bgra8UnormSrgb;
-    // the GPU handles format conversion during the render pass write.
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label:           None,
-        size:            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count:    1,
-        dimension:       wgpu::TextureDimension::D2,
-        format:          wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats:    &[],
-    });
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    (tex, view)
-}
-
-fn make_y_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label:           None,
-        size:            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count:    1,
-        dimension:       wgpu::TextureDimension::D2,
-        format:          wgpu::TextureFormat::R8Unorm,
-        usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats:    &[],
-    });
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    (tex, view)
-}
-
-fn make_uv_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
-    // UV texture: half width, half height, Rg8Unorm (R=Cb G=Cr interleaved)
-    let (uw, uh) = (w / 2, h / 2);
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label:           None,
-        size:            wgpu::Extent3d { width: uw, height: uh, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count:    1,
-        dimension:       wgpu::TextureDimension::D2,
-        format:          wgpu::TextureFormat::Rg8Unorm,
-        usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats:    &[],
-    });
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    (tex, view)
-}
-
-fn make_rgba_bind_group(
-    device:  &wgpu::Device,
-    layout:  &wgpu::BindGroupLayout,
-    view:    &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label:   None,
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-        ],
-    })
-}
-
-fn make_nv12_bind_group(
-    device:  &wgpu::Device,
-    layout:  &wgpu::BindGroupLayout,
-    y_view:  &wgpu::TextureView,
-    uv_view: &wgpu::TextureView,
-    sampler: &wgpu::Sampler,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label:   None,
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(y_view)  },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(uv_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler)     },
-        ],
-    })
-}
-
-fn upload_rgba(queue: &wgpu::Queue, tex: &wgpu::Texture, rgba: &[u8], w: u32, h: u32) {
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: tex, mip_level: 0,
-            origin:  wgpu::Origin3d::ZERO,
-            aspect:  wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::ImageDataLayout {
-            offset:         0,
-            bytes_per_row:  Some(4 * w),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-    );
-}
-
-fn upload_nv12(queue: &wgpu::Queue, y_tex: &wgpu::Texture, uv_tex: &wgpu::Texture, frame: &Nv12Frame) {
-    // Y plane: R8Unorm, width × height, 1 byte per texel
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: y_tex, mip_level: 0,
-            origin:  wgpu::Origin3d::ZERO,
-            aspect:  wgpu::TextureAspect::All,
-        },
-        &frame.y,
-        wgpu::ImageDataLayout {
-            offset:         0,
-            bytes_per_row:  Some(frame.width),
-            rows_per_image: Some(frame.height),
-        },
-        wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
-    );
-
-    // UV plane: Rg8Unorm, width/2 × height/2, 2 bytes per texel (Cb, Cr)
-    let (uw, uh) = frame.uv_dims();
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: uv_tex, mip_level: 0,
-            origin:  wgpu::Origin3d::ZERO,
-            aspect:  wgpu::TextureAspect::All,
-        },
-        &frame.uv,
-        wgpu::ImageDataLayout {
-            offset:         0,
-            bytes_per_row:  Some(uw * 2), // 2 bytes per Rg8Unorm texel
-            rows_per_image: Some(uh),
-        },
-        wgpu::Extent3d { width: uw, height: uh, depth_or_array_layers: 1 },
-    );
-}
-
-fn render_frame(
-    surface:        &wgpu::Surface,
-    device:         &wgpu::Device,
-    queue:          &wgpu::Queue,
-    pipeline:       &wgpu::RenderPipeline,
-    bind_group:     &wgpu::BindGroup,
-    surface_config: &wgpu::SurfaceConfiguration,
-) -> anyhow::Result<bool> {
-    let frame = match surface.get_current_texture() {
-        Ok(f) => f,
-        // Lost and Outdated both mean the swap chain is invalid on Wayland/Vulkan.
-        // reconfigure rebuilds only the swap chain — Device/Queue/Pipeline untouched.
-        // See E-37, E-39.
-        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-            surface.configure(device, surface_config);
-            return Ok(false);
+    fn frame_duration(&self) -> Duration {
+        match self {
+            AnyDecoder::Hw(d) => d.frame_duration(),
+            AnyDecoder::Sw(d) => d.frame_duration(),
         }
-        // Timeout: compositor temporarily busy. Retry next frame without reconfigure.
-        Err(wgpu::SurfaceError::Timeout) => return Ok(false),
-        Err(e) => return Err(anyhow::anyhow!("Surface error: {}", e)),
-    };
-    let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut enc = device.create_command_encoder(&Default::default());
-    {
-        let mut rpass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view:           &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load:  wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        rpass.set_pipeline(pipeline);
-        rpass.set_bind_group(0, bind_group, &[]);
-        rpass.draw(0..6, 0..1);
     }
-    queue.submit(std::iter::once(enc.finish()));
-    // FIX 2: wgpu Vulkan WSI (VK_KHR_wayland_surface) manages buffer attachment internally.
-    // Do not call wl_surface.commit() here — it would double-commit and blank the surface.
-    frame.present();
-    Ok(true)
 }
 
 // ─── Renderer context ─────────────────────────────────────────────────────────
 
 struct RendererCtx {
-    // FIX 3: conn keeps the Wayland socket fd alive for the life of the renderer.
-    _conn:          Connection,
-    evq:            wayland_client::EventQueue<WaylandState>,
-    wls:            WaylandState,
-    wl_surface:     wl_surface::WlSurface,
-    layer_surface:  ZwlrLayerSurfaceV1,
-    wgpu_surface:   wgpu::Surface<'static>,
-    device:         wgpu::Device,
-    queue:          wgpu::Queue,
-    // RGBA pipeline (SW path: swscale → Rgba8UnormSrgb)
-    pipeline_rgba:  wgpu::RenderPipeline,
-    bg_layout_rgba: wgpu::BindGroupLayout,
-    // NV12 pipeline (HW path: VA-API → R8Unorm Y + Rg8Unorm UV → BT.709 shader)
-    pipeline_nv12:  wgpu::RenderPipeline,
-    bg_layout_nv12: wgpu::BindGroupLayout,
-    sampler:        wgpu::Sampler,
-    surf_w:         u32,
-    surf_h:         u32,
-    surface_config: wgpu::SurfaceConfiguration,
+    _conn:         Connection,
+    evq:           wayland_client::EventQueue<WaylandState>,
+    wls:           WaylandState,
+    wl_surface:    wl_surface::WlSurface,
+    layer_surface: ZwlrLayerSurfaceV1,
+    shm:           wl_shm::WlShm,
+    canvas:        ShmCanvas,
+    surf_w:        u32,
+    surf_h:        u32,
 }
 
 // ─── Blocking init ────────────────────────────────────────────────────────────
 
 fn init_renderer() -> anyhow::Result<RendererCtx> {
     use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
-    use raw_window_handle::{
-        RawDisplayHandle, RawWindowHandle,
-        WaylandDisplayHandle, WaylandWindowHandle,
-    };
 
     tracing::debug!("init_renderer — connecting to Wayland");
 
@@ -419,8 +353,8 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
 
     conn.display().get_registry(&qh, ());
     evq.roundtrip(&mut wls).context("globals roundtrip")?;
-    tracing::debug!("globals — compositor={} layer_shell={}",
-        wls.compositor.is_some(), wls.layer_shell.is_some());
+    tracing::debug!("globals — compositor={} layer_shell={} shm={}",
+        wls.compositor.is_some(), wls.layer_shell.is_some(), wls.shm.is_some());
 
     let compositor  = wls.compositor.take()
         .ok_or_else(|| anyhow::anyhow!("No wl_compositor global"))?;
@@ -428,30 +362,20 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
         .ok_or_else(|| anyhow::anyhow!(
             "No zwlr_layer_shell_v1 — use Hyprland/Sway/river (not GNOME/KDE)"
         ))?;
+    let shm = wls.shm.take()
+        .ok_or_else(|| anyhow::anyhow!("No wl_shm global"))?;
 
     let wl_surface    = compositor.create_surface(&qh, ());
     let layer_surface = layer_shell.get_layer_surface(
-        &wl_surface,
-        None,
-        Layer::Bottom,
-        "wpick".to_string(),
-        &qh,
-        (),
+        &wl_surface, None, Layer::Bottom, "wpick".to_string(), &qh, (),
     );
-
     layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
     layer_surface.set_size(0, 0);
     layer_surface.set_exclusive_zone(-1);
     wl_surface.commit();
 
-    // FIX 4: roundtrip triggers Configure. Init acks manually here; render loop
-    // must not re-ack this startup serial (needs_ack cleared below).
     evq.roundtrip(&mut wls).context("configure roundtrip")?;
-    tracing::debug!("configure — configured={} surf={}x{}",
-        wls.configured, wls.surf_width, wls.surf_height);
-
-    anyhow::ensure!(wls.configured,
-        "Layer surface not configured — compositor didn't send Configure event");
+    anyhow::ensure!(wls.configured, "Layer surface not configured");
 
     let surf_w = if wls.surf_width  > 0 { wls.surf_width  } else { wls.output_width  };
     let surf_h = if wls.surf_height > 0 { wls.surf_height } else { wls.output_height };
@@ -459,258 +383,16 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
     layer_surface.ack_configure(wls.configure_serial);
     wl_surface.commit();
     evq.flush().context("flush after ack_configure")?;
-    // Prevent render loop from re-acking the startup serial (double-ack = protocol error).
     wls.needs_ack = false;
 
     tracing::debug!("Wayland surface ready: {}x{}", surf_w, surf_h);
 
-    // ── wgpu ──────────────────────────────────────────────────────────────────
-    let backend     = conn.display().backend().upgrade()
-        .ok_or_else(|| anyhow::anyhow!("Wayland backend unavailable"))?;
-    let display_ptr = backend.display_ptr() as *mut c_void;
-    let surface_ptr = wl_surface.id().as_ptr() as *mut c_void;
+    let canvas = ShmCanvas::create(&shm, &qh, surf_w, surf_h)
+        .context("create shm canvas")?;
 
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::VULKAN,
-        ..Default::default()
-    });
+    tracing::info!("Renderer ready (wl_shm {}x{})", surf_w, surf_h);
 
-    let raw_display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
-        NonNull::new(display_ptr).ok_or_else(|| anyhow::anyhow!("null display ptr"))?,
-    ));
-    let raw_window = RawWindowHandle::Wayland(WaylandWindowHandle::new(
-        NonNull::new(surface_ptr).ok_or_else(|| anyhow::anyhow!("null surface ptr"))?,
-    ));
-
-    // SAFETY: _conn keeps the Wayland connection alive for the duration of RendererCtx.
-    // wl_surface is stored in RendererCtx and outlives wgpu_surface.
-    let wgpu_surface = unsafe {
-        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-            raw_display_handle: raw_display,
-            raw_window_handle:  raw_window,
-        })
-    }.context("create wgpu surface")?;
-
-    tracing::debug!("requesting Vulkan adapter");
-    let adapter = pollster::block_on(instance.request_adapter(
-        &wgpu::RequestAdapterOptions {
-            power_preference:       wgpu::PowerPreference::HighPerformance,
-            compatible_surface:     Some(&wgpu_surface),
-            force_fallback_adapter: false,
-        },
-    )).ok_or_else(|| anyhow::anyhow!(
-        "No Vulkan adapter — install vulkan-radeon / nvidia-utils / vulkan-intel"
-    ))?;
-
-    tracing::info!("Vulkan adapter: {}", adapter.get_info().name);
-
-    let (device, queue) = pollster::block_on(
-        adapter.request_device(&wgpu::DeviceDescriptor::default(), None)
-    ).context("request_device")?;
-
-    let caps   = wgpu_surface.get_capabilities(&adapter);
-    // M-3: caps.formats can be empty on some drivers — avoid panic.
-    let format = caps.formats.first().copied()
-        .ok_or_else(|| anyhow::anyhow!("GPU reports no surface formats — check Vulkan driver"))?;
-    tracing::debug!("surface format = {:?}", format);
-
-    // Prefer Mailbox > FifoRelaxed > Fifo.
-    // Mailbox (and Immediate) do NOT block on Wayland frame callbacks inside
-    // Mesa's Vulkan WSI. Fifo blocks — when Hyprland hides a layer surface
-    // behind a fullscreen window it stops sending frame callbacks, causing
-    // vkAcquireNextImageKHR to hang forever. With Mailbox the render loop
-    // keeps running; when fullscreen exits the compositor picks up our latest
-    // frame immediately. Our own next_frame + sleep pacing prevents CPU spin.
-    let present_mode = [
-        wgpu::PresentMode::Mailbox,
-        wgpu::PresentMode::FifoRelaxed,
-    ]
-    .into_iter()
-    .find(|m| caps.present_modes.contains(m))
-    .unwrap_or(wgpu::PresentMode::Fifo);
-    tracing::debug!("present mode = {:?}", present_mode);
-
-    let surface_config = wgpu::SurfaceConfiguration {
-        usage:        wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format,
-        width:        surf_w,
-        height:       surf_h,
-        present_mode,
-        // B-2: alpha_modes can be empty on some drivers — avoid panic.
-        alpha_mode:   caps.alpha_modes.first().copied()
-                          .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-        view_formats: vec![],
-        desired_maximum_frame_latency: 2,
-    };
-    wgpu_surface.configure(&device, &surface_config);
-
-    // ── Shared vertex shader ──────────────────────────────────────────────────
-    let shader_vert = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label:  None,
-        source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/vertex.wgsl").into()),
-    });
-
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        mag_filter:     wgpu::FilterMode::Linear,
-        min_filter:     wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
-
-    // ── RGBA pipeline (SW fallback) ───────────────────────────────────────────
-    let bg_layout_rgba = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label:   None,
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding:    0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type:    wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled:   false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding:    1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty:         wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count:      None,
-            },
-        ],
-    });
-
-    let shader_frag_rgba = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label:  None,
-        source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/fragment.wgsl").into()),
-    });
-
-    let pipeline_rgba = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label:  None,
-        layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label:                None,
-            bind_group_layouts:   &[&bg_layout_rgba],
-            push_constant_ranges: &[],
-        })),
-        vertex: wgpu::VertexState {
-            module:              &shader_vert,
-            entry_point:         "vs_main",
-            buffers:             &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module:              &shader_frag_rgba,
-            entry_point:         "fs_main",
-            targets:             &[Some(wgpu::ColorTargetState {
-                format,
-                blend:      None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive:     wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample:   wgpu::MultisampleState::default(),
-        multiview:     None,
-        cache:         None,
-    });
-
-    // ── NV12 pipeline (HW path) ───────────────────────────────────────────────
-    // Three bindings: Y texture (R8), UV texture (Rg8), shared sampler.
-    let bg_layout_nv12 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label:   None,
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding:    0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type:    wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled:   false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding:    1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type:    wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled:   false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding:    2,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty:         wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count:      None,
-            },
-        ],
-    });
-
-    let shader_frag_yuv = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label:  None,
-        source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/fragment_yuv.wgsl").into()),
-    });
-
-    let pipeline_nv12 = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label:  None,
-        layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label:                None,
-            bind_group_layouts:   &[&bg_layout_nv12],
-            push_constant_ranges: &[],
-        })),
-        vertex: wgpu::VertexState {
-            module:              &shader_vert,
-            entry_point:         "vs_main",
-            buffers:             &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module:              &shader_frag_yuv,
-            entry_point:         "fs_main",
-            targets:             &[Some(wgpu::ColorTargetState {
-                format,
-                blend:      None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive:     wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample:   wgpu::MultisampleState::default(),
-        multiview:     None,
-        cache:         None,
-    });
-
-    tracing::debug!("render pipelines ready (RGBA + NV12)");
-
-    Ok(RendererCtx {
-        _conn: conn,
-        evq,
-        wls,
-        wl_surface,
-        layer_surface,
-        wgpu_surface,
-        device,
-        queue,
-        pipeline_rgba,
-        bg_layout_rgba,
-        pipeline_nv12,
-        bg_layout_nv12,
-        sampler,
-        surf_w,
-        surf_h,
-        surface_config,
-    })
+    Ok(RendererCtx { _conn: conn, evq, wls, wl_surface, layer_surface, shm, canvas, surf_w, surf_h })
 }
 
 // ─── Public async entry point ─────────────────────────────────────────────────
@@ -721,22 +403,15 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     tracing::debug!("renderer::run started");
 
-    // Keep the original receiver so we can resubscribe on each restart.
-    let mut shutdown_rx = shutdown_rx;
-    let mut init_failures = 0u32;
+    let mut shutdown_rx    = shutdown_rx;
+    let mut init_failures  = 0u32;
 
     loop {
-        // init_renderer can fail transiently (compositor mid-transition, output
-        // not yet ready). Retry with backoff instead of dying permanently.
-        let ctx = match tokio::task::spawn_blocking(init_renderer)
-            .await
+        let ctx = match tokio::task::spawn_blocking(init_renderer).await
             .context("renderer init thread panicked")?
         {
-            Ok(ctx) => {
-                init_failures = 0;
-                ctx
-            }
-            Err(e) => {
+            Ok(ctx) => { init_failures = 0; ctx }
+            Err(e)  => {
                 init_failures += 1;
                 tracing::warn!("Renderer init failed (attempt {}): {}", init_failures, e);
                 if init_failures >= 10 {
@@ -750,13 +425,9 @@ pub async fn run(
             }
         };
 
-        tracing::info!("Renderer ready: {}x{}", ctx.surf_w, ctx.surf_h);
-
         let (wp_tx, wp_rx) = std::sync::mpsc::channel::<Option<WallpaperInfo>>();
         let (sd_tx, sd_rx) = std::sync::mpsc::channel::<()>();
 
-        // Seed render loop with current wallpaper (important on restart so the
-        // wallpaper reappears automatically without a new `wpick set`).
         let _ = wp_tx.send(wallpaper_rx.borrow_and_update().clone());
 
         let mut wallpaper_rx2 = wallpaper_rx.clone();
@@ -768,8 +439,6 @@ pub async fn run(
             }
         });
 
-        // resubscribe() creates a fresh receiver on the same broadcast channel.
-        // The original shutdown_rx stays alive for the next iteration.
         let mut sd_shutdown = shutdown_rx.resubscribe();
         let sd_forward = tokio::spawn(async move {
             let _ = sd_shutdown.recv().await;
@@ -784,114 +453,17 @@ pub async fn run(
         sd_forward.abort();
 
         match result {
-            Ok(()) => break, // clean shutdown via sd_rx
-
+            Ok(()) => break,
             Err(ref e) if e.to_string().contains("__layer_surface_closed__") => {
                 if shutdown_rx.try_recv().is_ok() { break; }
-                // Compositor destroyed our surface (exclusive fullscreen, output
-                // removal). Try to reinitialise immediately — the compositor is
-                // ready for a new surface as soon as it sends Closed. A long sleep
-                // here caused the wallpaper to stay blank when fullscreen exited
-                // before we woke up.
                 tracing::info!("Renderer: layer surface closed — reinitialising");
                 continue;
             }
-
             Err(e) => return Err(e),
         }
     }
 
     Ok(())
-}
-
-// ─── Frame action — returned by decode_upload_render, no lifetime deps ───────
-
-/// What the render loop should do after decode_upload_render returns.
-/// No references into decoder/render_state — safe to act on after borrow ends.
-enum FrameAction {
-    /// Frame decoded, uploaded, and rendered normally (or swapchain reconfigured).
-    Ok,
-    /// EOF — call seek_to_start on the current decoder.
-    Eof,
-    /// HW decode error — try SW fallback for current_wp.
-    HwError,
-    /// Unrecoverable error — clear decoder and render_state.
-    Clear,
-    /// Not time to decode yet, or no active decoder.
-    Skip,
-}
-
-/// Decode one frame, upload to GPU, render. Returns a `FrameAction` that
-/// callers act on AFTER this borrow scope ends (so decoder/render_state can
-/// be mutated without conflicting with any active borrow).
-fn decode_upload_render(
-    ctx:        &RendererCtx,
-    dec:        &mut AnyDecoder,
-    rs:         &RenderState,
-    next_frame: &mut Instant,
-) -> FrameAction {
-    if Instant::now() < *next_frame { return FrameAction::Skip; }
-
-    match (dec, rs) {
-        // HW path: VA-API → NV12 → Y+UV upload → BT.709 shader
-        (AnyDecoder::Hw(hw), RenderState::Nv12 { y_tex, uv_tex, bind_group, .. }) => {
-            match hw.next_nv12_frame() {
-                Ok(Some(frame)) => {
-                    upload_nv12(&ctx.queue, y_tex, uv_tex, &frame);
-                    // Returns Ok or NeedWlCommit depending on surface state
-                    advance_timer_from_render(
-                        ctx, &ctx.pipeline_nv12, bind_group, hw.frame_duration(), next_frame,
-                    )
-                }
-                Ok(None) => FrameAction::Eof,
-                Err(e) => {
-                    tracing::warn!("HW: decode error: {}", e);
-                    FrameAction::HwError
-                }
-            }
-        }
-        // SW path: swscale → RGBA → texture → identity shader
-        (AnyDecoder::Sw(sw), RenderState::Rgba { texture, bind_group, .. }) => {
-            match sw.next_frame_rgba() {
-                Ok(Some((rgba, w, h))) => {
-                    upload_rgba(&ctx.queue, texture, rgba, w, h);
-                    // Returns Ok or NeedWlCommit depending on surface state
-                    advance_timer_from_render(
-                        ctx, &ctx.pipeline_rgba, bind_group, sw.frame_duration(), next_frame,
-                    )
-                }
-                Ok(None)  => FrameAction::Eof,
-                Err(e)    => { tracing::warn!("SW: next_frame_rgba: {}", e); FrameAction::Clear }
-            }
-        }
-        // Decoder/state type mismatch — should never happen
-        _ => {
-            tracing::warn!("render_loop: decoder/render_state type mismatch");
-            FrameAction::Clear
-        }
-    }
-}
-
-/// Render a frame and update next_frame based on whether presentation succeeded.
-fn advance_timer_from_render(
-    ctx:        &RendererCtx,
-    pipeline:   &wgpu::RenderPipeline,
-    bind_group: &wgpu::BindGroup,
-    dur:        Duration,
-    next_frame: &mut Instant,
-) -> FrameAction {
-    match render_frame(
-        &ctx.wgpu_surface, &ctx.device, &ctx.queue,
-        pipeline, bind_group, &ctx.surface_config,
-    ) {
-        // Additive update avoids drift from decode+upload latency (FIX 5).
-        Ok(true)  => { *next_frame += dur; FrameAction::Ok }
-        // Swapchain reconfigured (Lost/Outdated). Reset timer so decoder doesn't
-        // race ahead. wgpu/Vulkan handles the next wl_surface.commit() internally
-        // via frame.present() — no manual commit here (would blank the surface).
-        Ok(false) => { *next_frame = Instant::now() + dur; FrameAction::Ok }
-        Err(e)    => { tracing::warn!("render_frame: {}", e); FrameAction::Ok }
-    }
 }
 
 // ─── Synchronous render loop ──────────────────────────────────────────────────
@@ -901,103 +473,26 @@ fn render_loop(
     wp_rx:   std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
     sd_rx:   std::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let mut decoder:      Option<AnyDecoder>    = None;
-    let mut render_state: Option<RenderState>   = None;
-    let mut current_wp:   Option<WallpaperInfo> = None;
-    let mut next_frame:   Instant               = Instant::now();
+    let mut decoder:     Option<AnyDecoder>    = None;
+    let mut current_wp:  Option<WallpaperInfo> = None;
+    let mut next_frame:  Instant               = Instant::now();
+    // Frame callback state: pending_cb keeps the WlCallback alive until done fires.
+    let mut pending_cb:  Option<wl_callback::WlCallback> = None;
+    let mut cb_deadline: Option<Instant>                 = None;
+    const HIDDEN_TIMEOUT: Duration = Duration::from_secs(2);
 
-    tracing::debug!("render_loop running");
+    tracing::debug!("render_loop running (wl_shm)");
 
     loop {
-        // ── Shutdown ──────────────────────────────────────────────────────────
+        // ── 1. Shutdown ───────────────────────────────────────────────────────
         if sd_rx.try_recv().is_ok() {
             tracing::info!("Renderer shutting down");
             break;
         }
 
-        // ── Wallpaper change ──────────────────────────────────────────────────
-        while let Ok(new_wp) = wp_rx.try_recv() {
-            decoder      = None;
-            render_state = None;
-            if let Some(info) = new_wp {
-                tracing::debug!("loading wallpaper: {}", info.title);
-                open_wallpaper(&ctx, &info, &mut decoder, &mut render_state);
-                current_wp = Some(info);
-                next_frame = Instant::now();
-            } else {
-                current_wp = None;
-            }
-        }
-
-        // ── Handle Wayland re-configure (e.g. after fullscreen exit) ─────────
-        if ctx.wls.needs_ack {
-            ctx.wls.needs_ack = false;
-            ctx.layer_surface.ack_configure(ctx.wls.configure_serial);
-            // Protocol-required ack commit. Commits no buffer — the compositor
-            // briefly sees a transparent surface until the next render below.
-            ctx.wl_surface.commit();
-            if let Err(e) = ctx.evq.flush() {
-                tracing::warn!("flush after re-configure: {}", e);
-            }
-            let new_w = if ctx.wls.surf_width  > 0 { ctx.wls.surf_width  } else { ctx.surface_config.width  };
-            let new_h = if ctx.wls.surf_height > 0 { ctx.wls.surf_height } else { ctx.surface_config.height };
-            if new_w != ctx.surface_config.width || new_h != ctx.surface_config.height {
-                ctx.surface_config.width  = new_w;
-                ctx.surface_config.height = new_h;
-                tracing::info!("Surface resized: {}x{}", new_w, new_h);
-            }
-            ctx.wgpu_surface.configure(&ctx.device, &ctx.surface_config);
-            tracing::info!("Re-configured after compositor event ({}x{})", new_w, new_h);
-            // Force immediate re-render so the buffer is re-attached right away,
-            // minimising the blank window between the ack commit and the next frame.
-            next_frame = Instant::now();
-        }
-
-        // ── Layer surface closed (e.g. exclusive fullscreen, output removed) ──
-        // The compositor destroyed our layer surface. We must drop it and
-        // recreate the entire renderer — signal renderer::run to restart.
-        if ctx.wls.closed {
-            tracing::warn!("Layer surface closed — requesting renderer restart");
-            // Drop Wayland objects in the correct order before returning
-            drop(ctx.layer_surface);
-            drop(ctx.wl_surface);
-            let _ = ctx.evq.flush();
-            // Return a sentinel error that renderer::run recognises as "restart"
-            // rather than a fatal failure.
-            anyhow::bail!("__layer_surface_closed__");
-        }
-
-        // ── Decode + upload + render ──────────────────────────────────────────
-        // Phase 1: decode_upload_render borrows decoder/render_state mutably.
-        // No mutations of decoder/render_state happen inside — only the action
-        // enum is returned. The borrow ends before Phase 2.
-        let action = match (decoder.as_mut(), render_state.as_ref()) {
-            (Some(dec), Some(rs)) => decode_upload_render(&ctx, dec, rs, &mut next_frame),
-            _                     => FrameAction::Skip,
-        };
-
-        // Phase 2: act on the result — borrows fully released, safe to mutate.
-        match action {
-            FrameAction::Eof => {
-                if let Some(ref mut dec) = decoder {
-                    if let Err(e) = dec.seek_to_start() {
-                        tracing::warn!("seek_to_start failed: {} — clearing", e);
-                        decoder = None; render_state = None;
-                    }
-                }
-            }
-            FrameAction::HwError => {
-                tracing::warn!("HW decode error — falling back to SW");
-                decoder = None; render_state = None;
-                if let Some(ref info) = current_wp {
-                    open_wallpaper(&ctx, info, &mut decoder, &mut render_state);
-                }
-            }
-            FrameAction::Clear => { decoder = None; render_state = None; }
-            FrameAction::Ok | FrameAction::Skip => {}
-        }
-
-        // ── Wayland event dispatch (non-blocking) ─────────────────────────────
+        // ── 2. Wayland events — ALWAYS, even while waiting for callback ───────
+        // This is what breaks the fullscreen deadlock: Configure acks are sent
+        // here even when we're in the "waiting for frame callback" state below.
         if let Err(e) = ctx.evq.dispatch_pending(&mut ctx.wls) {
             tracing::warn!("dispatch_pending: {}", e);
         }
@@ -1005,67 +500,272 @@ fn render_loop(
             tracing::warn!("evq flush: {}", e);
         }
 
-        // ── Frame timing ──────────────────────────────────────────────────────
-        let wait = if decoder.is_some() {
+        // ── 3. Frame callback received ────────────────────────────────────────
+        if ctx.wls.frame_done {
+            ctx.wls.frame_done = false;
+            pending_cb  = None;
+            cb_deadline = None;
+        }
+
+        // ── 4. Wallpaper change ───────────────────────────────────────────────
+        while let Ok(new_wp) = wp_rx.try_recv() {
+            decoder    = None;
+            pending_cb = None;
+            cb_deadline = None;
+            if let Some(info) = new_wp {
+                tracing::debug!("loading wallpaper: {}", info.title);
+                decoder    = open_decoder(&info);
+                current_wp = Some(info);
+                next_frame = Instant::now();
+            } else {
+                current_wp = None;
+            }
+        }
+
+        // ── 5. Handle compositor Configure ────────────────────────────────────
+        if ctx.wls.needs_ack {
+            ctx.wls.needs_ack = false;
+            ctx.layer_surface.ack_configure(ctx.wls.configure_serial);
+
+            let new_w = if ctx.wls.surf_width  > 0 { ctx.wls.surf_width  } else { ctx.surf_w };
+            let new_h = if ctx.wls.surf_height > 0 { ctx.wls.surf_height } else { ctx.surf_h };
+
+            if new_w != ctx.surf_w || new_h != ctx.surf_h {
+                // Resize canvas to new dimensions.
+                let qh = ctx.evq.handle();
+                match ShmCanvas::create(&ctx.shm, &qh, new_w, new_h) {
+                    Ok(c)  => {
+                        ctx.canvas  = c;
+                        ctx.surf_w  = new_w;
+                        ctx.surf_h  = new_h;
+                        pending_cb  = None;
+                        cb_deadline = None;
+                        next_frame  = Instant::now();
+                        tracing::info!("Canvas resized to {}x{}", new_w, new_h);
+                    }
+                    Err(e) => tracing::warn!("Canvas resize failed: {}", e),
+                }
+            } else {
+                tracing::info!("Acked configure ({}x{} unchanged)", new_w, new_h);
+            }
+
+            // Commit with no buffer — the compositor just needs to see our ack.
+            // The next wl_shm render will attach a real buffer.
+            ctx.wl_surface.commit();
+            if let Err(e) = ctx.evq.flush() {
+                tracing::warn!("flush after ack: {}", e);
+            }
+        }
+
+        // ── 6. Layer surface closed ───────────────────────────────────────────
+        if ctx.wls.closed {
+            tracing::warn!("Layer surface closed — requesting renderer restart");
+            drop(ctx.layer_surface);
+            drop(ctx.wl_surface);
+            let _ = ctx.evq.flush();
+            anyhow::bail!("__layer_surface_closed__");
+        }
+
+        // ── 7. Frame callback guard ───────────────────────────────────────────
+        // While a callback is pending: sleep briefly so the event loop above
+        // keeps running (picking up Configure acks, buffer releases, etc.).
+        // If the deadline passes the compositor is not compositing us (surface
+        // hidden behind fullscreen) — keep looping without rendering.
+        if pending_cb.is_some() {
+            let deadline = *cb_deadline.get_or_insert_with(|| Instant::now() + HIDDEN_TIMEOUT);
+            if Instant::now() < deadline {
+                // Compositor will callback soon — wait 4 ms and loop.
+                std::thread::sleep(Duration::from_millis(4));
+            } else {
+                // Surface hidden: sleep longer, keep Wayland events flowing.
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            continue;
+        }
+
+        // ── 8. Render ─────────────────────────────────────────────────────────
+        if let Some(dec) = decoder.as_mut() {
             let now = Instant::now();
-            if next_frame > now { (next_frame - now).min(Duration::from_millis(8)) }
-            else                { Duration::ZERO }
+            if now < next_frame {
+                let wait = (next_frame - now).min(Duration::from_millis(8));
+                std::thread::sleep(wait);
+                continue;
+            }
+
+            let dur        = dec.frame_duration();
+            let canvas_w   = ctx.canvas.width;
+            let canvas_h   = ctx.canvas.height;
+            let pixels     = ctx.canvas.pixels_mut();
+            let eof;
+
+            match dec {
+                AnyDecoder::Hw(hw) => {
+                    match hw.next_nv12_frame() {
+                        Ok(Some(frame)) => {
+                            write_nv12_to_bgra(pixels, canvas_w, canvas_h, &frame);
+                            eof = false;
+                        }
+                        Ok(None) => { eof = true; }
+                        Err(e) => {
+                            tracing::warn!("HW decode error: {} — falling back to SW", e);
+                            if let Some(ref info) = current_wp {
+                                decoder = open_decoder(info);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                AnyDecoder::Sw(sw) => {
+                    match sw.next_frame_rgba() {
+                        Ok(Some((rgba, fw, fh))) => {
+                            write_rgba_to_bgra(pixels, canvas_w, canvas_h, rgba, fw, fh);
+                            eof = false;
+                        }
+                        Ok(None) => { eof = true; }
+                        Err(e) => {
+                            tracing::warn!("SW decode error: {}", e);
+                            decoder = None;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if eof {
+                if let Some(ref mut d) = decoder {
+                    if let Err(e) = d.seek_to_start() {
+                        tracing::warn!("seek_to_start: {} — clearing decoder", e);
+                        decoder = None;
+                    }
+                }
+                continue;
+            }
+
+            // Present: attach real buffer, mark damage, request frame callback, commit.
+            // The frame callback fires when the compositor has composited this frame.
+            // Only then do we decode and render the next one — this guarantees
+            // get_current_texture()-equivalent blocking never occurs.
+            ctx.wl_surface.attach(Some(&ctx.canvas.buffer), 0, 0);
+            ctx.wl_surface.damage_buffer(0, 0, canvas_w as i32, canvas_h as i32);
+            let cb = ctx.wl_surface.frame(&ctx.evq.handle(), ());
+            ctx.wl_surface.commit();
+            if let Err(e) = ctx.evq.flush() {
+                tracing::warn!("flush after render commit: {}", e);
+            }
+
+            ctx.wls.buffer_released = false;
+            pending_cb  = Some(cb);
+            cb_deadline = None;
+            next_frame += dur;
+
         } else {
-            // No active wallpaper — poll slowly to save CPU.
-            Duration::from_millis(100)
-        };
-        if wait > Duration::ZERO {
-            std::thread::sleep(wait);
+            // No active wallpaper — poll slowly.
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    // Proper Wayland cleanup order: layer_surface before wl_surface
     drop(ctx.layer_surface);
     drop(ctx.wl_surface);
     let _ = ctx.evq.flush();
     Ok(())
 }
 
-// ─── Wallpaper open helper ────────────────────────────────────────────────────
+// ─── Decoder open helper ──────────────────────────────────────────────────────
 
-/// Try to open a wallpaper with HW decode (NV12 path) first, fall back to SW (RGBA path).
-/// On success, populates `decoder` and `render_state`.
-fn open_wallpaper(
-    ctx:          &RendererCtx,
-    info:         &WallpaperInfo,
-    decoder:      &mut Option<AnyDecoder>,
-    render_state: &mut Option<RenderState>,
-) {
-    // ── Try HW (VA-API → NV12) ────────────────────────────────────────────────
+fn open_decoder(info: &WallpaperInfo) -> Option<AnyDecoder> {
     if let Some(hw) = HwDecoder::try_open(&info.file_path) {
-        let dims: (u32, u32) = hw.dimensions();
-        let (y_tex, y_view)   = make_y_texture(&ctx.device, dims.0, dims.1);
-        let (uv_tex, uv_view) = make_uv_texture(&ctx.device, dims.0, dims.1);
-        let bind_group = make_nv12_bind_group(
-            &ctx.device, &ctx.bg_layout_nv12, &y_view, &uv_view, &ctx.sampler,
-        );
-        *decoder = Some(AnyDecoder::Hw(hw));
-        *render_state = Some(RenderState::Nv12 {
-            y_tex, uv_tex,
-            _y_view: y_view, _uv_view: uv_view,
-            bind_group,
-        });
-        tracing::info!("HW NV12 path active: {}x{} — {}", dims.0, dims.1, info.title);
-        return;
+        tracing::info!("HW decode active (VA-API): {}x{} — {}",
+            hw.dimensions().0, hw.dimensions().1, info.title);
+        return Some(AnyDecoder::Hw(hw));
     }
-
-    // ── SW fallback (swscale → RGBA) ──────────────────────────────────────────
     match VideoDecoder::open(&info.file_path) {
         Ok(sw) => {
-            let dims = sw.dimensions();
-            let (texture, view) = make_rgba_texture(&ctx.device, dims.0, dims.1);
-            let bind_group = make_rgba_bind_group(
-                &ctx.device, &ctx.bg_layout_rgba, &view, &ctx.sampler,
-            );
-            *decoder = Some(AnyDecoder::Sw(sw));
-            *render_state = Some(RenderState::Rgba { texture, _view: view, bind_group });
-            tracing::info!("SW RGBA path active: {}x{} — {}", dims.0, dims.1, info.title);
+            tracing::info!("SW decode active: {}x{} — {}",
+                sw.dimensions().0, sw.dimensions().1, info.title);
+            Some(AnyDecoder::Sw(sw))
         }
-        Err(e) => tracing::warn!("VideoDecoder::open: {}", e),
+        Err(e) => {
+            tracing::warn!("VideoDecoder::open failed: {}", e);
+            None
+        }
+    }
+}
+
+// ─── Pixel conversion helpers ─────────────────────────────────────────────────
+
+/// Convert a single NV12 sample (BT.709 limited range) to BGRA.
+#[inline(always)]
+fn nv12_to_bgra(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
+    let y = y as i32 - 16;
+    let u = u as i32 - 128;
+    let v = v as i32 - 128;
+    let r = ((298 * y + 409 * v           + 128) >> 8).clamp(0, 255) as u8;
+    let g = ((298 * y - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
+    let b = ((298 * y + 516 * u           + 128) >> 8).clamp(0, 255) as u8;
+    (b, g, r)
+}
+
+/// Write NV12 frame into the BGRA canvas, scaling to (canvas_w × canvas_h).
+///
+/// wl_shm ARGB8888 on little-endian: bytes in memory are [B, G, R, A].
+fn write_nv12_to_bgra(
+    pixels:   &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    frame:    &Nv12Frame,
+) {
+    let cw = canvas_w as usize;
+    let ch = canvas_h as usize;
+    let fw = frame.width  as usize;
+    let fh = frame.height as usize;
+
+    for cy in 0..ch {
+        let fy = cy * fh / ch;
+        for cx in 0..cw {
+            let fx = cx * fw / cw;
+            let y  = frame.y[fy * fw + fx];
+            let uv_y = fy / 2;
+            let uv_x = fx / 2;
+            // UV plane: `fw` bytes per row (fw/2 pairs × 2 bytes = fw bytes)
+            let u  = frame.uv[uv_y * fw + uv_x * 2];
+            let v  = frame.uv[uv_y * fw + uv_x * 2 + 1];
+            let (b, g, r) = nv12_to_bgra(y, u, v);
+            let i = (cy * cw + cx) * 4;
+            pixels[i]   = b;
+            pixels[i+1] = g;
+            pixels[i+2] = r;
+            pixels[i+3] = 255;
+        }
+    }
+}
+
+/// Write an RGBA frame from VideoDecoder into the BGRA canvas, scaling to canvas size.
+///
+/// VideoDecoder outputs packed RGBA (R G B A per pixel).
+/// wl_shm ARGB8888 wants [B, G, R, A] in memory on little-endian.
+fn write_rgba_to_bgra(
+    pixels:   &mut [u8],
+    canvas_w: u32,
+    canvas_h: u32,
+    rgba:     &[u8],
+    frame_w:  u32,
+    frame_h:  u32,
+) {
+    let cw = canvas_w as usize;
+    let ch = canvas_h as usize;
+    let fw = frame_w  as usize;
+    let fh = frame_h  as usize;
+
+    for cy in 0..ch {
+        let fy = cy * fh / ch;
+        for cx in 0..cw {
+            let fx = cx * fw / cw;
+            let si = (fy * fw + fx) * 4;
+            let di = (cy * cw + cx) * 4;
+            pixels[di]   = rgba[si + 2]; // B ← R from RGBA
+            pixels[di+1] = rgba[si + 1]; // G
+            pixels[di+2] = rgba[si];     // R ← B from RGBA
+            pixels[di+3] = rgba[si + 3]; // A
+        }
     }
 }
