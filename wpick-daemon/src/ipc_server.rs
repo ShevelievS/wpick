@@ -155,16 +155,16 @@ async fn dispatch(
         }
 
         ClientCommand::Kill => {
-            tracing::info!("Kill received — shutting down");
-            let socket_path = dirs.socket_path.clone();
-            // Delayed exit: give the caller 150 ms to receive the Ok response
-            // before we call process::exit(0). Without this delay the process
-            // exits instantly, closing the socket before the TUI reads the
-            // response — recv_response then blocks forever (Bug 2).
+            tracing::info!("Kill received — initiating graceful shutdown");
+            // Grab the shutdown sender from state before releasing the lock.
+            let sd = state.lock().await.shutdown_tx.clone();
+            // Delay long enough for the TUI to receive and process the Ok
+            // response before the daemon begins tearing down Wayland objects.
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                let _ = std::fs::remove_file(&socket_path);
-                std::process::exit(0);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                // Broadcast shutdown — renderer exits cleanly, drops layer_surface
+                // and wl_surface, then main() runs cleanup() which removes the socket.
+                let _ = sd.send(());
             });
             DaemonResponse::Ok
         }
