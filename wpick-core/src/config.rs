@@ -25,11 +25,19 @@ pub struct WpickConfig {
 pub struct GeneralConfig {
     pub volume: f32,
     pub muted:  bool,
+    /// When `true`, competing wallpaper tools are suspended (SIGSTOP) instead
+    /// of terminated (SIGTERM/SIGKILL).  Suspended tools are resumed (SIGCONT)
+    /// automatically when the wpick daemon exits.
+    ///
+    /// Default `false` (terminate).  Use `true` if you want competing tools to
+    /// resume after wpick exits without needing to restart them manually.
+    #[serde(default)]
+    pub pause_competitors: bool,
 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
-        Self { volume: 0.8, muted: false }
+        Self { volume: 0.8, muted: false, pause_competitors: false }
     }
 }
 

@@ -1,47 +1,25 @@
-// VA-API hardware video decoder.
+// VA-API hardware video decoder with integrated swscale.
 //
-// Decodes video frames on the GPU via VA-API, then transfers them to CPU-side
-// NV12 (semi-planar YCbCr 4:2:0). The renderer uploads Y and UV planes
-// separately and converts to RGB in the fragment shader — no swscale needed.
+// Decode path:
+//   avformat → avcodec (VA-API) → vaapi_frame (GPU)
+//   → av_hwframe_transfer_data → nv12_frame (CPU, NV12)
+//   → sws_scale                → dst (BGRA at target_w × target_h)
 //
-// Usage:
-//   if let Some(dec) = HwDecoder::try_open(path) { ... }  // None → use VideoDecoder
+// The sws_scale call writes directly into the caller-supplied SHM slot,
+// eliminating staging buffers (y_buf / uv_buf) used in previous versions.
 //
 // Safety invariants (upheld internally):
 //   - All raw pointers are non-null after construction succeeds.
 //   - Ownership is exclusive; the struct is never shared across threads.
-//   - Drop frees every resource in the correct order (packet → frames → codec → format → hw_device).
+//   - Drop frees every resource in reverse-init order.
 
 use std::ptr;
 use std::time::Duration;
 
 use ffmpeg_sys_next as ffsys;
 
-// AVERROR(EAGAIN) = -EAGAIN. EAGAIN = 11 on Linux (POSIX, stable).
+// AVERROR(EAGAIN) = -EAGAIN. EAGAIN = 11 on Linux.
 const AVERROR_EAGAIN: i32 = -11;
-
-// ─── Public types ─────────────────────────────────────────────────────────────
-
-/// Compact NV12 frame with stride padding stripped.
-///
-/// Layout:
-/// - `y`  : `width × height` bytes (luma, 1 byte per pixel)
-/// - `uv` : `width × (height/2)` bytes (chroma, interleaved U+V, 2 bytes per pair)
-///
-/// UV texture dimensions: `(width/2, height/2)` @ `Rg8Unorm`.
-pub struct Nv12Frame {
-    pub y:      Vec<u8>,
-    pub uv:     Vec<u8>,
-    pub width:  u32,
-    pub height: u32,
-}
-
-impl Nv12Frame {
-    /// UV texture dimensions: (width/2, height/2).
-    pub fn uv_dims(&self) -> (u32, u32) {
-        (self.width / 2, self.height / 2)
-    }
-}
 
 // ─── HwDecoder ────────────────────────────────────────────────────────────────
 
@@ -52,14 +30,13 @@ pub struct HwDecoder {
     fps:           f64,
     width:         u32,
     height:        u32,
+    target_w:      u32,
     hw_device_ctx: *mut ffsys::AVBufferRef,
     packet:        *mut ffsys::AVPacket,
     vaapi_frame:   *mut ffsys::AVFrame,
     nv12_frame:    *mut ffsys::AVFrame,
+    sws_ctx:       *mut ffsys::SwsContext,
     eof_sent:      bool,
-    // B-4: reused across frames — avoids 3 MB/frame of allocation at 1080p30
-    y_buf:         Vec<u8>,
-    uv_buf:        Vec<u8>,
 }
 
 // SAFETY: HwDecoder exclusively owns all raw pointers and is never aliased.
@@ -74,15 +51,18 @@ impl Drop for HwDecoder {
             ffsys::avcodec_free_context(&mut self.codec_ctx);
             ffsys::avformat_close_input(&mut self.format_ctx);
             ffsys::av_buffer_unref(&mut self.hw_device_ctx);
+            if !self.sws_ctx.is_null() {
+                ffsys::sws_freeContext(self.sws_ctx);
+            }
         }
     }
 }
 
 impl HwDecoder {
-    /// Try to open a VA-API hardware decoder, trying each DRM render node in turn.
-    /// Returns `None` if hw decode is unavailable for this file — caller should
-    /// fall back to `VideoDecoder`.
-    pub fn try_open(path: &str) -> Option<Self> {
+    /// Try to open a VA-API hardware decoder for `path`, scaling output to
+    /// `target_w × target_h` BGRA.  Returns `None` if hw decode is unavailable
+    /// — caller should fall back to `VideoDecoder`.
+    pub fn try_open(path: &str, target_w: u32, target_h: u32) -> Option<Self> {
         let path_c = std::ffi::CString::new(path).ok()?;
         for device in ["/dev/dri/renderD128", "/dev/dri/renderD129"] {
             if !std::path::Path::new(device).exists() {
@@ -92,7 +72,7 @@ impl HwDecoder {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            match unsafe { Self::open_inner(&path_c, &device_c) } {
+            match unsafe { Self::open_inner(&path_c, &device_c, target_w, target_h) } {
                 Ok(dec) => {
                     tracing::info!("HW decode active: VA-API on {}", device);
                     return Some(dec);
@@ -108,6 +88,8 @@ impl HwDecoder {
     unsafe fn open_inner(
         path_c:   &std::ffi::CStr,
         device_c: &std::ffi::CStr,
+        target_w: u32,
+        target_h: u32,
     ) -> anyhow::Result<Self> {
         ffmpeg_next::init().ok(); // idempotent
 
@@ -186,7 +168,6 @@ impl HwDecoder {
             anyhow::bail!("avcodec_parameters_to_context: {}", ret);
         }
 
-        // Wire up hw device + pixel-format selection callback
         (*codec_ctx).hw_device_ctx = ffsys::av_buffer_ref(hw_device_ctx);
         (*codec_ctx).get_format     = Some(get_format_vaapi);
 
@@ -213,7 +194,7 @@ impl HwDecoder {
         let width  = (*codecpar).width  as u32;
         let height = (*codecpar).height as u32;
 
-        // ── 7. Allocate reusable buffers ──────────────────────────────────────
+        // ── 7. Allocate reusable frame objects ────────────────────────────────
         let packet      = ffsys::av_packet_alloc();
         let vaapi_frame = ffsys::av_frame_alloc();
         let nv12_frame  = ffsys::av_frame_alloc();
@@ -224,11 +205,31 @@ impl HwDecoder {
             ffsys::avcodec_free_context(&mut { codec_ctx });
             ffsys::av_buffer_unref(&mut hw_device_ctx);
             ffsys::avformat_close_input(&mut format_ctx);
-            anyhow::bail!("allocation failed");
+            anyhow::bail!("frame/packet allocation failed");
         }
 
-        let y_buf  = Vec::with_capacity((width  * height)      as usize);
-        let uv_buf = Vec::with_capacity((width  * height / 2) as usize);
+        // ── 8. Create swscale context: NV12 (src dims) → BGRA (target dims) ──
+        let sws_ctx = ffsys::sws_getContext(
+            width    as libc::c_int,
+            height   as libc::c_int,
+            ffsys::AVPixelFormat::AV_PIX_FMT_NV12,
+            target_w as libc::c_int,
+            target_h as libc::c_int,
+            ffsys::AVPixelFormat::AV_PIX_FMT_BGRA,
+            ffsys::SwsFlags::SWS_BILINEAR as libc::c_int,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null(),
+        );
+        if sws_ctx.is_null() {
+            ffsys::av_packet_free(&mut { packet });
+            ffsys::av_frame_free(&mut { vaapi_frame });
+            ffsys::av_frame_free(&mut { nv12_frame });
+            ffsys::avcodec_free_context(&mut { codec_ctx });
+            ffsys::av_buffer_unref(&mut hw_device_ctx);
+            ffsys::avformat_close_input(&mut format_ctx);
+            anyhow::bail!("sws_getContext failed (NV12→BGRA)");
+        }
 
         Ok(Self {
             format_ctx,
@@ -237,63 +238,58 @@ impl HwDecoder {
             fps,
             width,
             height,
+            target_w,
             hw_device_ctx,
             packet,
             vaapi_frame,
             nv12_frame,
+            sws_ctx,
             eof_sent: false,
-            y_buf,
-            uv_buf,
         })
     }
 
     // ── Public interface ──────────────────────────────────────────────────────
 
-    /// Decode the next frame and return compact NV12.
-    /// `Ok(None)` means EOF — call `seek_to_start()` for seamless loop.
-    /// B-4: internal staging buffers (`y_buf`/`uv_buf`) reuse their heap
-    /// allocation across frames so no zero-init or realloc occurs after
-    /// the first frame when resolution is constant.
-    pub fn next_nv12_frame(&mut self) -> anyhow::Result<Option<Nv12Frame>> {
-        unsafe { self.next_nv12_inner() }
+    /// Decode the next frame and write it as BGRA into `dst`.
+    ///
+    /// `dst` must be exactly `target_w * target_h * 4` bytes.
+    /// Returns `Ok(true)` when a frame was written, `Ok(false)` at EOF.
+    pub fn next_frame_bgra(&mut self, dst: &mut [u8]) -> anyhow::Result<bool> {
+        unsafe { self.next_frame_inner(dst) }
     }
 
-    unsafe fn next_nv12_inner(&mut self) -> anyhow::Result<Option<Nv12Frame>> {
+    unsafe fn next_frame_inner(&mut self, dst: &mut [u8]) -> anyhow::Result<bool> {
         loop {
-            // ── Try to drain decoder first (avoids unnecessary av_read_frame) ──
+            // ── Try to drain decoder first ────────────────────────────────────
             ffsys::av_frame_unref(self.vaapi_frame);
             let ret = ffsys::avcodec_receive_frame(self.codec_ctx, self.vaapi_frame);
 
             if ret == 0 {
-                // Got a VAAPI frame — transfer to CPU NV12
-                match self.transfer_to_nv12() {
-                    Ok(Some(frame)) => return Ok(Some(frame)),
-                    Ok(None)        => continue, // corrupt/skipped frame
-                    Err(e)          => {
-                        tracing::warn!("HW: transfer_to_nv12: {}", e);
+                match self.transfer_and_scale(dst) {
+                    Ok(true)  => return Ok(true),
+                    Ok(false) => continue, // corrupt/skipped frame — try next
+                    Err(e)    => {
+                        tracing::warn!("HW: transfer_and_scale: {}", e);
                         continue;
                     }
                 }
             }
 
-            if ret == ffsys::AVERROR_EOF { return Ok(None); }
+            if ret == ffsys::AVERROR_EOF { return Ok(false); }
 
             if ret != AVERROR_EAGAIN {
                 tracing::warn!("HW: avcodec_receive_frame: {}", ret);
-                // Not a fatal error — keep trying
             }
 
-            // Need more input — read a packet
+            // Need more input
             if self.eof_sent {
-                // Decoder flushed but returned EOF already handled above
-                return Ok(None);
+                return Ok(false);
             }
 
             ffsys::av_packet_unref(self.packet);
             let ret = ffsys::av_read_frame(self.format_ctx, self.packet);
 
             if ret == ffsys::AVERROR_EOF {
-                // Send flush packet to drain remaining decoder frames
                 ffsys::avcodec_send_packet(self.codec_ctx, ptr::null());
                 self.eof_sent = true;
                 continue;
@@ -314,70 +310,63 @@ impl HwDecoder {
         }
     }
 
-    unsafe fn transfer_to_nv12(&mut self) -> anyhow::Result<Option<Nv12Frame>> {
+    /// Transfer GPU frame to CPU NV12, then swscale NV12→BGRA into `dst`.
+    /// Returns `Ok(false)` for corrupt/skippable frames.
+    unsafe fn transfer_and_scale(&mut self, dst: &mut [u8]) -> anyhow::Result<bool> {
         ffsys::av_frame_unref(self.nv12_frame);
-        // Request NV12 output — VA-API will pick a compatible format automatically
         (*self.nv12_frame).format = ffsys::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
 
         let ret = ffsys::av_hwframe_transfer_data(self.nv12_frame, self.vaapi_frame, 0);
         if ret < 0 {
             tracing::warn!("HW: av_hwframe_transfer_data: {}", ret);
-            return Ok(None);
+            return Ok(false);
         }
 
-        let frame     = self.nv12_frame;
-        let width     = self.width;
-        let height    = self.height;
-        let stride_y  = (*frame).linesize[0] as usize;
-        let stride_uv = (*frame).linesize[1] as usize;
-
-        // Validate pointers and strides before slicing
-        if (*frame).data[0].is_null() || (*frame).data[1].is_null() {
+        // Validate pointers
+        if (*self.nv12_frame).data[0].is_null() || (*self.nv12_frame).data[1].is_null() {
             tracing::warn!("HW: NV12 plane pointer is null — skipping frame");
-            return Ok(None);
-        }
-        let y_row  = width as usize;
-        let uv_row = width as usize; // width/2 pairs × 2 bytes = width bytes
-        if stride_y < y_row {
-            tracing::warn!("HW: Y stride {} < width {} — skipping frame", stride_y, y_row);
-            return Ok(None);
-        }
-        if stride_uv < uv_row {
-            tracing::warn!("HW: UV stride {} < row_bytes {} — skipping frame", stride_uv, uv_row);
-            return Ok(None);
+            return Ok(false);
         }
 
-        let raw_y   = std::slice::from_raw_parts((*frame).data[0], stride_y  * height as usize);
-        let uv_rows = height as usize / 2;
-        let raw_uv  = std::slice::from_raw_parts((*frame).data[1], stride_uv * uv_rows);
-
-        let y_len  = y_row  * height as usize;
-        let uv_len = uv_row * uv_rows;
-
-        // B-4: fill staging buffers without zero-init.
-        // clear() preserves heap allocation; extend_from_slice copies row by row
-        // stripping the ffmpeg stride padding (E-40). On frames after the first
-        // these clear+extend calls don't reallocate when resolution is unchanged.
-        self.y_buf.clear();
-        for row in 0..height as usize {
-            self.y_buf.extend_from_slice(
-                &raw_y[row * stride_y .. row * stride_y + y_row],
-            );
+        let stride_y  = (*self.nv12_frame).linesize[0];
+        let stride_uv = (*self.nv12_frame).linesize[1];
+        if stride_y <= 0 || stride_uv <= 0 {
+            tracing::warn!("HW: invalid NV12 strides {} {} — skipping", stride_y, stride_uv);
+            return Ok(false);
         }
 
-        self.uv_buf.clear();
-        for row in 0..uv_rows {
-            self.uv_buf.extend_from_slice(
-                &raw_uv[row * stride_uv .. row * stride_uv + uv_row],
-            );
-        }
+        let dst_stride = (self.target_w * 4) as libc::c_int;
+        let dst_ptr    = dst.as_mut_ptr();
 
-        // Swap staging buffers out — caller gets ownership, decoder gets
-        // pre-sized empty replacements for the next frame (no realloc next call).
-        let y  = std::mem::replace(&mut self.y_buf,  Vec::with_capacity(y_len));
-        let uv = std::mem::replace(&mut self.uv_buf, Vec::with_capacity(uv_len));
+        // src_data: Y plane + UV plane (NV12 = 2-plane format)
+        let src_data: [*const u8; 8] = [
+            (*self.nv12_frame).data[0],
+            (*self.nv12_frame).data[1],
+            ptr::null(), ptr::null(), ptr::null(), ptr::null(), ptr::null(), ptr::null(),
+        ];
+        let src_linesize: [libc::c_int; 8] = [
+            stride_y, stride_uv, 0, 0, 0, 0, 0, 0,
+        ];
+        // dst_data: single BGRA plane
+        let dst_data: [*mut u8; 8] = [
+            dst_ptr, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+            ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(),
+        ];
+        let dst_linesizes: [libc::c_int; 8] = [
+            dst_stride, 0, 0, 0, 0, 0, 0, 0,
+        ];
 
-        Ok(Some(Nv12Frame { y, uv, width, height }))
+        ffsys::sws_scale(
+            self.sws_ctx,
+            src_data.as_ptr(),
+            src_linesize.as_ptr(),
+            0,
+            self.height as libc::c_int,
+            dst_data.as_ptr() as *mut *mut u8,
+            dst_linesizes.as_ptr(),
+        );
+
+        Ok(true)
     }
 
     pub fn seek_to_start(&mut self) -> anyhow::Result<()> {
@@ -396,6 +385,7 @@ impl HwDecoder {
         Duration::from_secs_f64(1.0 / self.fps)
     }
 
+    /// Source video dimensions (for logging).
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -403,8 +393,6 @@ impl HwDecoder {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Returns true if the codec has at least one VA-API hw config that supports
-/// the `HW_DEVICE_CTX` method (what we use).
 unsafe fn has_vaapi_config(codec: *const ffsys::AVCodec) -> bool {
     let mut i = 0i32;
     loop {
@@ -419,7 +407,6 @@ unsafe fn has_vaapi_config(codec: *const ffsys::AVCodec) -> bool {
     }
 }
 
-/// Pixel-format selection callback: prefer `AV_PIX_FMT_VAAPI` over SW formats.
 unsafe extern "C" fn get_format_vaapi(
     _ctx: *mut ffsys::AVCodecContext,
     fmt:  *const ffsys::AVPixelFormat,
@@ -431,7 +418,6 @@ unsafe extern "C" fn get_format_vaapi(
         }
         p = p.add(1);
     }
-    // Codec has no VAAPI format in the list — decoder will fall back to SW
     ffsys::AVPixelFormat::AV_PIX_FMT_NONE
 }
 
@@ -443,8 +429,6 @@ mod tests {
 
     const TEST_VIDEO: &str = "/tmp/wpick_test.mp4";
 
-    /// Checks whether VA-API is available on this machine.
-    /// We detect by attempting to create a hw device context.
     fn vaapi_available() -> bool {
         let device = if std::path::Path::new("/dev/dri/renderD128").exists() {
             "/dev/dri/renderD128"
@@ -473,65 +457,53 @@ mod tests {
         }
     }
 
-    /// HwDecoder opens successfully when VA-API is present, skips otherwise.
     #[test]
     fn test_hw_decoder_open_or_skip() {
         if !vaapi_available() {
             eprintln!("VA-API not available — skipping hw_decode tests");
             return;
         }
-        let dec = HwDecoder::try_open(TEST_VIDEO);
+        let dec = HwDecoder::try_open(TEST_VIDEO, 320, 240);
         assert!(dec.is_some(), "expected HW decoder to open on VA-API machine");
     }
 
-    /// try_open returns None (does not panic) on a non-existent file.
     #[test]
     fn test_hw_decoder_nonexistent_file() {
-        let dec = HwDecoder::try_open("/tmp/wpick_nonexistent_99999.mp4");
+        let dec = HwDecoder::try_open("/tmp/wpick_nonexistent_99999.mp4", 320, 240);
         assert!(dec.is_none(), "expected None for nonexistent file");
     }
 
-    /// Decode at least one frame and verify NV12 plane sizes.
     #[test]
-    fn test_hw_decoder_nv12_frame_dimensions() {
+    fn test_hw_decoder_frame_bgra() {
         if !vaapi_available() { return; }
-        let mut dec = match HwDecoder::try_open(TEST_VIDEO) {
+        let mut dec = match HwDecoder::try_open(TEST_VIDEO, 320, 240) {
             Some(d) => d,
             None    => return,
         };
-        let frame = dec.next_nv12_frame().unwrap();
-        assert!(frame.is_some(), "expected at least one frame");
-        let f = frame.unwrap();
-        assert_eq!(f.width,  320, "Y width");
-        assert_eq!(f.height, 240, "Y height");
-        assert_eq!(f.y.len(),  (320 * 240) as usize, "Y plane size");
-        assert_eq!(f.uv.len(), (320 * 120) as usize, "UV plane size (width * height/2)");
-        let (uw, uh) = f.uv_dims();
-        assert_eq!(uw, 160, "UV texture width");
-        assert_eq!(uh, 120, "UV texture height");
+        let mut buf = vec![0u8; 320 * 240 * 4];
+        let ok = dec.next_frame_bgra(&mut buf).unwrap();
+        assert!(ok, "expected at least one frame");
+        // Verify BGRA alpha = 255 (sws_scale fills alpha)
+        assert_eq!(buf[3], 255, "alpha channel should be 255");
     }
 
-    /// Decode all frames and verify seek-to-start gives another frame.
     #[test]
     fn test_hw_decoder_seek_and_loop() {
         if !vaapi_available() { return; }
-        let mut dec = match HwDecoder::try_open(TEST_VIDEO) {
+        let mut dec = match HwDecoder::try_open(TEST_VIDEO, 320, 240) {
             Some(d) => d,
             None    => return,
         };
-        // Drain to EOF
-        while dec.next_nv12_frame().unwrap().is_some() {}
-        // Seek back
+        let mut buf = vec![0u8; 320 * 240 * 4];
+        while dec.next_frame_bgra(&mut buf).unwrap() {}
         dec.seek_to_start().unwrap();
-        let after_seek = dec.next_nv12_frame().unwrap();
-        assert!(after_seek.is_some(), "expected frame after seek to start");
+        assert!(dec.next_frame_bgra(&mut buf).unwrap(), "expected frame after seek");
     }
 
-    /// frame_duration is within a sane range for a 30fps clip.
     #[test]
     fn test_hw_decoder_frame_duration() {
         if !vaapi_available() { return; }
-        let dec = match HwDecoder::try_open(TEST_VIDEO) {
+        let dec = match HwDecoder::try_open(TEST_VIDEO, 320, 240) {
             Some(d) => d,
             None    => return,
         };
@@ -540,5 +512,18 @@ mod tests {
             dur.as_millis() > 10 && dur.as_millis() < 200,
             "unexpected frame duration: {:?}", dur,
         );
+    }
+
+    #[test]
+    fn test_hw_decoder_bgra_buffer_size() {
+        if !vaapi_available() { return; }
+        let mut dec = match HwDecoder::try_open(TEST_VIDEO, 640, 360) {
+            Some(d) => d,
+            None    => return,
+        };
+        // target: 640×360 BGRA = 921600 bytes
+        let mut buf = vec![0u8; 640 * 360 * 4];
+        let ok = dec.next_frame_bgra(&mut buf).unwrap();
+        assert!(ok, "expected at least one frame at target dimensions");
     }
 }
