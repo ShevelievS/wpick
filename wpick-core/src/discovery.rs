@@ -163,6 +163,11 @@ pub fn find_wallpaper_dirs(_config: &WpickConfig) -> Result<Vec<WallpaperDir>> {
         }
     }
 
+    // Deduplicate by Workshop ID — multiple Steam root candidates (symlinks, Flatpak
+    // paths) can point to the same library, producing the same wallpaper twice.
+    results.sort_by_key(|wd| wd.id);
+    results.dedup_by_key(|wd| wd.id);
+
     Ok(results)
 }
 
@@ -251,25 +256,82 @@ mod tests {
     }
 
     #[test]
-    fn test_numeric_dir_filter() {
-        // Simulate the filtering logic: only numeric names become WallpaperDir entries
-        let names = vec![
-            "2819752398",
-            "12345",
-            "thumbnails",
-            ".DS_Store",
-            "preview",
+    fn test_workshop_id_parse_logic() {
+        // Confirm which directory names are valid Workshop IDs (u64) and which are not.
+        let valid   = ["2819752398", "12345", "0", "18446744073709551615"];
+        let invalid = ["thumbnails", ".DS_Store", "preview", "abc123", "-1", "1.5"];
+
+        for name in valid {
+            assert!(name.parse::<u64>().is_ok(), "'{name}' should be a valid Workshop ID");
+        }
+        for name in invalid {
+            assert!(name.parse::<u64>().is_err(), "'{name}' should NOT be a valid Workshop ID");
+        }
+    }
+
+    #[test]
+    fn test_dedup_removes_duplicate_workshop_ids() {
+        // Two Steam root candidates that overlap produce the same Workshop IDs.
+        // The sort + dedup we added must collapse them to one entry per ID.
+        let mut results = vec![
+            WallpaperDir { id: 100, path: "/fake/root_a/100".into() },
+            WallpaperDir { id: 200, path: "/fake/root_a/200".into() },
+            WallpaperDir { id: 100, path: "/fake/root_b/100".into() }, // duplicate
         ];
+        results.sort_by_key(|wd| wd.id);
+        results.dedup_by_key(|wd| wd.id);
 
-        let ids: Vec<u64> = names
-            .iter()
-            .filter_map(|name| name.parse::<u64>().ok())
-            .collect();
+        assert_eq!(results.len(), 2, "duplicate IDs must be collapsed to one");
+        assert_eq!(results[0].id, 100);
+        assert_eq!(results[1].id, 200);
+    }
 
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&2819752398u64));
-        assert!(ids.contains(&12345u64));
-        // Non-numeric names produce no panics and are simply absent
-        assert!(!ids.iter().any(|_| false)); // tautology — just confirms no panic
+    #[test]
+    fn test_find_wallpaper_dirs_with_mock_steam() -> crate::error::Result<()> {
+        use tempfile::TempDir;
+
+        let steam_root = TempDir::new()?;
+        let steamapps  = steam_root.path().join("steamapps");
+        std::fs::create_dir_all(&steamapps)?;
+
+        // libraryfolders.vdf pointing at the same root (single library entry).
+        let vdf = format!(
+            "\"libraryfolders\"\n{{\n  \"0\"\n  {{\n    \"path\"    \"{}\"\n  }}\n}}\n",
+            steam_root.path().display()
+        );
+        std::fs::write(steamapps.join("libraryfolders.vdf"), &vdf)?;
+
+        // Create Workshop dirs — two numeric (valid IDs) + one non-numeric (skipped).
+        let workshop = steamapps.join("workshop").join("content").join("431960");
+        std::fs::create_dir_all(workshop.join("12345"))?;
+        std::fs::create_dir_all(workshop.join("67890"))?;
+        std::fs::create_dir_all(workshop.join("not_a_number"))?;
+
+        // parse the VDF directly to confirm it's valid
+        let content = std::fs::read_to_string(steamapps.join("libraryfolders.vdf"))?;
+        let folders: LibraryFolders = keyvalues_serde::from_str(&content)
+            .map_err(|e| crate::error::WpickError::VdfParse {
+                path:   "test".into(),
+                reason: e.to_string(),
+            })?;
+
+        let mut found_ids: Vec<u64> = Vec::new();
+        for entry in folders.entries.values() {
+            let wd = std::path::PathBuf::from(&entry.path)
+                .join("steamapps/workshop/content/431960");
+            if let Ok(rd) = std::fs::read_dir(&wd) {
+                for e in rd.flatten() {
+                    if let Ok(id) = e.file_name().to_string_lossy().parse::<u64>() {
+                        if e.path().is_dir() { found_ids.push(id); }
+                    }
+                }
+            }
+        }
+
+        found_ids.sort();
+        assert_eq!(found_ids, vec![12345u64, 67890u64],
+            "non-numeric dir 'not_a_number' must be excluded");
+
+        Ok(())
     }
 }

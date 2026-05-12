@@ -5,7 +5,7 @@
 //      Fallback: if no Configure within 2 s → path B.
 //   B) Closed during fullscreen → recreate after fullscreen exits.
 
-use std::os::unix::io::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -23,9 +23,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
-use wpick_core::model::WallpaperInfo;
+use std::collections::HashMap;
 
-use wpick_core::config::PauseConfig;
+use wpick_core::cache::Cache;
+use wpick_core::config::{MonitorConfig, PauseConfig};
+use wpick_core::model::WallpaperInfo;
 
 use crate::hw_decode::HwDecoder;
 use crate::video::VideoDecoder;
@@ -391,19 +393,14 @@ impl ShmCanvas {
     ) -> anyhow::Result<Self> {
         let stride = w * 4;
         let size   = (stride * h) as usize;
-        let path   = format!(
-            "/tmp/.wpick-shm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let file = std::fs::OpenOptions::new()
-            .read(true).write(true).create(true)
-            .open(&path).context("shm open")?;
-        std::fs::remove_file(&path).ok();
-        file.set_len(size as u64).context("set_len")?;
+
+        // memfd_create: anonymous file, no path on disk, no TOCTOU.
+        let name_c = std::ffi::CString::new("wpick-shm").unwrap();
+        let fd = unsafe { libc::memfd_create(name_c.as_ptr(), 0) };
+        anyhow::ensure!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.set_len(size as u64).context("ftruncate")?;
+
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(), size,
@@ -512,6 +509,9 @@ struct OutputSurface {
     in_fullscreen: bool,
     closed_in_fs:  bool,
     nudge_at:      Option<Instant>,
+    /// When Some, this surface is pinned to a specific wallpaper from `[monitors]` config
+    /// and ignores global `Set` commands.
+    pinned_wp:     Option<WallpaperInfo>,
 }
 
 // ─── Renderer context ─────────────────────────────────────────────────────────
@@ -661,6 +661,7 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
             in_fullscreen: false,
             closed_in_fs:  false,
             nudge_at:      None,
+            pinned_wp:     None,
         });
 
         wls.surf_ev[i].needs_ack   = false;
@@ -678,6 +679,8 @@ pub async fn run(
     mut wallpaper_rx: watch::Receiver<Option<WallpaperInfo>>,
     shutdown_rx:      broadcast::Receiver<()>,
     pause_cfg:        PauseConfig,
+    monitors:         HashMap<String, MonitorConfig>,
+    cache:            Arc<tokio::sync::Mutex<Cache>>,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
     let mut init_failures = 0u32;
@@ -724,6 +727,10 @@ pub async fn run(
             let _ = sd_tx.send(());
         });
 
+        // Resolve per-monitor wallpapers from cache (async, before entering blocking task).
+        // Re-resolved each reinit so a re-scan between reinits picks up new entries.
+        let monitor_wallpapers = resolve_monitor_wallpapers(&monitors, &cache).await;
+
         let fs = Arc::clone(&fullscreen);
         let pm = PauseMonitors {
             on_fullscreen: pause.on_fullscreen,
@@ -731,7 +738,7 @@ pub async fn run(
             battery:       Arc::clone(&pause.battery),
             lid:           Arc::clone(&pause.lid),
         };
-        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, sd_rx, fs, pm))
+        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, sd_rx, fs, pm, monitor_wallpapers))
             .await.context("render loop panic")?;
 
         wp_fwd.abort();
@@ -750,18 +757,51 @@ pub async fn run(
     Ok(())
 }
 
+// ─── Per-monitor wallpaper resolution ────────────────────────────────────────
+
+/// Look up WallpaperInfo for every monitor that has a `wallpaper_id` configured.
+/// Missing or invalid IDs are skipped — those surfaces will fall back to the global wallpaper.
+async fn resolve_monitor_wallpapers(
+    monitors: &HashMap<String, MonitorConfig>,
+    cache:    &Arc<tokio::sync::Mutex<Cache>>,
+) -> HashMap<String, WallpaperInfo> {
+    let mut out = HashMap::new();
+    for (name, cfg) in monitors {
+        let Some(id) = cfg.wallpaper_id else { continue };
+        let guard = cache.lock().await;
+        match guard.get_by_id(id) {
+            Ok(Some(info)) => { out.insert(name.clone(), info); }
+            Ok(None) => tracing::warn!("monitor '{}': wallpaper_id {} not in cache", name, id),
+            Err(e)   => tracing::warn!("monitor '{}': cache lookup failed: {}", name, e),
+        }
+    }
+    out
+}
+
 // ─── Render loop ──────────────────────────────────────────────────────────────
 
 const NUDGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn render_loop(
-    mut ctx:    RendererCtx,
-    wp_rx:      std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
-    sd_rx:      std::sync::mpsc::Receiver<()>,
-    fullscreen: Arc<AtomicBool>,
-    pause:      PauseMonitors,
+    mut ctx:           RendererCtx,
+    wp_rx:             std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
+    sd_rx:             std::sync::mpsc::Receiver<()>,
+    fullscreen:        Arc<AtomicBool>,
+    pause:             PauseMonitors,
+    monitor_wallpapers: HashMap<String, WallpaperInfo>,
 ) -> anyhow::Result<()> {
     let mut current_wp: Option<WallpaperInfo> = None;
+
+    // Apply per-monitor pinned wallpapers from config before the first frame.
+    for surf in &mut ctx.surfaces {
+        if let Some(info) = monitor_wallpapers.get(&surf.output_name) {
+            tracing::info!("surface[{}] ({}) pinned to wallpaper '{}'",
+                surf.ev_idx, surf.output_name, info.title);
+            surf.decoder   = open_decoder(info, surf.surf_w, surf.surf_h);
+            surf.next_frame = Instant::now();
+            surf.pinned_wp  = Some(info.clone());
+        }
+    }
 
     loop {
         // ── shutdown ──────────────────────────────────────────────────────────
@@ -774,21 +814,21 @@ fn render_loop(
         }
         let _ = ctx.evq.flush();
 
-        // ── wallpaper change → recreate all decoders ──────────────────────────
+        // ── wallpaper change → recreate decoders for non-pinned surfaces ──────
         while let Ok(new_wp) = wp_rx.try_recv() {
-            for surf in &mut ctx.surfaces {
-                surf.decoder     = None;
-                surf.canvas_ready = false;
-            }
-            if let Some(info) = new_wp {
+            if let Some(ref info) = new_wp {
                 tracing::info!("wallpaper: {}", info.title);
-                for surf in &mut ctx.surfaces {
-                    surf.decoder    = open_decoder(&info, surf.surf_w, surf.surf_h);
+            }
+            current_wp = new_wp.clone();
+            for surf in &mut ctx.surfaces {
+                // Surfaces with a per-monitor override ignore global wallpaper changes.
+                if surf.pinned_wp.is_some() { continue; }
+                surf.decoder      = None;
+                surf.canvas_ready = false;
+                if let Some(ref info) = new_wp {
+                    surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h);
                     surf.next_frame = Instant::now();
                 }
-                current_wp = Some(info);
-            } else {
-                current_wp = None;
             }
         }
 
@@ -887,7 +927,8 @@ fn process_surface(
                     ctx.surfaces[i].surf_w        = new_w;
                     ctx.surfaces[i].surf_h        = new_h;
                     ctx.surfaces[i].canvas_ready  = false;
-                    if let Some(ref info) = current_wp {
+                    let active_wp = ctx.surfaces[i].pinned_wp.clone().or_else(|| current_wp.clone());
+                    if let Some(ref info) = active_wp {
                         ctx.surfaces[i].decoder = open_decoder(info, new_w, new_h);
                     }
                 }
@@ -967,7 +1008,8 @@ fn process_surface(
             ctx.wls.surf_ev[ev_idx].frame_ready = true;
             if is_hw {
                 tracing::warn!("hw surface[{}]: {} — sw fallback", i, e);
-                if let Some(ref info) = current_wp {
+                let active_wp = ctx.surfaces[i].pinned_wp.clone().or_else(|| current_wp.clone());
+                if let Some(ref info) = active_wp {
                     ctx.surfaces[i].decoder = match VideoDecoder::open(&info.file_path, sw, sh) {
                         Ok(d)  => { tracing::info!("sw fallback surface[{}]", i); Some(AnyDecoder::Sw(d)) }
                         Err(e2) => { tracing::warn!("sw fallback surface[{}]: {}", i, e2); None }

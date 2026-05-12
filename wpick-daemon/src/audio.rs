@@ -163,13 +163,10 @@ fn decode_and_send(
 // ─── Volume/mute helper ───────────────────────────────────────────────────────
 
 fn apply_volume(sink: &rodio::Sink, vol: f32, muted: bool) {
-    if muted {
-        sink.set_volume(0.0);
-        sink.pause();
-    } else {
-        sink.set_volume(vol.clamp(0.0, 1.0));
-        sink.play();
-    }
+    // Never pause — pausing blocks the decode thread's SyncSender when the
+    // channel fills up, causing a stuck thread + audio delay on unmute.
+    // Silence is achieved by volume=0.0 while the source keeps draining.
+    sink.set_volume(if muted { 0.0 } else { vol.clamp(0.0, 1.0) });
 }
 
 // ─── Public async run loop ────────────────────────────────────────────────────
@@ -307,5 +304,38 @@ mod tests {
         let mut src = StreamingSource { rx, buf: Vec::new(), pos: 0, sample_rate: 48_000, channels: 2 };
         let vals: Vec<f32> = (0..4).map(|_| src.next().unwrap()).collect();
         assert_eq!(vals, vec![0.1, 0.2, 0.3, 0.4]);
+    }
+
+    /// rodio reads sample_rate/channels from the Source trait to configure its
+    /// resampler.  Wrong values would cause pitch shift or stereo collapse.
+    #[test]
+    fn test_streaming_source_metadata() {
+        use rodio::Source;
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let src = StreamingSource { rx, buf: Vec::new(), pos: 0, sample_rate: 48_000, channels: 2 };
+        assert_eq!(src.sample_rate(), 48_000, "sample_rate must be 48 kHz");
+        assert_eq!(src.channels(),    2,      "must be stereo");
+        assert!(src.current_frame_len().is_none(), "streaming source has no fixed frame len");
+        assert!(src.total_duration().is_none(),    "streaming source has no total duration");
+    }
+
+    /// apply_volume must set volume without ever pausing the sink.
+    /// Pausing the sink blocks the decode thread's SyncSender when the channel fills.
+    #[test]
+    fn test_apply_volume_never_pauses_sink() {
+        // Skip cleanly when no audio output device is available (CI without sound card).
+        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+            eprintln!("no audio output device — skipping apply_volume test");
+            return;
+        };
+        let Ok(sink) = rodio::Sink::try_new(&handle) else { return; };
+
+        apply_volume(&sink, 0.5, false);
+        assert!((sink.volume() - 0.5).abs() < 1e-4, "volume should be 0.5 when not muted");
+        assert!(!sink.is_paused(), "sink must not be paused when not muted");
+
+        apply_volume(&sink, 0.8, true);
+        assert!(sink.volume() < 1e-4, "volume should be 0.0 when muted");
+        assert!(!sink.is_paused(), "sink must NEVER be paused (blocks decode thread)");
     }
 }

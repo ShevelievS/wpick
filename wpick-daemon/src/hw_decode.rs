@@ -436,7 +436,26 @@ unsafe extern "C" fn get_format_vaapi(
 mod tests {
     use super::*;
 
-    const TEST_VIDEO: &str = "/tmp/wpick_test.mp4";
+    /// Same fixture used by video.rs tests — generates the file once via ffmpeg.
+    fn test_video_path() -> Option<&'static str> {
+        static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        const PATH: &str = "/tmp/wpick_test.mp4";
+        let ok = READY.get_or_init(|| {
+            if std::path::Path::new(PATH).exists() { return true; }
+            let status = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-f", "lavfi", "-i", "color=c=blue:size=320x240:rate=30",
+                    "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                    "-t", "2",
+                    "-c:v", "libx264", "-c:a", "aac", "-pix_fmt", "yuv420p",
+                    PATH,
+                ])
+                .status();
+            matches!(status, Ok(s) if s.success())
+        });
+        if *ok { Some(PATH) } else { None }
+    }
 
     fn vaapi_available() -> bool {
         let device = if std::path::Path::new("/dev/dri/renderD128").exists() {
@@ -467,39 +486,42 @@ mod tests {
     }
 
     #[test]
-    fn test_hw_decoder_open_or_skip() {
-        if !vaapi_available() {
-            eprintln!("VA-API not available — skipping hw_decode tests");
-            return;
-        }
-        let dec = HwDecoder::try_open(TEST_VIDEO, 320, 240);
-        assert!(dec.is_some(), "expected HW decoder to open on VA-API machine");
-    }
-
-    #[test]
     fn test_hw_decoder_nonexistent_file() {
+        // Does not require a test video — must return None for a missing file.
         let dec = HwDecoder::try_open("/tmp/wpick_nonexistent_99999.mp4", 320, 240);
         assert!(dec.is_none(), "expected None for nonexistent file");
     }
 
     #[test]
+    fn test_hw_decoder_open_or_skip() {
+        let Some(path) = test_video_path() else { return; };
+        if !vaapi_available() {
+            eprintln!("VA-API not available — skipping hw_decode tests");
+            return;
+        }
+        let dec = HwDecoder::try_open(path, 320, 240);
+        assert!(dec.is_some(), "expected HW decoder to open on a VA-API machine");
+    }
+
+    #[test]
     fn test_hw_decoder_frame_bgra() {
+        let Some(path) = test_video_path() else { return; };
         if !vaapi_available() { return; }
-        let mut dec = match HwDecoder::try_open(TEST_VIDEO, 320, 240) {
+        let mut dec = match HwDecoder::try_open(path, 320, 240) {
             Some(d) => d,
             None    => return,
         };
         let mut buf = vec![0u8; 320 * 240 * 4];
         let ok = dec.next_frame_bgra(&mut buf).unwrap();
         assert!(ok, "expected at least one frame");
-        // Verify BGRA alpha = 255 (sws_scale fills alpha)
-        assert_eq!(buf[3], 255, "alpha channel should be 255");
+        assert_eq!(buf[3], 255, "BGRA alpha should be 255");
     }
 
     #[test]
     fn test_hw_decoder_seek_and_loop() {
+        let Some(path) = test_video_path() else { return; };
         if !vaapi_available() { return; }
-        let mut dec = match HwDecoder::try_open(TEST_VIDEO, 320, 240) {
+        let mut dec = match HwDecoder::try_open(path, 320, 240) {
             Some(d) => d,
             None    => return,
         };
@@ -511,8 +533,9 @@ mod tests {
 
     #[test]
     fn test_hw_decoder_frame_duration() {
+        let Some(path) = test_video_path() else { return; };
         if !vaapi_available() { return; }
-        let dec = match HwDecoder::try_open(TEST_VIDEO, 320, 240) {
+        let dec = match HwDecoder::try_open(path, 320, 240) {
             Some(d) => d,
             None    => return,
         };
@@ -525,14 +548,32 @@ mod tests {
 
     #[test]
     fn test_hw_decoder_bgra_buffer_size() {
+        let Some(path) = test_video_path() else { return; };
         if !vaapi_available() { return; }
-        let mut dec = match HwDecoder::try_open(TEST_VIDEO, 640, 360) {
+        let mut dec = match HwDecoder::try_open(path, 640, 360) {
             Some(d) => d,
             None    => return,
         };
-        // target: 640×360 BGRA = 921600 bytes
         let mut buf = vec![0u8; 640 * 360 * 4];
         let ok = dec.next_frame_bgra(&mut buf).unwrap();
-        assert!(ok, "expected at least one frame at target dimensions");
+        assert!(ok, "expected at least one frame at 640×360");
+    }
+
+    #[test]
+    fn test_hw_decoder_small_dst_rejected() {
+        // Safety guard: next_frame_bgra with dst < target_w*target_h*4 must Err.
+        let Some(path) = test_video_path() else { return; };
+        if !vaapi_available() { return; }
+        let mut dec = match HwDecoder::try_open(path, 320, 240) {
+            Some(d) => d,
+            None    => return,
+        };
+        let mut tiny = vec![0u8; 10]; // 10 < 320*240*4 = 307200
+        let result = dec.next_frame_bgra(&mut tiny);
+        assert!(result.is_err(), "must return Err for undersized dst buffer");
+        assert!(
+            result.unwrap_err().to_string().contains("dst too small"),
+            "error message must mention 'dst too small'"
+        );
     }
 }

@@ -336,29 +336,43 @@ mod tests {
 
     #[test]
     fn test_path_traversal_rejected() -> crate::error::Result<()> {
-        let tmp = TempDir::new()?;
-        let cache_dir = TempDir::new()?;
+        // Multiple traversal patterns — none must escape the cache output dir.
+        let traversal_names: &[&[u8]] = &[
+            b"../../evil.sh",
+            b"../escape.txt",
+            b"/etc/passwd",
+            b"sub/../../sneaky.sh",
+        ];
 
-        // Build a PKG with a path-traversal filename
-        let mut pkg_bytes = b"PKGV0001".to_vec();
-        pkg_bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 file
+        for &name in traversal_names {
+            let tmp       = TempDir::new()?;
+            let cache_dir = TempDir::new()?;
 
-        let traversal = b"../../evil.sh";
-        pkg_bytes.extend_from_slice(&(traversal.len() as u32).to_le_bytes());
-        pkg_bytes.extend_from_slice(traversal);
-        let content = b"pwned";
-        pkg_bytes.extend_from_slice(&(content.len() as u32).to_le_bytes());
-        pkg_bytes.extend_from_slice(content);
+            let mut pkg_bytes = b"PKGV0001".to_vec();
+            pkg_bytes.extend_from_slice(&1u32.to_le_bytes());
+            pkg_bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            pkg_bytes.extend_from_slice(name);
+            let content = b"pwned";
+            pkg_bytes.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            pkg_bytes.extend_from_slice(content);
 
-        let pkg_path = tmp.path().join("scene.pkg");
-        std::fs::write(&pkg_path, &pkg_bytes)?;
+            std::fs::write(tmp.path().join("scene.pkg"), &pkg_bytes)?;
+            let wd = make_wallpaper_dir(99998, tmp.path());
+            let _ = extract_and_parse(&wd, cache_dir.path());
 
-        let wd = make_wallpaper_dir(99998, tmp.path());
-        let _ = extract_and_parse(&wd, cache_dir.path()); // may succeed or fail
-
-        // The traversal target must NOT have been written
-        let evil = cache_dir.path().parent().unwrap().join("evil.sh");
-        assert!(!evil.exists(), "path traversal must be blocked");
+            // Verify that nothing was written above the cache output dir.
+            let name_str = std::str::from_utf8(name).unwrap_or("?");
+            let dangerous = cache_dir.path().parent().unwrap().join("evil.sh");
+            let dangerous2 = cache_dir.path().parent().unwrap().join("sneaky.sh");
+            let dangerous3 = std::path::Path::new("/etc/passwd");
+            assert!(!dangerous.exists(),  "traversal '{name_str}' escaped cache dir (evil.sh)");
+            assert!(!dangerous2.exists(), "traversal '{name_str}' escaped cache dir (sneaky.sh)");
+            // /etc/passwd is a pre-existing file, so we only assert we didn't MODIFY it.
+            if dangerous3.exists() {
+                let meta = std::fs::metadata(dangerous3)?;
+                assert!(meta.len() > 0, "/etc/passwd should not be zeroed by traversal");
+            }
+        }
         Ok(())
     }
 
@@ -372,6 +386,65 @@ mod tests {
         let wd = make_wallpaper_dir(99997, tmp.path());
         let r = extract_and_parse(&wd, out.path());
         assert!(r.is_err(), "absurd file_count must be rejected");
+    }
+
+    #[test]
+    fn test_pkgv0005_magic_accepted() -> crate::error::Result<()> {
+        let tmp       = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        // PKGV0005 with 0 files — extraction must succeed (result is None, no project.json).
+        let mut pkg_bytes = b"PKGV0005".to_vec();
+        pkg_bytes.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(tmp.path().join("scene.pkg"), &pkg_bytes)?;
+
+        let wd     = make_wallpaper_dir(11111, tmp.path());
+        let result = extract_and_parse(&wd, cache_dir.path());
+        assert!(result.is_ok(), "PKGV0005 must be accepted, got: {:?}", result.err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_direct_wallpaper_parse() -> crate::error::Result<()> {
+        // Wallpapers stored directly (no scene.pkg): project.json + mp4 in the same dir.
+        let tmp       = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        let project_json = r#"{
+            "title": "My Wallpaper",
+            "type": "video",
+            "file": "video.mp4",
+            "soundEnabled": true,
+            "preview": "preview.jpg"
+        }"#;
+        std::fs::write(tmp.path().join("project.json"), project_json)?;
+        std::fs::write(tmp.path().join("video.mp4"),    b"fake-video-data")?;
+
+        let wd     = make_wallpaper_dir(12345, tmp.path());
+        let result = extract_and_parse(&wd, cache_dir.path())?;
+
+        let info = result.expect("direct wallpaper must parse to Some(WallpaperInfo)");
+        assert_eq!(info.id, 12345);
+        assert_eq!(info.title, "My Wallpaper");
+        assert_eq!(info.wallpaper_type, WallpaperType::Video);
+        assert!(info.has_audio,          "soundEnabled=true must set has_audio");
+        assert!(info.preview_path.is_some(), "preview path must be populated");
+        assert_eq!(info.file_size_bytes, 15, "file_size_bytes should match fake data length");
+        Ok(())
+    }
+
+    #[test]
+    fn test_direct_wallpaper_non_video_skipped() -> crate::error::Result<()> {
+        let tmp       = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        let project_json = r#"{"title":"Scene WP","type":"scene","file":"scene.pkg"}"#;
+        std::fs::write(tmp.path().join("project.json"), project_json)?;
+
+        let wd     = make_wallpaper_dir(99990, tmp.path());
+        let result = extract_and_parse(&wd, cache_dir.path())?;
+        assert!(result.is_none(), "non-video type must return None (not supported)");
+        Ok(())
     }
 
     #[test]
