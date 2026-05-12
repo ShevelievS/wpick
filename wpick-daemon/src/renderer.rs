@@ -34,17 +34,18 @@ use crate::video::VideoDecoder;
 
 // ─── Fullscreen monitors (Hyprland + Sway) ───────────────────────────────────
 
-fn start_fullscreen_monitor() -> Arc<AtomicBool> {
+fn start_fullscreen_monitor(on_exit: Option<Arc<dyn Fn() + Send + Sync>>) -> Arc<AtomicBool> {
     let flag  = Arc::new(AtomicBool::new(false));
     let flag2 = Arc::clone(&flag);
 
     if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        let cb = on_exit.clone();
         std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
-            hyprland_fullscreen_loop(flag2, sig);
+            hyprland_fullscreen_loop(flag2, sig, cb);
         }).ok();
     } else if std::env::var("SWAYSOCK").is_ok() {
         std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
-            sway_fullscreen_loop(flag2);
+            sway_fullscreen_loop(flag2, on_exit);
         }).ok();
     } else {
         tracing::info!("unknown compositor — fullscreen detection off");
@@ -53,8 +54,14 @@ fn start_fullscreen_monitor() -> Arc<AtomicBool> {
     flag
 }
 
-fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String) {
-    let path = format!("/tmp/hypr/{}/.socket2.sock", sig);
+fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String, on_exit: Option<Arc<dyn Fn() + Send + Sync>>) {
+    // Hyprland >= 0.30 moved the socket from /tmp/hypr/ to $XDG_RUNTIME_DIR/hypr/.
+    let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path_xdg = format!("{}/hypr/{}/.socket2.sock", xdg, sig);
+    let path_tmp = format!("/tmp/hypr/{}/.socket2.sock", sig);
+    let path = if std::path::Path::new(&path_xdg).exists() { path_xdg } else { path_tmp };
+    tracing::info!("hyprland fullscreen monitor: {}", path);
+    let mut prev_active = false;
     loop {
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
             use std::io::BufRead;
@@ -63,6 +70,10 @@ fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String) {
                     Ok(l) if l.starts_with("fullscreen>>") => {
                         let p = l.trim_start_matches("fullscreen>>");
                         let active = !p.starts_with('0') && !p.contains(",0");
+                        if prev_active && !active {
+                            if let Some(ref cb) = on_exit { cb(); }
+                        }
+                        prev_active = active;
                         flag.store(active, Ordering::Relaxed);
                         tracing::debug!("hyprland fullscreen → {}", active);
                     }
@@ -79,7 +90,7 @@ fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String) {
 ///
 /// Protocol: 6-byte magic "i3-ipc" + u32 LE payload_len + u32 LE msg_type.
 /// SUBSCRIBE = type 2; window events = type 0x80000003.
-fn sway_fullscreen_loop(flag: Arc<AtomicBool>) {
+fn sway_fullscreen_loop(flag: Arc<AtomicBool>, on_exit: Option<Arc<dyn Fn() + Send + Sync>>) {
     use std::io::{Read, Write};
     const MAGIC: &[u8] = b"i3-ipc";
     const SUBSCRIBE: u32 = 2;
@@ -125,6 +136,10 @@ fn sway_fullscreen_loop(flag: Arc<AtomicBool>) {
                         if s.contains("\"change\":\"fullscreen_mode\"") {
                             let active = s.contains("\"fullscreen_mode\":1")
                                       || s.contains("\"fullscreen_mode\":2");
+                            let prev = flag.load(Ordering::Relaxed);
+                            if prev && !active {
+                                if let Some(ref cb) = on_exit { cb(); }
+                            }
                             flag.store(active, Ordering::Relaxed);
                             tracing::debug!("sway fullscreen → {}", active);
                         }
@@ -509,6 +524,10 @@ struct OutputSurface {
     in_fullscreen: bool,
     closed_in_fs:  bool,
     nudge_at:      Option<Instant>,
+    /// Set on fullscreen exit; after this delay we recreate the surface so it
+    /// becomes the newest (highest z-order) on the Bottom layer, landing above
+    /// any competitor surface that the shell restarted while we were paused.
+    recreate_after: Option<Instant>,
     /// When Some, this surface is pinned to a specific wallpaper from `[monitors]` config
     /// and ignores global `Set` commands.
     pinned_wp:     Option<WallpaperInfo>,
@@ -522,7 +541,7 @@ struct OutputSurface {
 unsafe impl Send for RendererCtx {}
 
 struct RendererCtx {
-    _conn:       Connection,
+    conn:        Connection,
     evq:         wayland_client::EventQueue<WaylandState>,
     wls:         WaylandState,
     compositor:  wl_compositor::WlCompositor,
@@ -658,9 +677,10 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
             surf_h:        sh,
             next_frame:    Instant::now(),
             canvas_ready:  false,
-            in_fullscreen: false,
-            closed_in_fs:  false,
-            nudge_at:      None,
+            in_fullscreen:  false,
+            closed_in_fs:   false,
+            nudge_at:       None,
+            recreate_after: None,
             pinned_wp:     None,
         });
 
@@ -670,21 +690,22 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
 
     evq.flush().context("flush")?;
     tracing::info!("renderer ready — {} output(s)", surfaces.len());
-    Ok(RendererCtx { _conn: conn, evq, wls, compositor, layer_shell, shm, surfaces })
+    Ok(RendererCtx { conn, evq, wls, compositor, layer_shell, shm, surfaces })
 }
 
 // ─── Async wrapper ────────────────────────────────────────────────────────────
 
 pub async fn run(
-    mut wallpaper_rx: watch::Receiver<Option<WallpaperInfo>>,
-    shutdown_rx:      broadcast::Receiver<()>,
-    pause_cfg:        PauseConfig,
-    monitors:         HashMap<String, MonitorConfig>,
-    cache:            Arc<tokio::sync::Mutex<Cache>>,
+    mut wallpaper_rx:    watch::Receiver<Option<WallpaperInfo>>,
+    shutdown_rx:         broadcast::Receiver<()>,
+    pause_cfg:           PauseConfig,
+    monitors:            HashMap<String, MonitorConfig>,
+    cache:               Arc<tokio::sync::Mutex<Cache>>,
+    on_fullscreen_exit:  Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
     let mut init_failures = 0u32;
-    let fullscreen        = start_fullscreen_monitor();
+    let fullscreen        = start_fullscreen_monitor(on_fullscreen_exit);
 
     // Start pause monitors — only for sources enabled in config.
     let battery = if pause_cfg.on_battery   { start_battery_monitor() } else { Arc::new(AtomicBool::new(false)) };
@@ -808,6 +829,13 @@ fn render_loop(
         if sd_rx.try_recv().is_ok() { break; }
 
         // ── wayland events ────────────────────────────────────────────────────
+        // dispatch_pending does NOT read from the socket in wayland-client 0.31.
+        // We must call prepare_read()+read() first so frame callbacks and other
+        // compositor events actually arrive (without this the first frame renders
+        // but no subsequent frames do because frame_ready never becomes true again).
+        if let Some(guard) = ctx.conn.prepare_read() {
+            let _ = guard.read();
+        }
         if let Err(e) = ctx.evq.dispatch_pending(&mut ctx.wls) {
             tracing::warn!("wayland connection lost: {} — fatal", e);
             anyhow::bail!("__fatal__");
@@ -885,13 +913,19 @@ fn process_surface(
     // ── fullscreen transition ─────────────────────────────────────────────────
     if ctx.surfaces[i].in_fullscreen && !is_fs {
         ctx.surfaces[i].in_fullscreen = false;
-        tracing::info!("fullscreen exited — recovering surface[{}]", i);
         if ctx.surfaces[i].closed_in_fs {
+            // Compositor closed the surface during fullscreen — must recreate.
             ctx.surfaces[i].closed_in_fs = false;
+            tracing::info!("fullscreen exit: surface[{}] was closed — recreating", i);
             recreate_surface(ctx, i);
         } else {
-            nudge_surface(ctx, i);
-            ctx.surfaces[i].nudge_at = Some(Instant::now());
+            // Schedule a delayed recreate. We wait 800 ms so that any shell
+            // (e.g. QuickShell) that reacts to the fullscreen exit by starting
+            // a new wallpaper process gets its surface registered first; our
+            // newer surface will then sit on top of it in Hyprland's z-order.
+            tracing::info!("fullscreen exit: surface[{}] scheduling recreate in 800 ms", i);
+            ctx.wls.surf_ev[ev_idx].frame_ready = true;
+            ctx.surfaces[i].recreate_after = Some(Instant::now() + Duration::from_millis(300));
         }
         return false;
     }
@@ -903,6 +937,16 @@ fn process_surface(
             tracing::warn!("nudge timed out on surface[{}] — recreating", i);
             ctx.surfaces[i].nudge_at = None;
             recreate_surface(ctx, i);
+        }
+    }
+
+    // ── delayed post-fullscreen recreate for z-order ──────────────────────────
+    if let Some(t) = ctx.surfaces[i].recreate_after {
+        if Instant::now() >= t {
+            ctx.surfaces[i].recreate_after = None;
+            tracing::info!("post-fullscreen recreate: surface[{}] (z-order)", i);
+            recreate_surface(ctx, i);
+            return false;
         }
     }
 

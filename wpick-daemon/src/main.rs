@@ -205,6 +205,26 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to spawn competitor-handler thread")?;
     }
 
+    // 8b. Competitor watchdog — only active in kill-mode (pause_competitors = false).
+    //     In pause-mode (SIGSTOP) the shell sees the process as alive and won't restart
+    //     it, so no watchdog is needed.  In kill-mode the shell may restart the process,
+    //     so we re-scan every 5 s (not faster — rapid scanning causes a kill/restart loop
+    //     that crashes shell components like QuickShell).
+    if !config.general.pause_competitors {
+        let pids = Arc::clone(&paused_pids);
+        std::thread::Builder::new()
+            .name("competitor-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let stopped = handle_competing_tools(false);
+                if !stopped.is_empty() {
+                    tracing::info!("watchdog: re-killed {} competing tool(s)", stopped.len());
+                    if let Ok(mut g) = pids.lock() { g.extend_from_slice(&stopped); }
+                }
+            })
+            .context("Failed to spawn competitor watchdog thread")?;
+    }
+
     // 9. Cleanup helper — removes socket, resumes any SIGSTOP'd competitors.
     let cleanup = {
         let sp   = socket_path.clone();
@@ -288,9 +308,35 @@ async fn main() -> anyhow::Result<()> {
 
     // 13. Renderer — must run on this thread (Wayland is !Send)
     tracing::info!("Starting renderer");
+    // When fullscreen exits, any competitor that was restarted by a watchdog
+    // (e.g. QuickShell's mpvpaper manager) is killed again so our surface stays on top.
+    let on_fs_exit: Option<Arc<dyn Fn() + Send + Sync>> = {
+        let pause_mode2   = config.general.pause_competitors;
+        let paused_pids2  = Arc::clone(&paused_pids);
+        Some(Arc::new(move || {
+            tracing::info!("fullscreen exited — killing competing wallpaper tools");
+            // Kill immediately
+            let stopped = handle_competing_tools(pause_mode2);
+            if !stopped.is_empty() {
+                tracing::info!("fullscreen exit: killed {} tool(s) immediately", stopped.len());
+                if let Ok(mut g) = paused_pids2.lock() { g.extend_from_slice(&stopped); }
+            }
+            // Kill again after 600 ms — some shells (e.g. QuickShell) restart the
+            // wallpaper daemon within milliseconds of detecting it died.
+            let pids3 = Arc::clone(&paused_pids2);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                let stopped2 = handle_competing_tools(pause_mode2);
+                if !stopped2.is_empty() {
+                    tracing::info!("fullscreen exit (delayed): killed {} tool(s)", stopped2.len());
+                    if let Ok(mut g) = pids3.lock() { g.extend_from_slice(&stopped2); }
+                }
+            });
+        }))
+    };
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache)))
+        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit))
         .await
         .context("Renderer error")?;
 
