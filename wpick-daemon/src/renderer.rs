@@ -15,8 +15,8 @@ use tokio::sync::{broadcast, watch};
 use wayland_client::{
     Connection, Dispatch, QueueHandle,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry,
-        wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_output, wl_region,
+        wl_registry, wl_shm, wl_shm_pool, wl_surface,
     },
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
@@ -328,6 +328,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
 impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
     fn event(_: &mut Self, _: &wl_compositor::WlCompositor, _: wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
+impl Dispatch<wl_region::WlRegion, ()> for WaylandState {
+    fn event(_: &mut Self, _: &wl_region::WlRegion, _: wl_region::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+}
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandState {
     fn event(_: &mut Self, _: &wl_surface::WlSurface, _: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
@@ -601,6 +604,12 @@ fn make_output_surface(
     ls.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
     ls.set_size(0, 0);
     ls.set_exclusive_zone(-1);
+    // Empty input region: compositor will not route pointer events to this surface.
+    // Fixes cursor shape staying stuck as the last window's cursor (e.g. I-beam)
+    // when the mouse moves over the wallpaper, and eliminates compositor hit-test
+    // overhead on every pointer motion event.
+    let empty_region = compositor.create_region(qh, ());
+    wl.set_input_region(Some(&empty_region));
     wl.commit();
     (wl, ls)
 }
