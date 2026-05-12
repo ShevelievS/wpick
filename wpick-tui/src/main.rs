@@ -218,10 +218,15 @@ async fn run_tui(config: WpickConfig, dirs: AppDirs) -> Result<()> {
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
 
+    // Query terminal for image protocol support after entering alternate screen.
+    // Falls back to halfblocks unicode if the terminal doesn't support Kitty/Sixel.
+    let picker = ratatui_image::picker::Picker::from_query_stdio()
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks());
+
     let result = {
         let backend  = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut term = ratatui::Terminal::new(backend)?;
-        let mut app  = App::new(config, dirs);
+        let mut app  = App::new(config, dirs, picker);
         app.run(&mut term).await
     };
 
