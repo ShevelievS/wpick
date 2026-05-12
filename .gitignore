@@ -26,6 +26,11 @@ Thumbs.db
 # ── Log files ────────────────────────────────────────────────────────────────
 *.log
 
+# ── Linux /proc fd ghost files (created if a tool leaks fd names into cwd) ──
+anon_inode:*
+pipe:[*
+socket:[*
+
 # ── Internal dev / AI process docs (never public) ────────────────────────────
 /PROMPTS.md
 /PROMPTS_V0.2.md
