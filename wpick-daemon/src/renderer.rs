@@ -54,12 +54,27 @@ fn start_fullscreen_monitor(on_exit: Option<Arc<dyn Fn() + Send + Sync>>) -> Arc
     flag
 }
 
+/// Query the active workspace's fullscreen state via Hyprland socket1.
+/// Returns true if the current workspace has a fullscreen window.
+fn hyprland_query_fullscreen(sock1: &str) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock1) else { return false; };
+    if stream.write_all(b"j/activeworkspace").is_err() { return false; }
+    let mut resp = String::new();
+    if stream.read_to_string(&mut resp).is_err() { return false; }
+    // "hasfullscreen": true  (Hyprland >= 0.30 JSON field, may have space after colon)
+    resp.contains("\"hasfullscreen\":true") || resp.contains("\"hasfullscreen\": true")
+}
+
 fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String, on_exit: Option<Arc<dyn Fn() + Send + Sync>>) {
     // Hyprland >= 0.30 moved the socket from /tmp/hypr/ to $XDG_RUNTIME_DIR/hypr/.
     let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     let path_xdg = format!("{}/hypr/{}/.socket2.sock", xdg, sig);
     let path_tmp = format!("/tmp/hypr/{}/.socket2.sock", sig);
     let path = if std::path::Path::new(&path_xdg).exists() { path_xdg } else { path_tmp };
+    let sock1_xdg = format!("{}/hypr/{}/.socket.sock", xdg, sig);
+    let sock1_tmp = format!("/tmp/hypr/{}/.socket.sock", sig);
+    let sock1 = if std::path::Path::new(&sock1_xdg).exists() { sock1_xdg } else { sock1_tmp };
     tracing::info!("hyprland fullscreen monitor: {}", path);
     let mut prev_active = false;
     loop {
@@ -75,7 +90,19 @@ fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String, on_exit: Option<
                         }
                         prev_active = active;
                         flag.store(active, Ordering::Relaxed);
-                        tracing::debug!("hyprland fullscreen → {}", active);
+                        tracing::info!("hyprland fullscreen → {}", active);
+                    }
+                    // workspace>> fires when switching workspaces.
+                    // Hyprland does NOT resend fullscreen>> on workspace switch, so the
+                    // flag can get stuck as true when moving away from a fullscreen workspace.
+                    // Query the real state via socket1 and update the flag ONLY — do NOT
+                    // update prev_active or fire the callback here.  prev_active must only
+                    // track real fullscreen>> transitions so that the callback fires correctly
+                    // when the user actually exits fullscreen (fullscreen>>0).
+                    Ok(l) if l.starts_with("workspace>>") || l.starts_with("focusedmon>>") => {
+                        let active = hyprland_query_fullscreen(&sock1);
+                        flag.store(active, Ordering::Relaxed);
+                        tracing::info!("workspace change → fullscreen={}", active);
                     }
                     Ok(_)  => {}
                     Err(e) => { tracing::debug!("hyprland ipc: {}", e); break; }
@@ -528,6 +555,11 @@ struct OutputSurface {
     /// becomes the newest (highest z-order) on the Bottom layer, landing above
     /// any competitor surface that the shell restarted while we were paused.
     recreate_after: Option<Instant>,
+    /// Timestamp of the last committed frame.  Used as a fallback when the
+    /// compositor stops sending frame callbacks (e.g. surface hidden behind a
+    /// fullscreen window): if no callback arrives within 300 ms we resume
+    /// rendering without waiting.
+    last_commit_at: Option<Instant>,
     /// When Some, this surface is pinned to a specific wallpaper from `[monitors]` config
     /// and ignores global `Set` commands.
     pinned_wp:     Option<WallpaperInfo>,
@@ -612,6 +644,7 @@ fn commit_slot(ctx: &mut RendererCtx, surf_i: usize, slot_i: usize) {
     ctx.surfaces[surf_i].wl_surface.damage_buffer(0, 0, sw, sh);
     ctx.surfaces[surf_i].wl_surface.frame(&qh, ev_idx);
     ctx.surfaces[surf_i].wl_surface.commit();
+    ctx.surfaces[surf_i].last_commit_at = Some(Instant::now());
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -681,6 +714,7 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
             closed_in_fs:   false,
             nudge_at:       None,
             recreate_after: None,
+            last_commit_at: None,
             pinned_wp:     None,
         });
 
@@ -998,6 +1032,17 @@ fn process_surface(
 
     // ── wait for frame callback + video timing ────────────────────────────────
     let now = Instant::now();
+    // Fallback: if no frame callback arrives within 300 ms (e.g. compositor
+    // stopped sending them while surface was hidden by a fullscreen window),
+    // force frame_ready so rendering resumes when the surface becomes visible.
+    if !ctx.wls.surf_ev[ev_idx].frame_ready {
+        let timed_out = ctx.surfaces[i].last_commit_at
+            .map(|t| t.elapsed() > Duration::from_millis(300))
+            .unwrap_or(false);
+        if timed_out {
+            ctx.wls.surf_ev[ev_idx].frame_ready = true;
+        }
+    }
     if !ctx.wls.surf_ev[ev_idx].frame_ready || now < ctx.surfaces[i].next_frame {
         return false;
     }
