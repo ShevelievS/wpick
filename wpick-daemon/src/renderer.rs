@@ -1,30 +1,9 @@
 // Wallpaper renderer — wl_shm CPU path, Hyprland-aware surface recovery.
 //
-// Sprint-1 changes vs previous version:
-//
-//   Buffer pool (3 slots):
-//     ShmPool replaces the single ShmCanvas.  Each slot tracks its own
-//     `in_use: Arc<AtomicBool>`.  wl_buffer::Release sets the flag to false,
-//     telling us the compositor has finished reading that slot and we can
-//     decode the next frame into it.  This prevents writing to a buffer that
-//     the compositor is still scanning out (tearing / corruption risk).
-//
-//   Frame callbacks:
-//     After every commit we request a wl_surface::frame callback.  The render
-//     loop waits for `frame_ready = true` before decoding the next frame.
-//     This paces us to the compositor's refresh cycle instead of using a
-//     fixed sleep, eliminating wasted decodes and avoiding frame starvation.
-//
-//   Decoder-side scaling (video.rs / hw_decode.rs):
-//     Both decoders now accept target_w / target_h and produce BGRA at that
-//     size.  The render loop copies the decoder output directly into the SHM
-//     slot — no more per-pixel loops in renderer.rs.
-//
-// Hyprland fullscreen recovery (unchanged):
-//   A) Surface still alive → nudge (re-set layer props + commit).
-//      Triggers a fresh Configure; ack + commit makes it visible again.
+// Surface recovery after fullscreen:
+//   A) Still alive → nudge (re-set layer props + commit) → fresh Configure.
 //      Fallback: if no Configure within 2 s → path B.
-//   B) Surface was Closed during fullscreen → recreate AFTER fullscreen exits.
+//   B) Closed during fullscreen → recreate after fullscreen exits.
 
 use std::os::unix::io::{AsFd, AsRawFd, OwnedFd};
 use std::sync::Arc;
@@ -46,71 +25,231 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 };
 use wpick_core::model::WallpaperInfo;
 
+use wpick_core::config::PauseConfig;
+
 use crate::hw_decode::HwDecoder;
 use crate::video::VideoDecoder;
 
-// ─── Hyprland fullscreen monitor ─────────────────────────────────────────────
+// ─── Fullscreen monitors (Hyprland + Sway) ───────────────────────────────────
 
 fn start_fullscreen_monitor() -> Arc<AtomicBool> {
     let flag  = Arc::new(AtomicBool::new(false));
     let flag2 = Arc::clone(&flag);
-    std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
-        let sig = match std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
-            Ok(s) => s,
-            Err(_) => { tracing::info!("not Hyprland — fullscreen detection off"); return; }
-        };
-        let path = format!("/tmp/hypr/{}/.socket2.sock", sig);
-        loop {
-            if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(stream).lines() {
-                    match line {
-                        Ok(l) if l.starts_with("fullscreen>>") => {
-                            let p = l.trim_start_matches("fullscreen>>");
-                            let active = !p.starts_with('0') && !p.contains(",0");
-                            flag2.store(active, Ordering::Relaxed);
-                            tracing::debug!("fullscreen → {}", active);
-                        }
-                        Ok(_)  => {}
-                        Err(e) => { tracing::debug!("hyprland ipc: {}", e); break; }
+
+    if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
+            hyprland_fullscreen_loop(flag2, sig);
+        }).ok();
+    } else if std::env::var("SWAYSOCK").is_ok() {
+        std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
+            sway_fullscreen_loop(flag2);
+        }).ok();
+    } else {
+        tracing::info!("unknown compositor — fullscreen detection off");
+    }
+
+    flag
+}
+
+fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String) {
+    let path = format!("/tmp/hypr/{}/.socket2.sock", sig);
+    loop {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stream).lines() {
+                match line {
+                    Ok(l) if l.starts_with("fullscreen>>") => {
+                        let p = l.trim_start_matches("fullscreen>>");
+                        let active = !p.starts_with('0') && !p.contains(",0");
+                        flag.store(active, Ordering::Relaxed);
+                        tracing::debug!("hyprland fullscreen → {}", active);
                     }
+                    Ok(_)  => {}
+                    Err(e) => { tracing::debug!("hyprland ipc: {}", e); break; }
                 }
             }
-            std::thread::sleep(Duration::from_secs(2));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Sway native IPC — subscribe to window events, track fullscreen_mode changes.
+///
+/// Protocol: 6-byte magic "i3-ipc" + u32 LE payload_len + u32 LE msg_type.
+/// SUBSCRIBE = type 2; window events = type 0x80000003.
+fn sway_fullscreen_loop(flag: Arc<AtomicBool>) {
+    use std::io::{Read, Write};
+    const MAGIC: &[u8] = b"i3-ipc";
+    const SUBSCRIBE: u32 = 2;
+    const EV_WINDOW: u32 = 0x8000_0003;
+
+    let sock = match std::env::var("SWAYSOCK") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    loop {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(mut stream) => {
+                let payload = b"[\"window\"]";
+                let mut msg = Vec::with_capacity(14 + payload.len());
+                msg.extend_from_slice(MAGIC);
+                msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                msg.extend_from_slice(&SUBSCRIBE.to_le_bytes());
+                msg.extend_from_slice(payload);
+
+                if stream.write_all(&msg).is_err() {
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+
+                // drain subscribe ACK
+                let mut hdr = [0u8; 14];
+                if stream.read_exact(&mut hdr).is_err() { std::thread::sleep(Duration::from_secs(2)); continue; }
+                let ack_len = u32::from_le_bytes(hdr[6..10].try_into().unwrap_or_default()) as usize;
+                let mut ack = vec![0u8; ack_len];
+                if stream.read_exact(&mut ack).is_err() { std::thread::sleep(Duration::from_secs(2)); continue; }
+
+                // event loop
+                loop {
+                    if stream.read_exact(&mut hdr).is_err() { break; }
+                    let body_len  = u32::from_le_bytes(hdr[6..10].try_into().unwrap_or_default()) as usize;
+                    let msg_type  = u32::from_le_bytes(hdr[10..14].try_into().unwrap_or_default());
+                    let mut body  = vec![0u8; body_len];
+                    if stream.read_exact(&mut body).is_err() { break; }
+
+                    if msg_type == EV_WINDOW {
+                        let s = std::str::from_utf8(&body).unwrap_or("");
+                        if s.contains("\"change\":\"fullscreen_mode\"") {
+                            let active = s.contains("\"fullscreen_mode\":1")
+                                      || s.contains("\"fullscreen_mode\":2");
+                            flag.store(active, Ordering::Relaxed);
+                            tracing::debug!("sway fullscreen → {}", active);
+                        }
+                    }
+                }
+                tracing::debug!("sway ipc disconnected — reconnecting");
+            }
+            Err(e) => tracing::debug!("sway ipc connect: {}", e),
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+// ─── Pause monitors ───────────────────────────────────────────────────────────
+
+struct PauseMonitors {
+    on_fullscreen: bool,
+    fullscreen:    Arc<AtomicBool>,
+    battery:       Arc<AtomicBool>,
+    lid:           Arc<AtomicBool>,
+}
+
+impl PauseMonitors {
+    fn is_paused(&self) -> bool {
+        (self.on_fullscreen && self.fullscreen.load(Ordering::Relaxed))
+            || self.battery.load(Ordering::Relaxed)
+            || self.lid.load(Ordering::Relaxed)
+    }
+}
+
+fn start_battery_monitor() -> Arc<AtomicBool> {
+    let flag  = Arc::new(AtomicBool::new(is_on_battery()));
+    let flag2 = Arc::clone(&flag);
+    std::thread::Builder::new().name("bat-mon".into()).spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            flag2.store(is_on_battery(), Ordering::Relaxed);
         }
     }).ok();
     flag
 }
 
+fn is_on_battery() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/power_supply") else { return false; };
+    for entry in entries.flatten() {
+        let path = entry.path().join("status");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if s.trim() == "Discharging" { return true; }
+        }
+    }
+    false
+}
+
+fn start_lid_monitor() -> Arc<AtomicBool> {
+    let flag  = Arc::new(AtomicBool::new(is_lid_closed()));
+    let flag2 = Arc::clone(&flag);
+    std::thread::Builder::new().name("lid-mon".into()).spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(5));
+            flag2.store(is_lid_closed(), Ordering::Relaxed);
+        }
+    }).ok();
+    flag
+}
+
+fn is_lid_closed() -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc/acpi/button/lid") else { return false; };
+    for entry in entries.flatten() {
+        let path = entry.path().join("state");
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if s.contains("closed") { return true; }
+        }
+    }
+    false
+}
+
 // ─── Wayland state ────────────────────────────────────────────────────────────
 
-struct WaylandState {
-    compositor:       Option<wl_compositor::WlCompositor>,
-    layer_shell:      Option<ZwlrLayerShellV1>,
-    shm:              Option<wl_shm::WlShm>,
-    _output:          Option<wl_output::WlOutput>,
-    output_width:     u32,
-    output_height:    u32,
+/// A discovered wl_output, kept alive for the lifetime of the renderer.
+struct OutputEntry {
+    _wl_output: wl_output::WlOutput,
+    name:       String,
+    width:      u32,
+    height:     u32,
+}
+
+/// Per-surface Wayland events written by Dispatch handlers,
+/// read by the render loop.  Indexed by the `usize` user-data
+/// attached to each ZwlrLayerSurfaceV1 / WlCallback at creation time.
+struct SurfaceEvent {
     configured:       bool,
     configure_serial: u32,
     surf_width:       u32,
     surf_height:      u32,
     needs_ack:        bool,
     closed:           bool,
-    /// Set to true when the compositor sends wl_callback::done.
-    /// The render loop clears it after each commit and waits for the next one.
+    /// Set true by `wl_callback::Done`; cleared by the render loop before each commit.
     frame_ready:      bool,
+}
+
+impl Default for SurfaceEvent {
+    fn default() -> Self {
+        Self {
+            configured: false, configure_serial: 0,
+            surf_width: 0, surf_height: 0,
+            needs_ack: false, closed: false,
+            frame_ready: true, // allow first frame immediately
+        }
+    }
+}
+
+struct WaylandState {
+    compositor:  Option<wl_compositor::WlCompositor>,
+    layer_shell: Option<ZwlrLayerShellV1>,
+    shm:         Option<wl_shm::WlShm>,
+    /// All discovered wl_outputs; index matches the usize user-data on each WlOutput.
+    outputs:     Vec<OutputEntry>,
+    /// Per-surface event state; index matches the usize user-data on each layer surface.
+    surf_ev:     Vec<SurfaceEvent>,
 }
 
 impl Default for WaylandState {
     fn default() -> Self {
         Self {
-            compositor: None, layer_shell: None, shm: None, _output: None,
-            output_width: 1920, output_height: 1080,
-            configured: false, configure_serial: 0,
-            surf_width: 0, surf_height: 0,
-            needs_ack: false, closed: false,
-            frame_ready: true, // allow first frame immediately
+            compositor: None, layer_shell: None, shm: None,
+            outputs: Vec::new(),
+            surf_ev: Vec::new(),
         }
     }
 }
@@ -125,8 +264,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WaylandState {
                 "wl_compositor"       => { state.compositor  = Some(registry.bind(name, version.min(4), qh, ())); }
                 "zwlr_layer_shell_v1" => { state.layer_shell = Some(registry.bind(name, version.min(4), qh, ())); }
                 "wl_shm"              => { state.shm         = Some(registry.bind(name, version.min(1), qh, ())); }
-                "wl_output" if state._output.is_none() => {
-                    state._output = Some(registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, ()));
+                "wl_output" => {
+                    // user-data = index into state.outputs
+                    let idx = state.outputs.len();
+                    let o = registry.bind::<wl_output::WlOutput, _, _>(name, version.min(4), qh, idx);
+                    state.outputs.push(OutputEntry {
+                        _wl_output: o,
+                        name:   String::new(),
+                        width:  1920,
+                        height: 1080,
+                    });
                 }
                 _ => {}
             }
@@ -158,12 +305,14 @@ impl Dispatch<wl_buffer::WlBuffer, Arc<AtomicBool>> for WaylandState {
     }
 }
 
-/// Frame callback: compositor signals it is ready for the next frame.
-impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
+/// Frame callback user-data = surface index into `WaylandState::surf_ev`.
+impl Dispatch<wl_callback::WlCallback, usize> for WaylandState {
     fn event(state: &mut Self, _: &wl_callback::WlCallback, event: wl_callback::Event,
-             _: &(), _: &Connection, _: &QueueHandle<Self>) {
+             idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
         if let wl_callback::Event::Done { .. } = event {
-            state.frame_ready = true;
+            if let Some(ev) = state.surf_ev.get_mut(*idx) {
+                ev.frame_ready = true;
+            }
         }
     }
 }
@@ -171,34 +320,44 @@ impl Dispatch<wl_callback::WlCallback, ()> for WaylandState {
 impl Dispatch<ZwlrLayerShellV1, ()> for WaylandState {
     fn event(_: &mut Self, _: &ZwlrLayerShellV1, _: zwlr_layer_shell_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
-impl Dispatch<ZwlrLayerSurfaceV1, ()> for WaylandState {
+/// Layer surface user-data = surface index into `WaylandState::surf_ev`.
+impl Dispatch<ZwlrLayerSurfaceV1, usize> for WaylandState {
     fn event(state: &mut Self, _: &ZwlrLayerSurfaceV1, event: zwlr_layer_surface_v1::Event,
-             _: &(), _: &Connection, _: &QueueHandle<Self>) {
+             idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(ev) = state.surf_ev.get_mut(*idx) else { return; };
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, width, height } => {
-                state.configure_serial = serial;
-                state.surf_width       = width;
-                state.surf_height      = height;
-                state.configured       = true;
-                state.needs_ack        = true;
+                ev.configure_serial = serial;
+                ev.surf_width       = width;
+                ev.surf_height      = height;
+                ev.configured       = true;
+                ev.needs_ack        = true;
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                tracing::warn!("layer_surface closed");
-                state.closed = true;
+                tracing::warn!("layer_surface[{}] closed", idx);
+                ev.closed = true;
             }
             _ => {}
         }
     }
 }
-impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
+/// wl_output user-data = index into `WaylandState::outputs`.
+impl Dispatch<wl_output::WlOutput, usize> for WaylandState {
     fn event(state: &mut Self, _: &wl_output::WlOutput, event: wl_output::Event,
-             _: &(), _: &Connection, _: &QueueHandle<Self>) {
-        if let wl_output::Event::Mode { flags, width, height, .. } = event {
-            use wayland_client::WEnum;
-            if matches!(flags, WEnum::Value(f) if f.contains(wl_output::Mode::Current)) && width > 0 && height > 0 {
-                state.output_width  = width  as u32;
-                state.output_height = height as u32;
+             idx: &usize, _: &Connection, _: &QueueHandle<Self>) {
+        let Some(o) = state.outputs.get_mut(*idx) else { return; };
+        match event {
+            wl_output::Event::Mode { flags, width, height, .. } => {
+                use wayland_client::WEnum;
+                if matches!(flags, WEnum::Value(f) if f.contains(wl_output::Mode::Current))
+                    && width > 0 && height > 0
+                {
+                    o.width  = width  as u32;
+                    o.height = height as u32;
+                }
             }
+            wl_output::Event::Name { name } => { o.name = name; }
+            _ => {}
         }
     }
 }
@@ -334,32 +493,60 @@ impl AnyDecoder {
     fn is_hw(&self) -> bool { matches!(self, AnyDecoder::Hw(_)) }
 }
 
-// ─── Renderer context ─────────────────────────────────────────────────────────
+// ─── Per-output surface state ─────────────────────────────────────────────────
 
-struct RendererCtx {
-    _conn:         Connection,
-    evq:           wayland_client::EventQueue<WaylandState>,
-    wls:           WaylandState,
-    compositor:    wl_compositor::WlCompositor,
-    layer_shell:   ZwlrLayerShellV1,
+struct OutputSurface {
+    /// Index into `RendererCtx::wls.surf_ev` — routes Dispatch events here.
+    ev_idx:        usize,
+    /// Index into `RendererCtx::wls.outputs` — used when recreating the surface.
+    output_idx:    usize,
+    output_name:   String,
     wl_surface:    wl_surface::WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
-    shm:           wl_shm::WlShm,
-    pool:          ShmPool,
+    pool:          Option<ShmPool>,
+    decoder:       Option<AnyDecoder>,
     surf_w:        u32,
     surf_h:        u32,
+    next_frame:    Instant,
+    canvas_ready:  bool,
+    in_fullscreen: bool,
+    closed_in_fs:  bool,
+    nudge_at:      Option<Instant>,
+}
+
+// ─── Renderer context ─────────────────────────────────────────────────────────
+
+// SAFETY: RendererCtx is created in one spawn_blocking task and immediately
+// moved into another.  All non-Send fields (ffmpeg SwsContext raw pointers,
+// wl_* Wayland objects) are used exclusively from the render thread.
+unsafe impl Send for RendererCtx {}
+
+struct RendererCtx {
+    _conn:       Connection,
+    evq:         wayland_client::EventQueue<WaylandState>,
+    wls:         WaylandState,
+    compositor:  wl_compositor::WlCompositor,
+    layer_shell: ZwlrLayerShellV1,
+    shm:         wl_shm::WlShm,
+    /// One entry per discovered wl_output.
+    surfaces:    Vec<OutputSurface>,
 }
 
 // ─── Surface helpers ──────────────────────────────────────────────────────────
 
-fn make_layer_surface(
+/// Create a layer surface pinned to a specific wl_output.
+/// `ev_idx` is stored as user-data on the ZwlrLayerSurfaceV1 so Dispatch
+/// events can route to the correct SurfaceEvent slot.
+fn make_output_surface(
     compositor:  &wl_compositor::WlCompositor,
     layer_shell: &ZwlrLayerShellV1,
+    output:      &wl_output::WlOutput,
     qh:          &QueueHandle<WaylandState>,
+    ev_idx:      usize,
 ) -> (wl_surface::WlSurface, ZwlrLayerSurfaceV1) {
     use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
     let wl = compositor.create_surface(qh, ());
-    let ls = layer_shell.get_layer_surface(&wl, None, Layer::Bottom, "wpick".into(), qh, ());
+    let ls = layer_shell.get_layer_surface(&wl, Some(output), Layer::Bottom, "wpick".into(), qh, ev_idx);
     ls.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
     ls.set_size(0, 0);
     ls.set_exclusive_zone(-1);
@@ -367,40 +554,45 @@ fn make_layer_surface(
     (wl, ls)
 }
 
-fn nudge_layer_surface(ctx: &mut RendererCtx) {
-    ctx.layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-    ctx.layer_surface.set_size(0, 0);
-    ctx.layer_surface.set_exclusive_zone(-1);
-    ctx.wl_surface.commit();
-    ctx.wls.configured = false;
-    ctx.wls.needs_ack  = false;
+fn nudge_surface(ctx: &mut RendererCtx, i: usize) {
+    let ev_idx = ctx.surfaces[i].ev_idx;
+    ctx.surfaces[i].layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+    ctx.surfaces[i].layer_surface.set_size(0, 0);
+    ctx.surfaces[i].layer_surface.set_exclusive_zone(-1);
+    ctx.surfaces[i].wl_surface.commit();
+    ctx.wls.surf_ev[ev_idx].configured = false;
+    ctx.wls.surf_ev[ev_idx].needs_ack  = false;
     let _ = ctx.evq.flush();
 }
 
-fn recreate_surface(ctx: &mut RendererCtx) {
-    let qh = ctx.evq.handle();
-    let (new_wl, new_ls) = make_layer_surface(&ctx.compositor, &ctx.layer_shell, &qh);
-    let old_ls = std::mem::replace(&mut ctx.layer_surface, new_ls);
-    let old_wl = std::mem::replace(&mut ctx.wl_surface, new_wl);
+fn recreate_surface(ctx: &mut RendererCtx, i: usize) {
+    let ev_idx  = ctx.surfaces[i].ev_idx;
+    let out_idx = ctx.surfaces[i].output_idx;
+    let qh      = ctx.evq.handle();
+    let output  = &ctx.wls.outputs[out_idx]._wl_output;
+    let (new_wl, new_ls) = make_output_surface(&ctx.compositor, &ctx.layer_shell, output, &qh, ev_idx);
+    let old_ls = std::mem::replace(&mut ctx.surfaces[i].layer_surface, new_ls);
+    let old_wl = std::mem::replace(&mut ctx.surfaces[i].wl_surface, new_wl);
     drop(old_ls);
     drop(old_wl);
-    ctx.wls.configured  = false;
-    ctx.wls.needs_ack   = false;
-    ctx.wls.closed      = false;
-    ctx.wls.frame_ready = true; // fresh surface — allow immediate render
+    ctx.wls.surf_ev[ev_idx] = SurfaceEvent { frame_ready: true, ..Default::default() };
     let _ = ctx.evq.flush();
-    tracing::info!("layer_surface recreated");
+    tracing::info!("surface[{}] ({}) recreated", i, ctx.surfaces[i].output_name);
 }
 
-/// Commit a black slot to give the surface content before the first video frame.
-/// Does NOT request a frame callback (keep frame_ready = true for fast first frame).
-fn commit_slot(ctx: &mut RendererCtx, idx: usize) {
-    ctx.pool.slots[idx].in_use.store(true, Ordering::Release);
-    let qh = ctx.evq.handle();
-    ctx.wl_surface.attach(Some(&ctx.pool.slots[idx].canvas.buffer), 0, 0);
-    ctx.wl_surface.damage_buffer(0, 0, ctx.surf_w as i32, ctx.surf_h as i32);
-    ctx.wl_surface.frame(&qh, ());
-    ctx.wl_surface.commit();
+/// Attach `slot_i` from surface `surf_i`'s pool and request a frame callback.
+/// `ev_idx` is passed as callback user-data so Done routes to the right SurfaceEvent.
+fn commit_slot(ctx: &mut RendererCtx, surf_i: usize, slot_i: usize) {
+    let ev_idx = ctx.surfaces[surf_i].ev_idx;
+    let sw     = ctx.surfaces[surf_i].surf_w as i32;
+    let sh     = ctx.surfaces[surf_i].surf_h as i32;
+    let qh     = ctx.evq.handle();  // owned QueueHandle — no borrow on ctx after this line
+    ctx.surfaces[surf_i].pool.as_ref().unwrap().slots[slot_i].in_use.store(true, Ordering::Release);
+    let buffer = &ctx.surfaces[surf_i].pool.as_ref().unwrap().slots[slot_i].canvas.buffer;
+    ctx.surfaces[surf_i].wl_surface.attach(Some(buffer), 0, 0);
+    ctx.surfaces[surf_i].wl_surface.damage_buffer(0, 0, sw, sh);
+    ctx.surfaces[surf_i].wl_surface.frame(&qh, ev_idx);
+    ctx.surfaces[surf_i].wl_surface.commit();
 }
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
@@ -412,36 +604,72 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
     let mut wls = WaylandState::default();
 
     conn.display().get_registry(&qh, ());
+    // Two roundtrips: first collects globals, second drains wl_output Mode/Name events.
     evq.roundtrip(&mut wls).context("globals roundtrip")?;
+    evq.roundtrip(&mut wls).context("output events roundtrip")?;
 
     let compositor  = wls.compositor.take().ok_or_else(|| anyhow::anyhow!("no wl_compositor"))?;
     let layer_shell = wls.layer_shell.take().ok_or_else(|| anyhow::anyhow!("no zwlr_layer_shell_v1"))?;
     let shm         = wls.shm.take().ok_or_else(|| anyhow::anyhow!("no wl_shm"))?;
+    anyhow::ensure!(!wls.outputs.is_empty(), "no wl_output found");
 
-    let (wl_surface, layer_surface) = make_layer_surface(&compositor, &layer_shell, &qh);
+    // Create one layer surface per output.  surf_ev is pre-populated so that
+    // Dispatch handlers can write into the correct slot as Configure events arrive.
+    let n = wls.outputs.len();
+    let mut raw: Vec<(wl_surface::WlSurface, ZwlrLayerSurfaceV1)> = Vec::with_capacity(n);
+    for i in 0..n {
+        wls.surf_ev.push(SurfaceEvent::default());
+        raw.push(make_output_surface(&compositor, &layer_shell, &wls.outputs[i]._wl_output, &qh, i));
+    }
 
+    // Collect Configure events for every surface we just committed.
     evq.roundtrip(&mut wls).context("configure roundtrip")?;
-    anyhow::ensure!(wls.configured, "layer surface not configured");
 
-    let surf_w = if wls.surf_width  > 0 { wls.surf_width  } else { wls.output_width  };
-    let surf_h = if wls.surf_height > 0 { wls.surf_height } else { wls.output_height };
+    let mut surfaces = Vec::with_capacity(n);
+    for (i, (wl_surf, layer_surf)) in raw.into_iter().enumerate() {
+        anyhow::ensure!(wls.surf_ev[i].configured, "surface[{}] ({}) not configured", i, wls.outputs[i].name);
 
-    let mut pool = ShmPool::create(&shm, &qh, surf_w, surf_h).context("shm pool")?;
-    pool.fill_all_black();
+        let ev = &wls.surf_ev[i];
+        let sw = if ev.surf_width  > 0 { ev.surf_width  } else { wls.outputs[i].width  };
+        let sh = if ev.surf_height > 0 { ev.surf_height } else { wls.outputs[i].height };
 
-    // Initial commit: show black surface immediately, then request first callback.
-    layer_surface.ack_configure(wls.configure_serial);
-    pool.slots[0].in_use.store(true, Ordering::Release);
-    wl_surface.attach(Some(&pool.slots[0].canvas.buffer), 0, 0);
-    wl_surface.damage_buffer(0, 0, surf_w as i32, surf_h as i32);
-    wl_surface.frame(&qh, ());
-    wl_surface.commit();
+        let mut pool = ShmPool::create(&shm, &qh, sw, sh).context("shm pool")?;
+        pool.fill_all_black();
+
+        // Ack + initial black commit + request first frame callback.
+        layer_surf.ack_configure(ev.configure_serial);
+        pool.slots[0].in_use.store(true, Ordering::Release);
+        wl_surf.attach(Some(&pool.slots[0].canvas.buffer), 0, 0);
+        wl_surf.damage_buffer(0, 0, sw as i32, sh as i32);
+        wl_surf.frame(&qh, i);
+        wl_surf.commit();
+
+        tracing::info!("surface[{}] {} {}x{}", i, wls.outputs[i].name, sw, sh);
+
+        surfaces.push(OutputSurface {
+            ev_idx:       i,
+            output_idx:   i,
+            output_name:  wls.outputs[i].name.clone(),
+            wl_surface:   wl_surf,
+            layer_surface: layer_surf,
+            pool:          Some(pool),
+            decoder:       None,
+            surf_w:        sw,
+            surf_h:        sh,
+            next_frame:    Instant::now(),
+            canvas_ready:  false,
+            in_fullscreen: false,
+            closed_in_fs:  false,
+            nudge_at:      None,
+        });
+
+        wls.surf_ev[i].needs_ack   = false;
+        wls.surf_ev[i].frame_ready = false; // wait for first callback
+    }
+
     evq.flush().context("flush")?;
-    wls.needs_ack   = false;
-    wls.frame_ready = false; // wait for first callback before rendering
-
-    tracing::info!("renderer ready {}x{} (pool: 3 slots)", surf_w, surf_h);
-    Ok(RendererCtx { _conn: conn, evq, wls, compositor, layer_shell, wl_surface, layer_surface, shm, pool, surf_w, surf_h })
+    tracing::info!("renderer ready — {} output(s)", surfaces.len());
+    Ok(RendererCtx { _conn: conn, evq, wls, compositor, layer_shell, shm, surfaces })
 }
 
 // ─── Async wrapper ────────────────────────────────────────────────────────────
@@ -449,10 +677,21 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
 pub async fn run(
     mut wallpaper_rx: watch::Receiver<Option<WallpaperInfo>>,
     shutdown_rx:      broadcast::Receiver<()>,
+    pause_cfg:        PauseConfig,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
     let mut init_failures = 0u32;
     let fullscreen        = start_fullscreen_monitor();
+
+    // Start pause monitors — only for sources enabled in config.
+    let battery = if pause_cfg.on_battery   { start_battery_monitor() } else { Arc::new(AtomicBool::new(false)) };
+    let lid     = if pause_cfg.on_lid_close { start_lid_monitor()     } else { Arc::new(AtomicBool::new(false)) };
+    let pause   = PauseMonitors {
+        on_fullscreen: pause_cfg.on_fullscreen,
+        fullscreen:    Arc::clone(&fullscreen),
+        battery,
+        lid,
+    };
 
     loop {
         let ctx = match tokio::task::spawn_blocking(init_renderer).await.context("init panic")? {
@@ -486,7 +725,13 @@ pub async fn run(
         });
 
         let fs = Arc::clone(&fullscreen);
-        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, sd_rx, fs))
+        let pm = PauseMonitors {
+            on_fullscreen: pause.on_fullscreen,
+            fullscreen:    Arc::clone(&pause.fullscreen),
+            battery:       Arc::clone(&pause.battery),
+            lid:           Arc::clone(&pause.lid),
+        };
+        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, sd_rx, fs, pm))
             .await.context("render loop panic")?;
 
         wp_fwd.abort();
@@ -514,14 +759,9 @@ fn render_loop(
     wp_rx:      std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
     sd_rx:      std::sync::mpsc::Receiver<()>,
     fullscreen: Arc<AtomicBool>,
+    pause:      PauseMonitors,
 ) -> anyhow::Result<()> {
-    let mut decoder:       Option<AnyDecoder>    = None;
-    let mut current_wp:    Option<WallpaperInfo> = None;
-    let mut next_frame:    Instant               = Instant::now();
-    let mut canvas_ready:  bool                  = false;
-    let mut in_fullscreen: bool                  = false;
-    let mut closed_in_fs:  bool                  = false;
-    let mut nudge_at:      Option<Instant>       = None;
+    let mut current_wp: Option<WallpaperInfo> = None;
 
     loop {
         // ── shutdown ──────────────────────────────────────────────────────────
@@ -534,181 +774,212 @@ fn render_loop(
         }
         let _ = ctx.evq.flush();
 
-        // ── wallpaper change ──────────────────────────────────────────────────
+        // ── wallpaper change → recreate all decoders ──────────────────────────
         while let Ok(new_wp) = wp_rx.try_recv() {
-            decoder      = None;
-            canvas_ready = false;
+            for surf in &mut ctx.surfaces {
+                surf.decoder     = None;
+                surf.canvas_ready = false;
+            }
             if let Some(info) = new_wp {
                 tracing::info!("wallpaper: {}", info.title);
-                decoder    = open_decoder(&info, ctx.surf_w, ctx.surf_h);
+                for surf in &mut ctx.surfaces {
+                    surf.decoder    = open_decoder(&info, surf.surf_w, surf.surf_h);
+                    surf.next_frame = Instant::now();
+                }
                 current_wp = Some(info);
-                next_frame = Instant::now();
             } else {
                 current_wp = None;
             }
         }
 
-        // ── configure ack ─────────────────────────────────────────────────────
-        if ctx.wls.needs_ack {
-            ctx.wls.needs_ack = false;
-            ctx.layer_surface.ack_configure(ctx.wls.configure_serial);
-
-            let new_w = if ctx.wls.surf_width  > 0 { ctx.wls.surf_width  } else { ctx.surf_w };
-            let new_h = if ctx.wls.surf_height > 0 { ctx.wls.surf_height } else { ctx.surf_h };
-
-            if new_w != ctx.surf_w || new_h != ctx.surf_h {
-                let qh = ctx.evq.handle();
-                match ShmPool::create(&ctx.shm, &qh, new_w, new_h) {
-                    Ok(mut new_pool) => {
-                        new_pool.fill_all_black();
-                        ctx.pool   = new_pool;
-                        ctx.surf_w = new_w;
-                        ctx.surf_h = new_h;
-                        canvas_ready = false;
-                        // Decoder must be recreated for new target dimensions.
-                        if let Some(ref info) = current_wp {
-                            decoder = open_decoder(info, new_w, new_h);
-                        }
-                    }
-                    Err(e) => tracing::warn!("pool resize: {}", e),
-                }
-            } else if !canvas_ready {
-                ctx.pool.fill_all_black();
-            }
-
-            // Commit a free black slot so the surface always has content.
-            if let Some(idx) = ctx.pool.free_idx() {
-                commit_slot(&mut ctx, idx);
-                ctx.wls.frame_ready = false;
-            }
-            let _ = ctx.evq.flush();
-
-            nudge_at   = None;
-            next_frame = Instant::now();
-            tracing::debug!("configure acked {}x{}", ctx.surf_w, ctx.surf_h);
-        }
-
-        // ── surface closed ────────────────────────────────────────────────────
-        if ctx.wls.closed {
-            ctx.wls.closed     = false;
-            ctx.wls.configured = false;
-            canvas_ready       = false;
-            if in_fullscreen {
-                closed_in_fs = true;
-                tracing::info!("Closed during fullscreen — deferring recreation");
-            } else {
-                recreate_surface(&mut ctx);
+        // ── per-surface processing ────────────────────────────────────────────
+        let is_fs    = fullscreen.load(Ordering::Relaxed);
+        let is_paused = pause.is_paused();
+        let mut any_work = false;
+        for i in 0..ctx.surfaces.len() {
+            if process_surface(&mut ctx, i, is_fs, is_paused, &current_wp) {
+                any_work = true;
             }
         }
 
-        // ── fullscreen transition ─────────────────────────────────────────────
-        let is_fs = fullscreen.load(Ordering::Relaxed);
-        if in_fullscreen && !is_fs {
-            in_fullscreen = false;
-            tracing::info!("fullscreen exited — recovering surface");
-            if closed_in_fs {
-                closed_in_fs = false;
-                recreate_surface(&mut ctx);
-            } else {
-                nudge_layer_surface(&mut ctx);
-                nudge_at = Some(Instant::now());
-            }
-            continue;
-        }
-        in_fullscreen = is_fs;
-
-        // ── nudge fallback ────────────────────────────────────────────────────
-        if let Some(t) = nudge_at {
-            if !ctx.wls.configured && t.elapsed() > NUDGE_TIMEOUT {
-                tracing::warn!("nudge timed out — recreating surface");
-                nudge_at = None;
-                recreate_surface(&mut ctx);
-            }
-        }
-
-        // ── wait for configure ────────────────────────────────────────────────
-        if !ctx.wls.configured {
-            std::thread::sleep(Duration::from_millis(5));
-            continue;
-        }
-
-        // ── wait for frame callback + video timing ────────────────────────────
-        let now = Instant::now();
-        if !ctx.wls.frame_ready || now < next_frame {
+        if !any_work {
             std::thread::sleep(Duration::from_millis(1));
-            continue;
         }
-
-        // ── idle when no decoder ──────────────────────────────────────────────
-        let Some(dec) = decoder.as_mut() else {
-            std::thread::sleep(Duration::from_millis(5));
-            continue;
-        };
-
-        // ── acquire free buffer slot ──────────────────────────────────────────
-        let Some(idx) = ctx.pool.free_idx() else {
-            // All slots held by compositor — defer until one is released.
-            std::thread::sleep(Duration::from_millis(1));
-            // Restore frame_ready so we don't skip the frame once a slot frees.
-            ctx.wls.frame_ready = true;
-            continue;
-        };
-        ctx.wls.frame_ready = false;
-
-        // ── decode directly into the SHM slot ────────────────────────────────
-        let dur = dec.frame_duration();
-        let (sw, sh) = (ctx.surf_w, ctx.surf_h);
-        let is_hw = dec.is_hw();
-
-        let decode_result = dec.next_frame_bgra(ctx.pool.slots[idx].canvas.pixels_mut());
-
-        match decode_result {
-            Ok(true) => {
-                canvas_ready = true;
-                // Commit slot + request next frame callback.
-                commit_slot(&mut ctx, idx);
-                let _ = ctx.evq.flush();
-                next_frame += dur;
-            }
-            Ok(false) => {
-                // EOF — seek to start for seamless loop.
-                ctx.wls.frame_ready = true;
-                if let Err(e) = dec.seek_to_start() {
-                    tracing::warn!("seek: {}", e);
-                    decoder = None;
-                }
-            }
-            Err(e) => {
-                ctx.wls.frame_ready = true;
-                if is_hw {
-                    tracing::warn!("hw: {} — sw fallback", e);
-                    if let Some(ref info) = current_wp {
-                        match VideoDecoder::open(&info.file_path, sw, sh) {
-                            Ok(sw_dec) => {
-                                tracing::info!("sw fallback decoder opened");
-                                decoder = Some(AnyDecoder::Sw(sw_dec));
-                            }
-                            Err(e2) => {
-                                tracing::warn!("sw fallback failed: {}", e2);
-                                decoder = None;
-                            }
-                        }
-                    }
-                } else {
-                    tracing::warn!("sw: {}", e);
-                    decoder = None;
-                }
-            }
-        }
-
-        // keep canvas_ready in scope (suppresses unused warning)
-        let _ = canvas_ready;
     }
 
-    drop(ctx.layer_surface);
-    drop(ctx.wl_surface);
+    for surf in ctx.surfaces.drain(..) {
+        drop(surf.layer_surface);
+        drop(surf.wl_surface);
+    }
     let _ = ctx.evq.flush();
     Ok(())
+}
+
+// ─── Per-surface processing ───────────────────────────────────────────────────
+
+/// Process one output surface for the current loop iteration.
+/// Returns `true` if a video frame was decoded and committed (work was done).
+fn process_surface(
+    ctx:        &mut RendererCtx,
+    i:          usize,
+    is_fs:      bool,
+    is_paused:  bool,
+    current_wp: &Option<WallpaperInfo>,
+) -> bool {
+    let ev_idx = ctx.surfaces[i].ev_idx;
+
+    // ── surface closed ────────────────────────────────────────────────────────
+    if ctx.wls.surf_ev[ev_idx].closed {
+        ctx.wls.surf_ev[ev_idx].closed     = false;
+        ctx.wls.surf_ev[ev_idx].configured = false;
+        ctx.surfaces[i].canvas_ready       = false;
+        if ctx.surfaces[i].in_fullscreen {
+            ctx.surfaces[i].closed_in_fs = true;
+            tracing::info!("surface[{}] closed during fullscreen — deferring", i);
+        } else {
+            recreate_surface(ctx, i);
+        }
+        return false;
+    }
+
+    // ── fullscreen transition ─────────────────────────────────────────────────
+    if ctx.surfaces[i].in_fullscreen && !is_fs {
+        ctx.surfaces[i].in_fullscreen = false;
+        tracing::info!("fullscreen exited — recovering surface[{}]", i);
+        if ctx.surfaces[i].closed_in_fs {
+            ctx.surfaces[i].closed_in_fs = false;
+            recreate_surface(ctx, i);
+        } else {
+            nudge_surface(ctx, i);
+            ctx.surfaces[i].nudge_at = Some(Instant::now());
+        }
+        return false;
+    }
+    ctx.surfaces[i].in_fullscreen = is_fs;
+
+    // ── nudge timeout fallback ────────────────────────────────────────────────
+    if let Some(t) = ctx.surfaces[i].nudge_at {
+        if !ctx.wls.surf_ev[ev_idx].configured && t.elapsed() > NUDGE_TIMEOUT {
+            tracing::warn!("nudge timed out on surface[{}] — recreating", i);
+            ctx.surfaces[i].nudge_at = None;
+            recreate_surface(ctx, i);
+        }
+    }
+
+    // ── configure ack ─────────────────────────────────────────────────────────
+    if ctx.wls.surf_ev[ev_idx].needs_ack {
+        ctx.wls.surf_ev[ev_idx].needs_ack = false;
+        ctx.surfaces[i].nudge_at          = None;
+        let serial = ctx.wls.surf_ev[ev_idx].configure_serial;
+        ctx.surfaces[i].layer_surface.ack_configure(serial);
+
+        let ew    = ctx.wls.surf_ev[ev_idx].surf_width;
+        let eh    = ctx.wls.surf_ev[ev_idx].surf_height;
+        let new_w = if ew > 0 { ew } else { ctx.surfaces[i].surf_w };
+        let new_h = if eh > 0 { eh } else { ctx.surfaces[i].surf_h };
+
+        if new_w != ctx.surfaces[i].surf_w || new_h != ctx.surfaces[i].surf_h {
+            let qh = ctx.evq.handle();
+            match ShmPool::create(&ctx.shm, &qh, new_w, new_h) {
+                Ok(mut p) => {
+                    p.fill_all_black();
+                    ctx.surfaces[i].pool         = Some(p);
+                    ctx.surfaces[i].surf_w        = new_w;
+                    ctx.surfaces[i].surf_h        = new_h;
+                    ctx.surfaces[i].canvas_ready  = false;
+                    if let Some(ref info) = current_wp {
+                        ctx.surfaces[i].decoder = open_decoder(info, new_w, new_h);
+                    }
+                }
+                Err(e) => tracing::warn!("pool resize surface[{}]: {}", i, e),
+            }
+        } else if !ctx.surfaces[i].canvas_ready {
+            if let Some(p) = ctx.surfaces[i].pool.as_mut() { p.fill_all_black(); }
+        }
+
+        let free = ctx.surfaces[i].pool.as_ref().and_then(|p| p.free_idx());
+        if let Some(slot) = free {
+            commit_slot(ctx, i, slot);
+            ctx.wls.surf_ev[ev_idx].frame_ready = false;
+        }
+        let _ = ctx.evq.flush();
+        ctx.surfaces[i].next_frame = Instant::now();
+        tracing::debug!("acked surface[{}] {}x{}", i, ctx.surfaces[i].surf_w, ctx.surfaces[i].surf_h);
+        return false;
+    }
+
+    // ── wait for configure ────────────────────────────────────────────────────
+    if !ctx.wls.surf_ev[ev_idx].configured { return false; }
+
+    // ── wait for frame callback + video timing ────────────────────────────────
+    let now = Instant::now();
+    if !ctx.wls.surf_ev[ev_idx].frame_ready || now < ctx.surfaces[i].next_frame {
+        return false;
+    }
+
+    // ── pause (fullscreen / battery / lid) ───────────────────────────────────
+    if is_paused {
+        ctx.wls.surf_ev[ev_idx].frame_ready = true;
+        return false;
+    }
+
+    // ── idle when no decoder ──────────────────────────────────────────────────
+    if ctx.surfaces[i].decoder.is_none() { return false; }
+
+    // ── acquire free buffer slot ──────────────────────────────────────────────
+    let Some(slot_i) = ctx.surfaces[i].pool.as_ref().and_then(|p| p.free_idx()) else {
+        ctx.wls.surf_ev[ev_idx].frame_ready = true;
+        return false;
+    };
+    ctx.wls.surf_ev[ev_idx].frame_ready = false;
+
+    // ── decode into SHM slot ──────────────────────────────────────────────────
+    let dur   = ctx.surfaces[i].decoder.as_ref().unwrap().frame_duration();
+    let is_hw = ctx.surfaces[i].decoder.as_ref().unwrap().is_hw();
+    let (sw, sh) = (ctx.surfaces[i].surf_w, ctx.surfaces[i].surf_h);
+
+    let result = {
+        // Single index → one &mut OutputSurface; then split into field borrows.
+        let surf = &mut ctx.surfaces[i];
+        let dec  = surf.decoder.as_mut().unwrap();
+        let pool = surf.pool.as_mut().unwrap();
+        dec.next_frame_bgra(pool.slots[slot_i].canvas.pixels_mut())
+    };
+
+    match result {
+        Ok(true) => {
+            ctx.surfaces[i].canvas_ready = true;
+            commit_slot(ctx, i, slot_i);
+            let _ = ctx.evq.flush();
+            ctx.surfaces[i].next_frame += dur;
+            true
+        }
+        Ok(false) => {
+            ctx.wls.surf_ev[ev_idx].frame_ready = true;
+            let dec = ctx.surfaces[i].decoder.as_mut().unwrap();
+            if let Err(e) = dec.seek_to_start() {
+                tracing::warn!("seek surface[{}]: {}", i, e);
+                ctx.surfaces[i].decoder = None;
+            }
+            false
+        }
+        Err(e) => {
+            ctx.wls.surf_ev[ev_idx].frame_ready = true;
+            if is_hw {
+                tracing::warn!("hw surface[{}]: {} — sw fallback", i, e);
+                if let Some(ref info) = current_wp {
+                    ctx.surfaces[i].decoder = match VideoDecoder::open(&info.file_path, sw, sh) {
+                        Ok(d)  => { tracing::info!("sw fallback surface[{}]", i); Some(AnyDecoder::Sw(d)) }
+                        Err(e2) => { tracing::warn!("sw fallback surface[{}]: {}", i, e2); None }
+                    };
+                }
+            } else {
+                tracing::warn!("sw surface[{}]: {}", i, e);
+                ctx.surfaces[i].decoder = None;
+            }
+            false
+        }
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

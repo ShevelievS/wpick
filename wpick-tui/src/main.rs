@@ -137,14 +137,13 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
         }
 
         Commands::Scan => {
-            println!("Scanning wallpaper library…");
-            match client.send(&ClientCommand::Scan).await? {
-                DaemonResponse::WallpaperList { items } => {
-                    println!("\u{2713} Scan complete: {} wallpapers found", items.len());
-                }
-                DaemonResponse::Error { message } => eprintln!("Scan error: {}", message),
-                _ => {}
-            }
+            print!("Scanning wallpaper library");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let items = client.scan_all(|done, total| {
+                print!("\rScanning {done}/{total}…   ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }).await?;
+            println!("\r\u{2713} Scan complete: {} wallpapers found    ", items.len());
         }
 
         Commands::Status => {

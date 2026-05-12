@@ -196,7 +196,10 @@ async fn main() -> anyhow::Result<()> {
             .spawn(move || {
                 let stopped = handle_competing_tools(pause_mode);
                 if !stopped.is_empty() {
-                    if let Ok(mut g) = pids.lock() { *g = stopped; }
+                    match pids.lock() {
+                        Ok(mut g) => { *g = stopped; }
+                        Err(e)    => tracing::warn!("paused_pids mutex poisoned: {}", e),
+                    }
                 }
             })
             .context("Failed to spawn competitor-handler thread")?;
@@ -269,10 +272,13 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("Ducking disabled by config");
                     ducking::start_noop()
                 };
-                let rt = tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .expect("audio runtime");
+                {
+                    Ok(rt) => rt,
+                    Err(e) => { tracing::error!("audio: failed to build runtime: {}", e); return; }
+                };
                 if let Err(e) = rt.block_on(audio::run(duck, audio_rx, volume_rx, audio_cfg)) {
                     tracing::error!("Audio task: {}", e);
                 }
@@ -284,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting renderer");
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(renderer::run(renderer_rx, shutdown_rx))
+        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause))
         .await
         .context("Renderer error")?;
 
