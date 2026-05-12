@@ -3,6 +3,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::ListState;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 use std::io::Stdout;
 use std::time::Duration;
 use wpick_core::config::{AppDirs, WpickConfig};
@@ -45,10 +47,14 @@ pub struct App {
     pub search_query:            String,
     pub search_active:           bool,
     pub filter_type:             FilterType,
+    // Image preview
+    pub picker:                  Option<Picker>,
+    pub preview:                 Option<StatefulProtocol>,
+    pub preview_id:              Option<u64>,
 }
 
 impl App {
-    pub fn new(config: WpickConfig, dirs: AppDirs) -> Self {
+    pub fn new(config: WpickConfig, dirs: AppDirs, picker: Picker) -> Self {
         Self {
             config,
             dirs,
@@ -68,6 +74,48 @@ impl App {
             search_query:            String::new(),
             search_active:           false,
             filter_type:             FilterType::All,
+            picker:                  Some(picker),
+            preview:                 None,
+            preview_id:              None,
+        }
+    }
+
+    /// Load (or reload) the preview image for the currently selected wallpaper.
+    /// No-op if the same wallpaper is already loaded.
+    /// Sets `preview = None` silently on any error (missing file, unsupported format, etc.).
+    pub fn update_preview(&mut self) {
+        if self.picker.is_none() {
+            self.preview = None;
+            return;
+        }
+
+        let (id, preview_path) = {
+            let filtered = self.filtered_wallpapers();
+            match filtered.get(self.selected) {
+                Some(w) => (w.id, w.preview_path.clone()),
+                None => {
+                    self.preview    = None;
+                    self.preview_id = None;
+                    return;
+                }
+            }
+        };
+
+        if self.preview_id == Some(id) {
+            return;
+        }
+
+        self.preview    = None;
+        self.preview_id = Some(id);
+
+        let path = match preview_path {
+            Some(p) => p,
+            None    => return,
+        };
+
+        if let Ok(img) = image::open(&path) {
+            let protocol = self.picker.as_ref().unwrap().new_resize_protocol(img);
+            self.preview = Some(protocol);
         }
     }
 
@@ -105,6 +153,7 @@ impl App {
         if len > 0 {
             self.selected = (self.selected + 1).min(len - 1);
             self.list_state.select(Some(self.selected));
+            self.update_preview();
         }
     }
 
@@ -112,6 +161,7 @@ impl App {
         if self.selected > 0 {
             self.selected -= 1;
             self.list_state.select(Some(self.selected));
+            self.update_preview();
         }
     }
 
@@ -162,6 +212,8 @@ impl App {
                         self.selected = 0;
                         let empty = self.filtered_wallpapers().is_empty();
                         self.list_state.select(if empty { None } else { Some(0) });
+                        self.preview_id = None;
+                        self.update_preview();
                     }
                 }
                 KeyCode::Char(c) => {
@@ -169,6 +221,8 @@ impl App {
                     self.selected = 0;
                     let empty = self.filtered_wallpapers().is_empty();
                     self.list_state.select(if empty { None } else { Some(0) });
+                    self.preview_id = None;
+                    self.update_preview();
                 }
                 _ => {}
             }
@@ -220,6 +274,8 @@ impl App {
                 self.selected = 0;
                 let empty = self.filtered_wallpapers().is_empty();
                 self.list_state.select(if empty { None } else { Some(0) });
+                self.preview_id = None;
+                self.update_preview();
             }
             KeyCode::Tab => {
                 self.filter_type = match self.filter_type {
@@ -231,6 +287,8 @@ impl App {
                 self.selected = 0;
                 let empty = self.filtered_wallpapers().is_empty();
                 self.list_state.select(if empty { None } else { Some(0) });
+                self.preview_id = None;
+                self.update_preview();
             }
             _ => {}
         }
@@ -370,6 +428,7 @@ impl App {
         };
 
         if let Some(items) = items {
+            self.preview_id = None; // force preview reload for new list
             self.wallpapers = items;
             if let Some(id) = prev_id {
                 if let Some(pos) = self.filtered_wallpapers().iter().position(|w| w.id == id) {
@@ -377,12 +436,14 @@ impl App {
                     let empty = self.filtered_wallpapers().is_empty();
                     self.list_state.select(if empty { None } else { Some(pos) });
                     self.loading = false;
+                    self.update_preview();
                     return;
                 }
             }
             let filtered_len = self.filtered_wallpapers().len();
             self.selected = self.selected.min(filtered_len.saturating_sub(1));
             self.list_state.select(if filtered_len == 0 { None } else { Some(self.selected) });
+            self.update_preview();
         }
 
         self.loading = false;
@@ -453,5 +514,153 @@ impl App {
             }
             Ok(_) | Err(_) => {}
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wpick_core::config::WpickConfig;
+    use wpick_core::model::{WallpaperInfo, WallpaperType};
+
+    fn make_app() -> App {
+        let config = WpickConfig::default();
+        let dirs = config.app_dirs().unwrap();
+        App {
+            config,
+            dirs,
+            client:                 None,
+            wallpapers:             Vec::new(),
+            selected:               0,
+            list_state:             ListState::default(),
+            current_wallpaper_id:   None,
+            mode:                   AppMode::Browse,
+            status_message:         None,
+            status_is_error:        false,
+            status_clear_at:        None,
+            daemon_connected:       false,
+            loading:                false,
+            should_quit:            false,
+            last_reconnect_attempt: None,
+            search_query:           String::new(),
+            search_active:          false,
+            filter_type:            FilterType::All,
+            picker:                 None,
+            preview:                None,
+            preview_id:             None,
+        }
+    }
+
+    fn wallpaper(id: u64, preview_path: Option<&str>) -> WallpaperInfo {
+        WallpaperInfo {
+            id,
+            title:           format!("Test {id}"),
+            wallpaper_type:  WallpaperType::Video,
+            file_path:       format!("/tmp/test_{id}.mp4"),
+            preview_path:    preview_path.map(String::from),
+            has_audio:       false,
+            file_size_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn test_update_preview_empty_list_clears_state() {
+        let mut app = make_app();
+        app.update_preview();
+        assert!(app.preview.is_none());
+        assert!(app.preview_id.is_none());
+    }
+
+    #[test]
+    fn test_update_preview_no_preview_path_sets_id_only() {
+        let mut app = make_app();
+        app.picker = Some(Picker::halfblocks());
+        app.wallpapers = vec![wallpaper(42, None)];
+        app.update_preview();
+        assert!(app.preview.is_none());
+        assert_eq!(app.preview_id, Some(42));
+    }
+
+    #[test]
+    fn test_update_preview_missing_file_leaves_preview_none() {
+        let mut app = make_app();
+        app.picker = Some(Picker::halfblocks());
+        app.wallpapers = vec![wallpaper(1, Some("/tmp/wpick_nonexistent_9876543.jpg"))];
+        app.update_preview();
+        assert!(app.preview.is_none());
+        assert_eq!(app.preview_id, Some(1));
+    }
+
+    #[test]
+    fn test_update_preview_same_id_skips_reload() {
+        let mut app = make_app();
+        app.picker = Some(Picker::halfblocks());
+        app.wallpapers = vec![wallpaper(7, Some("/tmp/wpick_nonexistent_9876543.jpg"))];
+        app.update_preview();
+        assert_eq!(app.preview_id, Some(7));
+        // Overwrite preview_id sentinel — second call must not clear it
+        app.preview_id = Some(7);
+        app.update_preview();
+        assert_eq!(app.preview_id, Some(7)); // unchanged
+    }
+
+    #[test]
+    fn test_update_preview_no_picker_sets_id_only() {
+        let mut app = make_app();
+        // picker is None, but we still record preview_id so we don't loop
+        app.wallpapers = vec![wallpaper(5, Some("/tmp/some_preview.jpg"))];
+        app.update_preview();
+        assert!(app.preview.is_none());
+        // preview_id is NOT set when picker is absent — update_preview returns early
+        assert!(app.preview_id.is_none());
+    }
+
+    #[test]
+    fn test_update_preview_with_real_image() {
+        use image::{ImageBuffer, Rgb};
+        let img: image::DynamicImage =
+            ImageBuffer::from_fn(4, 4, |_, _| Rgb([200u8, 100, 50])).into();
+        let tmp = std::env::temp_dir().join("wpick_test_preview_real.png");
+        img.save(&tmp).unwrap();
+
+        let mut app = make_app();
+        app.picker = Some(Picker::halfblocks());
+        app.wallpapers = vec![wallpaper(99, Some(tmp.to_str().unwrap()))];
+        app.update_preview();
+
+        assert!(app.preview.is_some(), "expected preview to be loaded");
+        assert_eq!(app.preview_id, Some(99));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_select_next_updates_preview_id() {
+        let mut app = make_app();
+        app.picker = Some(Picker::halfblocks());
+        app.wallpapers = vec![
+            wallpaper(1, None),
+            wallpaper(2, None),
+        ];
+        app.update_preview();
+        assert_eq!(app.preview_id, Some(1));
+
+        app.select_next();
+        assert_eq!(app.preview_id, Some(2));
+    }
+
+    #[test]
+    fn test_select_prev_updates_preview_id() {
+        let mut app = make_app();
+        app.picker = Some(Picker::halfblocks());
+        app.wallpapers = vec![wallpaper(10, None), wallpaper(20, None)];
+        app.selected = 1;
+        app.update_preview();
+        assert_eq!(app.preview_id, Some(20));
+
+        app.select_prev();
+        assert_eq!(app.preview_id, Some(10));
     }
 }

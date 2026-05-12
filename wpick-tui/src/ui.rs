@@ -1,9 +1,9 @@
-use std::path::Path;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
 use wpick_core::model::{WallpaperInfo, WallpaperType};
 
 use crate::app::{App, AppMode, FilterType};
@@ -38,7 +38,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_detail(frame, app, detail_area);
         }
         AppMode::Detail => {
-            render_detail(frame, app, main);
+            render_detail(frame, app, main);  // app already &mut App
         }
     }
 }
@@ -253,7 +253,7 @@ fn type_icon_and_color(t: &WallpaperType) -> (&'static str, Color) {
 
 // ── Detail (right panel or full screen) ──────────────────────────────────────
 
-fn render_detail(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn render_detail(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // Always reserve 1 line at bottom for status bar
     let [content_area, status_area] = Layout::vertical([
         Constraint::Min(0),
@@ -274,8 +274,8 @@ fn render_detail(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         );
     } else {
         let [preview_area, info_area] = Layout::vertical([
-            Constraint::Percentage(40),
             Constraint::Min(0),
+            Constraint::Length(7),
         ])
         .areas(content_area);
         render_preview(frame, app, preview_area);
@@ -285,31 +285,30 @@ fn render_detail(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     render_status(frame, app, status_area);
 }
 
-fn render_preview(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let filtered = app.filtered_wallpapers();
-    let content = match filtered.get(app.selected) {
-        None => Text::raw(""),
-        Some(w) => match &w.preview_path {
-            Some(path) => {
-                let filename = Path::new(path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(path.as_str());
-                Text::from(vec![
-                    Line::from(format!("[ {} ]", filename)),
-                    Line::from(""),
-                    Line::from("(image preview not yet implemented)"),
-                ])
-            }
-            None => Text::raw("preview not available"),
-        },
-    };
+fn render_preview(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Preview ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(Block::default().borders(Borders::ALL).title(" Preview ")),
-        area,
-    );
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    if let Some(state) = app.preview.as_mut() {
+        let widget = StatefulImage::<StatefulProtocol>::new().resize(Resize::Fit(None));
+        frame.render_stateful_widget(widget, inner, state);
+    } else {
+        let filtered = app.filtered_wallpapers();
+        let text = match filtered.get(app.selected) {
+            None => Text::raw(""),
+            Some(w) if w.preview_path.is_none() => {
+                Text::styled("no preview", Style::default().fg(Color::DarkGray))
+            }
+            Some(_) if app.loading => Text::raw(""),
+            Some(_) => Text::styled("no preview", Style::default().fg(Color::DarkGray)),
+        };
+        frame.render_widget(Paragraph::new(text), inner);
+    }
 }
 
 fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -319,40 +318,44 @@ fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         None    => return,
     };
 
-    let label = Style::default().fg(Color::Gray);
-    let (icon, _) = type_icon_and_color(&w.wallpaper_type);
-    let file_size  = format_bytes(w.file_size_bytes);
+    let (icon, icon_color) = type_icon_and_color(&w.wallpaper_type);
+    let file_size = format_bytes(w.file_size_bytes);
 
-    let audio_span: Span = if w.has_audio {
-        Span::styled("\u{266a} yes", Style::default().fg(Color::Yellow))
-    } else {
-        Span::styled("\u{2014}", Style::default().fg(Color::DarkGray))
-    };
+    // Row 1: title — bold, full width
+    let title_line = Line::from(Span::styled(
+        w.title.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![Span::styled("title  ", label), Span::raw(w.title.clone())]),
-        Line::from(vec![
-            Span::styled("type   ", label),
-            Span::raw(format!("{} {}", icon, w.wallpaper_type)),
-        ]),
-        Line::from(vec![Span::styled("audio  ", label), audio_span]),
-        Line::from(vec![Span::styled("size   ", label), Span::raw(file_size)]),
-        Line::from(vec![
-            Span::styled("id     ", label),
-            Span::styled(w.id.to_string(), Style::default().fg(Color::DarkGray)),
-        ]),
+    // Row 2: type  ♪  size  #id — all metadata compact on one line
+    let mut meta: Vec<Span> = vec![
+        Span::styled(format!("{} {}", icon, w.wallpaper_type), Style::default().fg(icon_color)),
     ];
+    if w.has_audio {
+        meta.push(Span::styled("  \u{266a}", Style::default().fg(Color::Yellow)));
+    }
+    meta.push(Span::styled(
+        format!("  {}", file_size),
+        Style::default().fg(Color::Gray),
+    ));
+    meta.push(Span::styled(
+        format!("  \u{23}{}",  w.id),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let meta_line = Line::from(meta);
+
+    let mut lines = vec![title_line, meta_line];
 
     if !w.is_supported() {
-        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "\u{26a0} video only — scene/web not yet supported",
+            "\u{26a0} scene/web not yet supported",
             Style::default().fg(Color::Yellow),
         )));
     }
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
+            .wrap(ratatui::widgets::Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL).title(" Details ")),
         area,
     );
