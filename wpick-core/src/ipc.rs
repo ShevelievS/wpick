@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, WpickError};
 use crate::model::WallpaperInfo;
 
+// 64 KiB — the largest valid command is a few hundred bytes; this caps OOM risk
+// from a malicious or buggy client on the local Unix socket.
+const MAX_CMD_BYTES: usize = 64 * 1024;
+// 16 MiB — WallpaperList can carry thousands of entries.
+const MAX_RESP_BYTES: usize = 16 * 1024 * 1024;
+
 // ─── Protocol enums ───────────────────────────────────────────────────────────
 
 /// Commands sent from wpick-tui to wpick-daemon over the Unix socket.
@@ -38,6 +44,9 @@ pub enum DaemonResponse {
         #[serde(default)]
         current_id: Option<u64>,
     },
+    /// Streamed zero or more times before the final `WallpaperList` in response to `Scan`.
+    /// `done` wallpapers have been processed out of `total` discovered.
+    ScanProgress { done: usize, total: usize },
 }
 
 // ─── Send / Receive helpers ───────────────────────────────────────────────────
@@ -68,6 +77,11 @@ where
     if n == 0 {
         return Err(WpickError::IpcClosed);
     }
+    if n > MAX_CMD_BYTES {
+        return Err(WpickError::IpcProtocol(format!(
+            "command too large ({n} bytes, max {MAX_CMD_BYTES})"
+        )));
+    }
     Ok(serde_json::from_str(line.trim())?)
 }
 
@@ -96,6 +110,11 @@ where
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
         return Err(WpickError::IpcClosed);
+    }
+    if n > MAX_RESP_BYTES {
+        return Err(WpickError::IpcProtocol(format!(
+            "response too large ({n} bytes, max {MAX_RESP_BYTES})"
+        )));
     }
     Ok(serde_json::from_str(line.trim())?)
 }

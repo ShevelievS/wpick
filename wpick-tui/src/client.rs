@@ -33,10 +33,42 @@ impl IpcClient {
         ipc::send_command(&mut self.writer, cmd)
             .await
             .context("send command")?;
-        let resp = ipc::recv_response(&mut self.reader)
+        ipc::recv_response(&mut self.reader)
             .await
-            .context("recv response")?;
-        Ok(resp)
+            .context("recv response")
+    }
+
+    /// Send a command without reading a response.  Pair with `recv_resp`.
+    pub async fn send_cmd_only(&mut self, cmd: &ClientCommand) -> Result<()> {
+        ipc::send_command(&mut self.writer, cmd)
+            .await
+            .context("send command")
+    }
+
+    /// Receive one response.  Pair with `send_cmd_only`.
+    pub async fn recv_resp(&mut self) -> Result<DaemonResponse> {
+        ipc::recv_response(&mut self.reader)
+            .await
+            .context("recv response")
+    }
+
+    /// Send Scan and drain all ScanProgress messages, calling `on_progress` for each.
+    /// Returns the final wallpaper list.  Useful in CLI / non-interactive contexts.
+    pub async fn scan_all<F>(&mut self, mut on_progress: F) -> Result<Vec<WallpaperInfo>>
+    where
+        F: FnMut(usize, usize),
+    {
+        ipc::send_command(&mut self.writer, &ClientCommand::Scan)
+            .await
+            .context("send scan")?;
+        loop {
+            match ipc::recv_response(&mut self.reader).await.context("recv scan")? {
+                DaemonResponse::ScanProgress { done, total } => on_progress(done, total),
+                DaemonResponse::WallpaperList { items }      => return Ok(items),
+                DaemonResponse::Error { message }            => anyhow::bail!("{}", message),
+                other => anyhow::bail!("unexpected scan response: {:?}", other),
+            }
+        }
     }
 
     pub async fn list_wallpapers(&mut self) -> Result<Vec<WallpaperInfo>> {

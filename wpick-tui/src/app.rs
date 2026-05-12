@@ -116,11 +116,11 @@ impl App {
     }
 
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-        self.try_reconnect().await;
+        self.try_reconnect(terminal).await;
 
         loop {
             if self.client.is_none() {
-                self.try_reconnect().await;
+                self.try_reconnect(terminal).await;
             }
 
             if let Some(clear_at) = self.status_clear_at {
@@ -134,7 +134,7 @@ impl App {
 
             if crossterm::event::poll(Duration::from_millis(250))? {
                 if let Event::Key(key) = crossterm::event::read()? {
-                    self.handle_key(key).await;
+                    self.handle_key(key, terminal).await;
                 }
             }
 
@@ -146,7 +146,7 @@ impl App {
         Ok(())
     }
 
-    async fn handle_key(&mut self, key: KeyEvent) {
+    async fn handle_key(&mut self, key: KeyEvent, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
         if self.search_active {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.cmd_kill().await;
@@ -206,7 +206,7 @@ impl App {
                 self.cmd_mute().await;
             }
             KeyCode::Char('r') => {
-                self.refresh_list().await;
+                self.refresh_list(terminal).await;
             }
             KeyCode::Char('i') => {
                 self.mode = match self.mode {
@@ -304,31 +304,85 @@ impl App {
         let _ = self.send(ClientCommand::Kill).await;
     }
 
-    pub async fn refresh_list(&mut self) {
+    pub async fn refresh_list(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
         self.loading = true;
         let prev_id = self.filtered_wallpapers().get(self.selected).map(|w| w.id);
 
-        match self.send(ClientCommand::Scan).await {
-            Ok(DaemonResponse::WallpaperList { items }) => {
-                self.wallpapers = items;
-                if let Some(id) = prev_id {
-                    if let Some(pos) = self.filtered_wallpapers().iter().position(|w| w.id == id) {
-                        self.selected = pos;
-                        let empty = self.filtered_wallpapers().is_empty();
-                        self.list_state.select(if empty { None } else { Some(pos) });
-                        self.loading = false;
-                        return;
-                    }
+        // Send Scan command — borrow client briefly, then release.
+        let send_ok = match self.client.as_mut() {
+            None => {
+                self.daemon_connected = false;
+                self.loading = false;
+                return;
+            }
+            Some(c) => tokio::time::timeout(
+                Duration::from_secs(5),
+                c.send_cmd_only(&wpick_core::ipc::ClientCommand::Scan),
+            ).await,
+        };
+        if let Err(_) | Ok(Err(_)) = send_ok {
+            self.client = None;
+            self.daemon_connected = false;
+            self.set_status_error("Scan failed (send)");
+            self.loading = false;
+            return;
+        }
+
+        // Drain responses: ScanProgress* then WallpaperList (or Error).
+        // Between each recv we redraw so the user sees live progress.
+        let items = loop {
+            // Redraw with current status before blocking on next message.
+            let _ = terminal.draw(|f| ui::render(f, self));
+
+            let resp = match self.client.as_mut() {
+                None => break None,
+                Some(c) => tokio::time::timeout(
+                    Duration::from_secs(120),
+                    c.recv_resp(),
+                ).await,
+            };
+
+            match resp {
+                Ok(Ok(DaemonResponse::ScanProgress { done, total })) => {
+                    self.status_message  = Some(format!("Scanning… {done}/{total}"));
+                    self.status_is_error = false;
+                    self.status_clear_at = None; // hold until scan finishes
                 }
-                let filtered_len = self.filtered_wallpapers().len();
-                self.selected = self.selected.min(filtered_len.saturating_sub(1));
-                self.list_state.select(if filtered_len == 0 { None } else { Some(self.selected) });
+                Ok(Ok(DaemonResponse::WallpaperList { items })) => break Some(items),
+                Ok(Ok(DaemonResponse::Error { message })) => {
+                    self.set_status_error(message);
+                    break None;
+                }
+                Ok(Ok(_)) => break None,
+                Ok(Err(e)) => {
+                    self.client = None;
+                    self.daemon_connected = false;
+                    self.set_status_error(e.to_string());
+                    break None;
+                }
+                Err(_timeout) => {
+                    self.client = None;
+                    self.daemon_connected = false;
+                    self.set_status_error("Scan timeout");
+                    break None;
+                }
             }
-            Ok(DaemonResponse::Error { message }) => {
-                self.set_status_error(message);
+        };
+
+        if let Some(items) = items {
+            self.wallpapers = items;
+            if let Some(id) = prev_id {
+                if let Some(pos) = self.filtered_wallpapers().iter().position(|w| w.id == id) {
+                    self.selected = pos;
+                    let empty = self.filtered_wallpapers().is_empty();
+                    self.list_state.select(if empty { None } else { Some(pos) });
+                    self.loading = false;
+                    return;
+                }
             }
-            Ok(_) => {}
-            Err(e) => self.set_status_error(e.to_string()),
+            let filtered_len = self.filtered_wallpapers().len();
+            self.selected = self.selected.min(filtered_len.saturating_sub(1));
+            self.list_state.select(if filtered_len == 0 { None } else { Some(self.selected) });
         }
 
         self.loading = false;
@@ -364,7 +418,7 @@ impl App {
         }
     }
 
-    pub async fn try_reconnect(&mut self) {
+    pub async fn try_reconnect(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
         if let Some(last) = self.last_reconnect_attempt {
             if last.elapsed() < std::time::Duration::from_secs(2) {
                 return;
@@ -382,9 +436,8 @@ impl App {
             self.client = Some(client);
             self.daemon_connected = true;
             self.last_reconnect_attempt = None;
-            // Sync volume/muted from the daemon's authoritative runtime state. (F-7)
             self.sync_volume_state().await;
-            self.refresh_list().await;
+            self.refresh_list(terminal).await;
         }
     }
 

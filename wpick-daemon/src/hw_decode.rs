@@ -31,6 +31,7 @@ pub struct HwDecoder {
     width:         u32,
     height:        u32,
     target_w:      u32,
+    target_h:      u32,
     hw_device_ctx: *mut ffsys::AVBufferRef,
     packet:        *mut ffsys::AVPacket,
     vaapi_frame:   *mut ffsys::AVFrame,
@@ -239,6 +240,7 @@ impl HwDecoder {
             width,
             height,
             target_w,
+            target_h,
             hw_device_ctx,
             packet,
             vaapi_frame,
@@ -252,9 +254,15 @@ impl HwDecoder {
 
     /// Decode the next frame and write it as BGRA into `dst`.
     ///
-    /// `dst` must be exactly `target_w * target_h * 4` bytes.
+    /// `dst` must be at least `target_w * target_h * 4` bytes.
     /// Returns `Ok(true)` when a frame was written, `Ok(false)` at EOF.
     pub fn next_frame_bgra(&mut self, dst: &mut [u8]) -> anyhow::Result<bool> {
+        let required = self.target_w as usize * self.target_h as usize * 4;
+        anyhow::ensure!(
+            dst.len() >= required,
+            "dst too small: {} < {} bytes ({}×{}×4)",
+            dst.len(), required, self.target_w, self.target_h,
+        );
         unsafe { self.next_frame_inner(dst) }
     }
 
@@ -356,7 +364,7 @@ impl HwDecoder {
             dst_stride, 0, 0, 0, 0, 0, 0, 0,
         ];
 
-        ffsys::sws_scale(
+        let rows = ffsys::sws_scale(
             self.sws_ctx,
             src_data.as_ptr(),
             src_linesize.as_ptr(),
@@ -365,6 +373,7 @@ impl HwDecoder {
             dst_data.as_ptr() as *mut *mut u8,
             dst_linesizes.as_ptr(),
         );
+        anyhow::ensure!(rows >= 0, "sws_scale failed: {}", rows);
 
         Ok(true)
     }

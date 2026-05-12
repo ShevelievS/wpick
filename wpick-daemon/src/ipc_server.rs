@@ -59,6 +59,16 @@ async fn handle_connection(
         };
         tracing::debug!("Command: {:?}", cmd);
 
+        // Scan is handled separately — it streams ScanProgress messages before
+        // the final WallpaperList, so it cannot go through the single-response dispatcher.
+        if let ClientCommand::Scan = &cmd {
+            if let Err(e) = handle_scan(&cache, &dirs, &mut writer).await {
+                tracing::warn!("Scan stream error: {}", e);
+                break;
+            }
+            continue;
+        }
+
         let response = dispatch(cmd, &state, &cache, &dirs).await;
 
         if let Err(e) = send_response(&mut writer, &response).await {
@@ -86,12 +96,8 @@ async fn dispatch(
             }
         }
 
-        ClientCommand::Scan => {
-            match scan_and_populate(Arc::clone(cache), (*dirs).clone()).await {
-                Ok(items) => DaemonResponse::WallpaperList { items },
-                Err(e)    => DaemonResponse::Error { message: e.to_string() },
-            }
-        }
+        // Scan is handled before dispatch() is called in handle_connection.
+        ClientCommand::Scan => unreachable!("Scan is handled by handle_scan"),
 
         ClientCommand::Set { id } => {
             let info = {
@@ -188,32 +194,61 @@ fn save_volume_config(volume: f32, muted: bool) {
     });
 }
 
+// ─── Streaming scan ───────────────────────────────────────────────────────────
+
+/// Handle a Scan command: run the scan in a background task, stream ScanProgress
+/// messages to the client as each wallpaper is processed, then send the final
+/// WallpaperList (or Error).
+async fn handle_scan(
+    cache:  &Arc<Mutex<Cache>>,
+    dirs:   &AppDirs,
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
+    let (prog_tx, mut prog_rx) = tokio::sync::mpsc::channel::<DaemonResponse>(16);
+    let scan = tokio::task::spawn(scan_and_populate(
+        Arc::clone(cache),
+        (*dirs).clone(),
+        prog_tx,
+    ));
+
+    // Stream progress messages until the sender is dropped (scan finishes).
+    while let Some(resp) = prog_rx.recv().await {
+        send_response(writer, &resp).await?;
+    }
+
+    // Send final result.
+    let final_resp = match scan.await {
+        Ok(Ok(items)) => DaemonResponse::WallpaperList { items },
+        Ok(Err(e))    => DaemonResponse::Error { message: e.to_string() },
+        Err(e)        => DaemonResponse::Error { message: format!("scan panic: {e}") },
+    };
+    send_response(writer, &final_resp).await.map_err(anyhow::Error::from)
+}
+
 // ─── Cache population ─────────────────────────────────────────────────────────
 
 async fn scan_and_populate(
-    cache: Arc<Mutex<Cache>>,
-    dirs:  AppDirs,
+    cache:    Arc<Mutex<Cache>>,
+    dirs:     AppDirs,
+    progress: tokio::sync::mpsc::Sender<DaemonResponse>,
 ) -> anyhow::Result<Vec<WallpaperInfo>> {
     tokio::task::spawn_blocking(move || {
         let config = WpickConfig::load().context("load config")?;
         let wallpaper_dirs = wpick_core::discovery::find_wallpaper_dirs(&config)
             .context("find wallpaper dirs")?;
 
-        tracing::info!("Scanning {} wallpaper dirs", wallpaper_dirs.len());
+        let total = wallpaper_dirs.len();
+        tracing::info!("Scanning {} wallpaper dirs", total);
 
         let cache_guard = cache.blocking_lock();
         let mut results = Vec::new();
 
-        for wd in wallpaper_dirs {
+        for (i, wd) in wallpaper_dirs.into_iter().enumerate() {
             match wpick_core::pkg::extract_and_parse(&wd, &dirs.wallpapers_dir) {
                 Ok(Some(info)) => {
                     let mtime = std::fs::metadata(wd.path.join("project.json"))
                         .and_then(|m| m.modified())
-                        .map(|t| {
-                            t.duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                        })
+                        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
                         .unwrap_or(0);
 
                     if let Err(e) = cache_guard.upsert(&info, mtime) {
@@ -221,13 +256,15 @@ async fn scan_and_populate(
                     }
                     results.push(info);
                 }
-                Ok(None) => {
-                    tracing::debug!("Skipping non-video wallpaper {}", wd.id);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to process wallpaper {}: {}", wd.id, e);
-                }
+                Ok(None) => tracing::debug!("Skipping non-video wallpaper {}", wd.id),
+                Err(e)   => tracing::warn!("Failed to process wallpaper {}: {}", wd.id, e),
             }
+
+            // Ignore send errors — client may have disconnected mid-scan.
+            let _ = progress.blocking_send(DaemonResponse::ScanProgress {
+                done:  i + 1,
+                total,
+            });
         }
 
         let active_ids: Vec<u64> = results.iter().map(|w| w.id).collect();
