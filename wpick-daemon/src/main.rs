@@ -290,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting renderer");
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause))
+        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache)))
         .await
         .context("Renderer error")?;
 

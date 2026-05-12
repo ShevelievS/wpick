@@ -85,7 +85,7 @@ async fn dispatch(
     cmd:   ClientCommand,
     state: &Arc<Mutex<DaemonState>>,
     cache: &Arc<Mutex<Cache>>,
-    dirs:  &AppDirs,
+    _dirs: &AppDirs,
 ) -> DaemonResponse {
     match cmd {
         ClientCommand::List => {
@@ -240,7 +240,6 @@ async fn scan_and_populate(
         let total = wallpaper_dirs.len();
         tracing::info!("Scanning {} wallpaper dirs", total);
 
-        let cache_guard = cache.blocking_lock();
         let mut results = Vec::new();
 
         for (i, wd) in wallpaper_dirs.into_iter().enumerate() {
@@ -251,8 +250,12 @@ async fn scan_and_populate(
                         .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
                         .unwrap_or(0);
 
-                    if let Err(e) = cache_guard.upsert(&info, mtime) {
-                        tracing::warn!("Cache upsert failed for {}: {}", wd.id, e);
+                    // Lock held only for the brief upsert — IPC commands stay responsive.
+                    {
+                        let guard = cache.blocking_lock();
+                        if let Err(e) = guard.upsert(&info, mtime) {
+                            tracing::warn!("Cache upsert failed for {}: {}", wd.id, e);
+                        }
                     }
                     results.push(info);
                 }
@@ -267,12 +270,13 @@ async fn scan_and_populate(
             });
         }
 
+        // One final lock acquisition for prune + get_all.
+        let guard = cache.blocking_lock();
         let active_ids: Vec<u64> = results.iter().map(|w| w.id).collect();
-        if let Err(e) = cache_guard.prune(&active_ids) {
+        if let Err(e) = guard.prune(&active_ids) {
             tracing::warn!("Cache prune failed: {}", e);
         }
-
-        let all = cache_guard.get_all().context("get_all after scan")?;
+        let all = guard.get_all().context("get_all after scan")?;
         Ok::<Vec<WallpaperInfo>, anyhow::Error>(all)
     })
     .await?

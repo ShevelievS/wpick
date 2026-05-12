@@ -237,8 +237,11 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_default_config_volume() {
-        assert_eq!(WpickConfig::default().general.volume, 0.8_f32);
+    fn test_default_config_general() {
+        let cfg = WpickConfig::default();
+        assert_eq!(cfg.general.volume, 0.8_f32);
+        assert!(!cfg.general.muted,             "default muted must be false");
+        assert!(!cfg.general.pause_competitors,  "default pause_competitors must be false");
     }
 
     #[test]
@@ -273,6 +276,7 @@ mod tests {
         cfg.pause.on_battery = true;
         cfg.audio.chunk_frames = 4096;
         cfg.autostart = true;
+        cfg.general.pause_competitors = true;
         cfg.monitors.insert("HDMI-A-1".into(), MonitorConfig {
             wallpaper_id: Some(12345),
             fit: FitMode::Stretch,
@@ -282,6 +286,7 @@ mod tests {
 
         let reloaded = WpickConfig::load_from(&path)?;
         assert_eq!(reloaded.general.volume, 0.5_f32);
+        assert!(reloaded.general.pause_competitors, "pause_competitors must round-trip");
         assert!(reloaded.pause.on_battery);
         assert_eq!(reloaded.audio.chunk_frames, 4096);
         assert!(reloaded.autostart);

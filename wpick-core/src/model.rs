@@ -21,7 +21,7 @@ impl fmt::Display for WallpaperType {
 }
 
 /// Metadata for a single Wallpaper Engine wallpaper, stored in / retrieved from the cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WallpaperInfo {
     /// Steam Workshop item ID (numeric folder name under `content/431960/`)
     pub id: u64,

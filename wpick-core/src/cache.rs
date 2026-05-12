@@ -263,4 +263,66 @@ mod tests {
         assert_eq!(mtime, Some(42));
         Ok(())
     }
+
+    #[test]
+    fn test_get_by_id_missing_returns_none() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache = Cache::open(&tmp.path().join("test.db"))?;
+        assert!(cache.get_by_id(99999)?.is_none(), "non-existent ID must return None");
+        Ok(())
+    }
+
+    #[test]
+    fn test_upsert_idempotency() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache = Cache::open(&tmp.path().join("test.db"))?;
+
+        let mut info = make_info(42, "Original");
+        cache.upsert(&info, 100)?;
+
+        info.title = "Updated".to_owned();
+        cache.upsert(&info, 200)?; // same id, new title + new mtime
+
+        let result = cache.get_by_id(42)?.expect("must exist after upsert");
+        assert_eq!(result.title, "Updated", "title must be updated");
+        assert_eq!(cache.count()?, 1, "upsert must not create a duplicate row");
+        assert_eq!(cache.get_pkg_mtime(42)?, Some(200), "mtime must be updated");
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache = Cache::open(&tmp.path().join("test.db"))?;
+
+        cache.upsert(&make_info(1, "One"), 0)?;
+        cache.upsert(&make_info(2, "Two"), 0)?;
+        assert_eq!(cache.count()?, 2);
+
+        cache.remove(1)?;
+        assert!(cache.get_by_id(1)?.is_none(), "removed entry must not be found");
+        assert_eq!(cache.count()?, 1, "count must decrease after remove");
+
+        // Removing a non-existent ID must not error.
+        cache.remove(9999)?;
+        assert_eq!(cache.count()?, 1, "count must be unchanged after no-op remove");
+        Ok(())
+    }
+
+    #[test]
+    fn test_count_tracks_insertions_and_removals() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache = Cache::open(&tmp.path().join("test.db"))?;
+
+        assert_eq!(cache.count()?, 0);
+        cache.upsert(&make_info(1, "A"), 0)?;
+        assert_eq!(cache.count()?, 1);
+        cache.upsert(&make_info(2, "B"), 0)?;
+        assert_eq!(cache.count()?, 2);
+        cache.upsert(&make_info(1, "A-updated"), 1)?; // re-upsert same id
+        assert_eq!(cache.count()?, 2, "re-upsert must not increase count");
+        cache.remove(1)?;
+        assert_eq!(cache.count()?, 1);
+        Ok(())
+    }
 }

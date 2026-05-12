@@ -28,7 +28,7 @@ pub enum ClientCommand {
 }
 
 /// Responses sent from wpick-daemon back to wpick-tui.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DaemonResponse {
     Ok,
@@ -37,11 +37,12 @@ pub enum DaemonResponse {
     WallpaperInfo { item: WallpaperInfo },
     /// Returned by Volume, Mute, and Status — carries the authoritative runtime state.
     /// `current_id` is the active wallpaper Workshop ID, or None when nothing is playing.
-    /// `#[serde(default)]` keeps it compatible with v0.1 daemons that don't send the field.
+    /// `#[serde(default)]` + `skip_serializing_if` keeps the field absent on the
+    /// wire when None, so v0.1 clients that don't know the field see nothing.
     VolumeState {
         volume:     f32,
         muted:      bool,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         current_id: Option<u64>,
     },
     /// Streamed zero or more times before the final `WallpaperList` in response to `Scan`.
@@ -147,9 +148,9 @@ mod tests {
         }
 
         // Spot-check wire format
-        assert_eq!(serde_json::to_string(&ClientCommand::List)?, r#"{"type":"List"}"#);
-        assert_eq!(serde_json::to_string(&ClientCommand::Scan)?, r#"{"type":"Scan"}"#);
-        assert_eq!(serde_json::to_string(&ClientCommand::Set { id: 42 })?, r#"{"type":"Set","id":42}"#);
+        assert_eq!(serde_json::to_string(&ClientCommand::List)?,   r#"{"type":"List"}"#);
+        assert_eq!(serde_json::to_string(&ClientCommand::Scan)?,   r#"{"type":"Scan"}"#);
+        assert_eq!(serde_json::to_string(&ClientCommand::Set { id: 42 })?,       r#"{"type":"Set","id":42}"#);
         assert_eq!(serde_json::to_string(&ClientCommand::Volume { level: 0.5 })?, r#"{"type":"Volume","level":0.5}"#);
 
         Ok(())
@@ -169,66 +170,92 @@ mod tests {
             file_size_bytes: 0,
         };
 
+        // Every variant must be present — if a new variant is added without
+        // updating this list, the enum coverage gap should be caught in review.
         let responses: Vec<DaemonResponse> = vec![
             DaemonResponse::Ok,
             DaemonResponse::Error { message: "oops".into() },
             DaemonResponse::WallpaperList { items: vec![sample_info.clone()] },
             DaemonResponse::WallpaperInfo { item: sample_info },
             DaemonResponse::VolumeState { volume: 0.75, muted: false, current_id: None },
+            DaemonResponse::VolumeState { volume: 0.5,  muted: true,  current_id: Some(99) },
+            DaemonResponse::ScanProgress { done: 5, total: 100 },
         ];
 
         for resp in &responses {
             let json = serde_json::to_string(resp)?;
-            let _back: DaemonResponse = serde_json::from_str(&json)?;
+            let back: DaemonResponse = serde_json::from_str(&json)?;
+            assert_eq!(resp, &back, "round-trip failed for {:?}", resp);
         }
 
-        // Spot-check wire format
+        // Spot-check wire formats
         assert_eq!(serde_json::to_string(&DaemonResponse::Ok)?, r#"{"type":"Ok"}"#);
+        assert_eq!(
+            serde_json::to_string(&DaemonResponse::ScanProgress { done: 3, total: 10 })?,
+            r#"{"type":"ScanProgress","done":3,"total":10}"#,
+        );
+        // VolumeState.current_id=None must be omitted (backward compat with v0.1 daemons).
+        let vs = DaemonResponse::VolumeState { volume: 1.0, muted: false, current_id: None };
+        assert!(!serde_json::to_string(&vs)?.contains("current_id"),
+            "current_id=None must be omitted from wire format");
 
         Ok(())
     }
 
-    // ── Async pipe round-trip ─────────────────────────────────────────────────
+    // ── Async pipe round-trips ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_send_recv_command_over_pipe() -> crate::error::Result<()> {
-        let (client, server) = tokio::io::duplex(1024);
-        let (server_read, _server_write) = tokio::io::split(server);
-        let (_client_read, mut client_write) = tokio::io::split(client);
-
-        let mut server_reader = tokio::io::BufReader::new(server_read);
-
-        send_command(&mut client_write, &ClientCommand::List).await?;
-
-        let received = recv_command(&mut server_reader).await?;
-        assert_eq!(received, ClientCommand::List);
+        // Exercise several command types including ones with payload fields.
+        let commands = vec![
+            ClientCommand::List,
+            ClientCommand::Set    { id: 42 },
+            ClientCommand::Volume { level: 0.7 },
+            ClientCommand::Info   { id: 99 },
+            ClientCommand::Kill,
+        ];
+        for cmd in &commands {
+            let (client, server) = tokio::io::duplex(1024);
+            let (server_read, _) = tokio::io::split(server);
+            let (_, mut client_write) = tokio::io::split(client);
+            let mut server_reader = tokio::io::BufReader::new(server_read);
+            send_command(&mut client_write, cmd).await?;
+            let received = recv_command(&mut server_reader).await?;
+            assert_eq!(&received, cmd, "pipe round-trip failed for {:?}", cmd);
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn test_send_recv_response_over_pipe() -> crate::error::Result<()> {
-        let (client, server) = tokio::io::duplex(1024);
-        let (_client_read, mut client_write) = tokio::io::split(client);
-        let (server_read, _server_write) = tokio::io::split(server);
-        let mut server_reader = tokio::io::BufReader::new(server_read);
-
-        send_response(&mut client_write, &DaemonResponse::Ok).await?;
-
-        let received = recv_response(&mut server_reader).await?;
-        assert!(matches!(received, DaemonResponse::Ok));
+        // Cover response types that carry payload, including ScanProgress.
+        let responses = vec![
+            DaemonResponse::Ok,
+            DaemonResponse::ScanProgress { done: 3, total: 10 },
+            DaemonResponse::VolumeState { volume: 0.5, muted: true, current_id: Some(7) },
+        ];
+        for resp in &responses {
+            let (client, server) = tokio::io::duplex(4096);
+            let (_, mut client_write) = tokio::io::split(client);
+            let (server_read, _)  = tokio::io::split(server);
+            let mut server_reader = tokio::io::BufReader::new(server_read);
+            send_response(&mut client_write, resp).await?;
+            let received = recv_response(&mut server_reader).await?;
+            assert_eq!(&received, resp, "pipe round-trip failed for {:?}", resp);
+        }
         Ok(())
     }
 
+    // ── EOF handling ─────────────────────────────────────────────────────────
+
     #[tokio::test]
     async fn test_eof_returns_ipc_closed_for_command() {
-        // Empty reader → EOF → IpcClosed
         let empty: &[u8] = b"";
         let mut reader = tokio::io::BufReader::new(empty);
         let result = recv_command(&mut reader).await;
         assert!(
             matches!(result, Err(WpickError::IpcClosed)),
-            "expected IpcClosed, got {:?}",
-            result
+            "expected IpcClosed, got {:?}", result
         );
     }
 
@@ -239,8 +266,22 @@ mod tests {
         let result = recv_response(&mut reader).await;
         assert!(
             matches!(result, Err(WpickError::IpcClosed)),
-            "expected IpcClosed, got {:?}",
-            result
+            "expected IpcClosed, got {:?}", result
+        );
+    }
+
+    // ── Oversized message protection ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_oversized_command_rejected() {
+        // A line just over MAX_CMD_BYTES must return IpcProtocol, not deserialize.
+        let payload = "x".repeat(MAX_CMD_BYTES + 1);
+        let line = format!("{payload}\n");
+        let mut reader = tokio::io::BufReader::new(line.as_bytes());
+        let result = recv_command(&mut reader).await;
+        assert!(
+            matches!(result, Err(WpickError::IpcProtocol(_))),
+            "expected IpcProtocol for oversized command, got {:?}", result
         );
     }
 }
