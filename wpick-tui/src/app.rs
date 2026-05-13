@@ -51,6 +51,13 @@ pub struct App {
     pub picker:                  Option<Picker>,
     pub preview:                 Option<StatefulProtocol>,
     pub preview_id:              Option<u64>,
+    // Monitor selector
+    /// Connected wl_output names fetched from the daemon.
+    pub monitors:                Vec<String>,
+    /// Whether the monitor-picker overlay is open.
+    pub monitor_select_mode:     bool,
+    /// Cursor inside the monitor picker (0 = "All monitors").
+    pub monitor_selected:        usize,
 }
 
 impl App {
@@ -77,6 +84,9 @@ impl App {
             picker:                  Some(picker),
             preview:                 None,
             preview_id:              None,
+            monitors:                Vec::new(),
+            monitor_select_mode:     false,
+            monitor_selected:        0,
         }
     }
 
@@ -197,6 +207,33 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        // ── Monitor selector overlay ──────────────────────────────────────────
+        if self.monitor_select_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.monitor_select_mode = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.monitor_selected > 0 {
+                        self.monitor_selected -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    // 0 = "All monitors", 1..=N = specific monitors
+                    let max = self.monitors.len(); // len()+1 items total, max idx = len()
+                    if self.monitor_selected < max {
+                        self.monitor_selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    self.monitor_select_mode = false;
+                    self.cmd_set_to_selected_monitor().await;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.search_active {
             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 self.cmd_kill().await;
@@ -260,7 +297,16 @@ impl App {
                 self.cmd_mute().await;
             }
             KeyCode::Char('r') => {
+                self.refresh_monitors().await;
                 self.refresh_list(terminal).await;
+            }
+            KeyCode::Char('M') => {
+                if !self.monitors.is_empty() {
+                    self.monitor_select_mode = true;
+                    self.monitor_selected    = 0;
+                } else {
+                    self.set_status_error("No monitors reported by daemon (try 'r' to refresh)");
+                }
             }
             KeyCode::Char('i') => {
                 self.mode = match self.mode {
@@ -299,10 +345,34 @@ impl App {
             Some(w) => w.id,
             None => return,
         };
-        match self.send(ClientCommand::Set { id }).await {
+        match self.send(ClientCommand::Set { id, monitor: None }).await {
             Ok(_) => {
                 self.current_wallpaper_id = Some(id);
                 self.set_status_ok("\u{2713} Applied");
+            }
+            Err(e) => self.set_status_error(e.to_string()),
+        }
+    }
+
+    /// Apply the selected wallpaper to the monitor chosen in the monitor selector.
+    /// `monitor_selected = 0` means "all monitors" (no monitor filter).
+    async fn cmd_set_to_selected_monitor(&mut self) {
+        let id = match self.filtered_wallpapers().get(self.selected) {
+            Some(w) => w.id,
+            None => return,
+        };
+        let monitor = if self.monitor_selected == 0 {
+            None
+        } else {
+            self.monitors.get(self.monitor_selected - 1).cloned()
+        };
+        let label = monitor.clone()
+            .map(|n| format!("\u{2713} Applied to {}", n))
+            .unwrap_or_else(|| "\u{2713} Applied (all monitors)".into());
+        match self.send(ClientCommand::Set { id, monitor }).await {
+            Ok(_) => {
+                self.current_wallpaper_id = Some(id);
+                self.set_status_ok(label);
             }
             Err(e) => self.set_status_error(e.to_string()),
         }
@@ -498,7 +568,18 @@ impl App {
             self.daemon_connected = true;
             self.last_reconnect_attempt = None;
             self.sync_volume_state().await;
+            self.refresh_monitors().await;
             self.refresh_list(terminal).await;
+        }
+    }
+
+    /// Query the daemon for the list of connected monitors.
+    pub async fn refresh_monitors(&mut self) {
+        match self.send(ClientCommand::ListOutputs).await {
+            Ok(DaemonResponse::OutputList { names }) => {
+                self.monitors = names;
+            }
+            _ => {}
         }
     }
 
@@ -550,6 +631,9 @@ mod tests {
             picker:                 None,
             preview:                None,
             preview_id:             None,
+            monitors:               Vec::new(),
+            monitor_select_mode:    false,
+            monitor_selected:       0,
         }
     }
 

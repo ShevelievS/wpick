@@ -79,11 +79,4 @@ impl IpcClient {
         }
     }
 
-    pub async fn set_wallpaper(&mut self, id: u64) -> Result<()> {
-        match self.send(&ClientCommand::Set { id }).await? {
-            DaemonResponse::Ok => Ok(()),
-            DaemonResponse::Error { message } => anyhow::bail!("{}", message),
-            other => anyhow::bail!("unexpected response: {:?}", other),
-        }
-    }
 }

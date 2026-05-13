@@ -18,12 +18,20 @@ const MAX_RESP_BYTES: usize = 16 * 1024 * 1024;
 pub enum ClientCommand {
     List,
     Scan,
-    Set    { id: u64 },
+    /// Apply wallpaper `id` to one monitor (by wl_output name) or all monitors
+    /// when `monitor` is absent.  Old clients that omit `monitor` continue to work.
+    Set {
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monitor: Option<String>,
+    },
     Volume { level: f32 },
     Mute,
     /// Query current volume and mute state without changing anything.
     Status,
     Info   { id: u64 },
+    /// Return the names of all currently connected wl_outputs.
+    ListOutputs,
     Kill,
 }
 
@@ -48,6 +56,8 @@ pub enum DaemonResponse {
     /// Streamed zero or more times before the final `WallpaperList` in response to `Scan`.
     /// `done` wallpapers have been processed out of `total` discovered.
     ScanProgress { done: usize, total: usize },
+    /// Response to `ListOutputs` — the wl_output names currently connected.
+    OutputList { names: Vec<String> },
 }
 
 // ─── Send / Receive helpers ───────────────────────────────────────────────────
@@ -133,11 +143,13 @@ mod tests {
         let commands = vec![
             ClientCommand::List,
             ClientCommand::Scan,
-            ClientCommand::Set    { id: 42 },
+            ClientCommand::Set    { id: 42, monitor: None },
+            ClientCommand::Set    { id: 7,  monitor: Some("DP-1".into()) },
             ClientCommand::Volume { level: 0.5 },
             ClientCommand::Mute,
             ClientCommand::Status,
             ClientCommand::Info   { id: 99 },
+            ClientCommand::ListOutputs,
             ClientCommand::Kill,
         ];
 
@@ -150,8 +162,15 @@ mod tests {
         // Spot-check wire format
         assert_eq!(serde_json::to_string(&ClientCommand::List)?,   r#"{"type":"List"}"#);
         assert_eq!(serde_json::to_string(&ClientCommand::Scan)?,   r#"{"type":"Scan"}"#);
-        assert_eq!(serde_json::to_string(&ClientCommand::Set { id: 42 })?,       r#"{"type":"Set","id":42}"#);
+        // monitor=None must be omitted for backward compat with old daemons
+        assert_eq!(serde_json::to_string(&ClientCommand::Set { id: 42, monitor: None })?,
+            r#"{"type":"Set","id":42}"#);
+        assert_eq!(serde_json::to_string(&ClientCommand::Set { id: 7, monitor: Some("DP-1".into()) })?,
+            r#"{"type":"Set","id":7,"monitor":"DP-1"}"#);
         assert_eq!(serde_json::to_string(&ClientCommand::Volume { level: 0.5 })?, r#"{"type":"Volume","level":0.5}"#);
+        // Forward compat: old {"type":"Set","id":42} (no monitor field) must deserialize correctly
+        let old: ClientCommand = serde_json::from_str(r#"{"type":"Set","id":42}"#)?;
+        assert_eq!(old, ClientCommand::Set { id: 42, monitor: None });
 
         Ok(())
     }
@@ -180,6 +199,7 @@ mod tests {
             DaemonResponse::VolumeState { volume: 0.75, muted: false, current_id: None },
             DaemonResponse::VolumeState { volume: 0.5,  muted: true,  current_id: Some(99) },
             DaemonResponse::ScanProgress { done: 5, total: 100 },
+            DaemonResponse::OutputList { names: vec!["DP-1".into(), "HDMI-A-1".into()] },
         ];
 
         for resp in &responses {
@@ -209,7 +229,7 @@ mod tests {
         // Exercise several command types including ones with payload fields.
         let commands = vec![
             ClientCommand::List,
-            ClientCommand::Set    { id: 42 },
+            ClientCommand::Set    { id: 42, monitor: None },
             ClientCommand::Volume { level: 0.7 },
             ClientCommand::Info   { id: 99 },
             ClientCommand::Kill,

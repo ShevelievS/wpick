@@ -122,17 +122,26 @@ async fn main() -> anyhow::Result<()> {
     let config = WpickConfig::load().context("Failed to load config")?;
     let dirs   = config.app_dirs().context("Failed to resolve app dirs")?;
 
-    // 2. File logging
-    let file_appender = tracing_appender::rolling::daily(&dirs.log_dir, "wpick.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("wpick_daemon=info".parse()?)
-                .add_directive("wpick_core=info".parse()?),
-        )
-        .init();
+    // 2. Logging — journal when running under systemd, rolling file otherwise.
+    let env_filter = tracing_subscriber::EnvFilter::from_default_env()
+        .add_directive("wpick_daemon=info".parse()?)
+        .add_directive("wpick_core=info".parse()?);
+
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        // systemd captures stderr; disable ANSI colours so journal formats cleanly.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_env_filter(env_filter)
+            .init();
+    } else {
+        let file_appender = tracing_appender::rolling::daily(&dirs.log_dir, "wpick.log");
+        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::fmt()
+            .with_writer(non_blocking)
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     tracing::info!("wpick-daemon starting");
 
@@ -153,15 +162,39 @@ async fn main() -> anyhow::Result<()> {
     );
     let (shutdown_tx, shutdown_rx) = sync::broadcast::channel::<()>(1);
 
+    // Per-monitor overrides channel — renderer subscribes to apply dynamic pins.
+    let (per_monitor_tx, per_monitor_rx) =
+        sync::watch::channel(std::collections::HashMap::<String, Option<WallpaperInfo>>::new());
+    // Shared output list published by the renderer and read by the IPC server.
+    let outputs: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outputs_renderer = Arc::clone(&outputs);
+
     // 5. DaemonState
     let state = Arc::new(sync::Mutex::new(DaemonState {
-        current:      None,
-        volume:       config.general.volume,
-        muted:        config.general.muted,
+        current:        None,
+        volume:         config.general.volume,
+        muted:          config.general.muted,
         wallpaper_tx,
         volume_tx,
-        shutdown_tx:  shutdown_tx.clone(),
+        shutdown_tx:    shutdown_tx.clone(),
+        per_monitor_tx,
+        outputs,
     }));
+
+    // 5b. Restore last wallpaper from config (persist-on-restart).
+    if let Some(last_id) = config.last_wallpaper_id {
+        let guard = cache.lock().await;
+        match guard.get_by_id(last_id) {
+            Ok(Some(info)) if info.is_supported() => {
+                tracing::info!("restoring last wallpaper id={}", last_id);
+                state.lock().await.set_wallpaper(info);
+            }
+            Ok(Some(_)) => tracing::info!("last wallpaper id={} unsupported — skipping", last_id),
+            Ok(None)    => tracing::info!("last wallpaper id={} not in cache — skipping", last_id),
+            Err(e)      => tracing::warn!("failed to look up last wallpaper id={}: {}", last_id, e),
+        }
+    }
 
     // 6 + 7. Atomic socket bind (TOCTOU-safe: try-bind first).
     let socket_path = dirs.socket_path.clone();
@@ -336,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit))
+        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit, per_monitor_rx, outputs_renderer))
         .await
         .context("Renderer error")?;
 

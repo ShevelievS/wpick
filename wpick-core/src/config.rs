@@ -10,14 +10,17 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct WpickConfig {
-    pub general:   GeneralConfig,
-    pub paths:     PathsConfig,
-    pub wayland:   WaylandConfig,
+    pub general:          GeneralConfig,
+    pub paths:            PathsConfig,
+    pub wayland:          WaylandConfig,
     // v0.2 additions:
-    pub monitors:  HashMap<String, MonitorConfig>,  // keyed by wl_output name
-    pub pause:     PauseConfig,
-    pub audio:     AudioConfig,
-    pub autostart: bool,
+    pub monitors:         HashMap<String, MonitorConfig>,  // keyed by wl_output name
+    pub pause:            PauseConfig,
+    pub audio:            AudioConfig,
+    pub autostart:        bool,
+    // v0.4 additions:
+    /// Last wallpaper set by the user; restored on daemon restart.
+    pub last_wallpaper_id: Option<u64>,
 }
 
 /// Playback / audio settings.
@@ -211,12 +214,18 @@ impl WpickConfig {
             .unwrap_or_else(|| home.join(".local/share"))
             .join("wpick");
 
+        // Prefer $XDG_RUNTIME_DIR/wpick.sock; fall back to ~/.wpick.sock for
+        // environments where XDG_RUNTIME_DIR is unset (e.g. tty sessions).
+        let socket_path = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(|d| PathBuf::from(d).join("wpick.sock"))
+            .unwrap_or_else(|| home.join(".wpick.sock"));
+
         let dirs_out = AppDirs {
             config_file:    config.join("wpick").join("config.toml"),
             cache_dir:      cache.clone(),
             wallpapers_dir: cache.join("wallpapers"),
             db_path:        cache.join("wpick.db"),
-            socket_path:    home.join(".wpick.sock"),
+            socket_path,
             log_dir:        log_dir.clone(),
         };
 
@@ -366,6 +375,55 @@ cache_dir = ""
     #[test]
     fn test_fitmode_default_is_fill() {
         assert_eq!(FitMode::default(), FitMode::Fill);
+    }
+
+    #[test]
+    fn test_last_wallpaper_id_round_trip() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("config.toml");
+
+        let mut cfg = WpickConfig::default();
+        assert!(cfg.last_wallpaper_id.is_none(), "default must be None");
+
+        cfg.last_wallpaper_id = Some(42);
+        cfg.save_to(&path)?;
+
+        let r = WpickConfig::load_from(&path)?;
+        assert_eq!(r.last_wallpaper_id, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_wallpaper_id_default_when_absent() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[general]\nvolume = 0.5\nmuted = false\n")?;
+
+        let cfg = WpickConfig::load_from(&path)?;
+        assert!(cfg.last_wallpaper_id.is_none(), "must default to None when key absent");
+        Ok(())
+    }
+
+    #[test]
+    fn test_socket_path_uses_xdg_runtime_dir() -> Result<()> {
+        let tmp = TempDir::new()?;
+        // Temporarily override XDG_RUNTIME_DIR in this process.
+        // SAFETY: single-threaded test, no concurrent env access.
+        let original = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()); }
+
+        let cfg  = WpickConfig::default();
+        let dirs = cfg.app_dirs()?;
+        let expected = tmp.path().join("wpick.sock");
+        assert_eq!(dirs.socket_path, expected,
+            "socket_path should be $XDG_RUNTIME_DIR/wpick.sock");
+
+        // Restore
+        match original {
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v); },
+            None    => unsafe { std::env::remove_var("XDG_RUNTIME_DIR"); },
+        }
+        Ok(())
     }
 
     #[test]

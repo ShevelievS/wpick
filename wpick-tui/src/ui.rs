@@ -1,8 +1,8 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
 use wpick_core::model::{WallpaperInfo, WallpaperType};
 
@@ -38,8 +38,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_detail(frame, app, detail_area);
         }
         AppMode::Detail => {
-            render_detail(frame, app, main);  // app already &mut App
+            render_detail(frame, app, main);
         }
+    }
+
+    if app.monitor_select_mode {
+        render_monitor_overlay(frame, app, frame.area());
     }
 }
 
@@ -409,4 +413,46 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+// ── Monitor selector overlay ──────────────────────────────────────────────────
+
+fn render_monitor_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    // Total items: "All monitors" + one per detected output.
+    let item_count = app.monitors.len() + 1;
+    let popup_h = (item_count as u16 + 4).min(area.height.saturating_sub(4));
+    let popup_w = 36_u16.min(area.width.saturating_sub(4));
+    let x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let y = area.y + area.height.saturating_sub(popup_h) / 2;
+    let popup = Rect::new(x, y, popup_w, popup_h);
+
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Select monitor ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(item_count);
+    items.push(ListItem::new("  All monitors"));
+    for name in &app.monitors {
+        items.push(ListItem::new(format!("  {}", name)));
+    }
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(app.monitor_selected));
+
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("\u{25b6} ");
+
+    frame.render_stateful_widget(list, inner, &mut list_state);
 }

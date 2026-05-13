@@ -745,6 +745,8 @@ pub async fn run(
     monitors:            HashMap<String, MonitorConfig>,
     cache:               Arc<tokio::sync::Mutex<Cache>>,
     on_fullscreen_exit:  Option<Arc<dyn Fn() + Send + Sync>>,
+    mut per_monitor_rx:  watch::Receiver<HashMap<String, Option<WallpaperInfo>>>,
+    outputs_out:         Arc<std::sync::Mutex<Vec<String>>>,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
     let mut init_failures = 0u32;
@@ -774,9 +776,16 @@ pub async fn run(
             }
         };
 
+        // Publish connected output names so IPC can serve ListOutputs.
+        if let Ok(mut g) = outputs_out.lock() {
+            *g = ctx.surfaces.iter().map(|s| s.output_name.clone()).collect();
+        }
+
         let (wp_tx, wp_rx) = std::sync::mpsc::channel::<Option<WallpaperInfo>>();
         let (sd_tx, sd_rx) = std::sync::mpsc::channel::<()>();
+        let (pin_tx, pin_rx) = std::sync::mpsc::channel::<HashMap<String, Option<WallpaperInfo>>>();
         let _ = wp_tx.send(wallpaper_rx.borrow_and_update().clone());
+        let _ = pin_tx.send(per_monitor_rx.borrow_and_update().clone());
 
         let mut rx2 = wallpaper_rx.clone();
         let wp_fwd = tokio::spawn(async move {
@@ -790,6 +799,13 @@ pub async fn run(
             let _ = sd_sub.recv().await;
             let _ = sd_tx.send(());
         });
+        let mut pm_rx2 = per_monitor_rx.clone();
+        let pin_fwd = tokio::spawn(async move {
+            loop {
+                if pm_rx2.changed().await.is_err() { break; }
+                if pin_tx.send(pm_rx2.borrow_and_update().clone()).is_err() { break; }
+            }
+        });
 
         // Resolve per-monitor wallpapers from cache (async, before entering blocking task).
         // Re-resolved each reinit so a re-scan between reinits picks up new entries.
@@ -802,11 +818,12 @@ pub async fn run(
             battery:       Arc::clone(&pause.battery),
             lid:           Arc::clone(&pause.lid),
         };
-        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, sd_rx, fs, pm, monitor_wallpapers))
+        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, pin_rx, sd_rx, fs, pm, monitor_wallpapers))
             .await.context("render loop panic")?;
 
         wp_fwd.abort();
         sd_fwd.abort();
+        pin_fwd.abort();
 
         match result {
             Ok(()) => break,
@@ -847,11 +864,12 @@ async fn resolve_monitor_wallpapers(
 const NUDGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn render_loop(
-    mut ctx:           RendererCtx,
-    wp_rx:             std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
-    sd_rx:             std::sync::mpsc::Receiver<()>,
-    fullscreen:        Arc<AtomicBool>,
-    pause:             PauseMonitors,
+    mut ctx:            RendererCtx,
+    wp_rx:              std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
+    pin_rx:             std::sync::mpsc::Receiver<HashMap<String, Option<WallpaperInfo>>>,
+    sd_rx:              std::sync::mpsc::Receiver<()>,
+    fullscreen:         Arc<AtomicBool>,
+    pause:              PauseMonitors,
     monitor_wallpapers: HashMap<String, WallpaperInfo>,
 ) -> anyhow::Result<()> {
     let mut current_wp: Option<WallpaperInfo> = None;
@@ -884,6 +902,36 @@ fn render_loop(
             anyhow::bail!("__fatal__");
         }
         let _ = ctx.evq.flush();
+
+        // ── dynamic per-monitor pins (IPC Set with monitor=) ─────────────────
+        // Consume only the most-recent snapshot — watch semantics mean older
+        // intermediate values don't matter.
+        let mut latest_pins: Option<HashMap<String, Option<WallpaperInfo>>> = None;
+        while let Ok(pins) = pin_rx.try_recv() { latest_pins = Some(pins); }
+        if let Some(pins) = latest_pins {
+            for surf in &mut ctx.surfaces {
+                if let Some(wp_opt) = pins.get(&surf.output_name) {
+                    match wp_opt {
+                        Some(info) => {
+                            tracing::info!("pin update: surface '{}' → '{}'",
+                                surf.output_name, info.title);
+                            surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h);
+                            surf.next_frame = Instant::now();
+                            surf.pinned_wp  = Some(info.clone());
+                            surf.canvas_ready = false;
+                        }
+                        None => {
+                            tracing::info!("pin update: surface '{}' unpinned", surf.output_name);
+                            surf.pinned_wp    = None;
+                            surf.canvas_ready = false;
+                            surf.decoder = current_wp.as_ref()
+                                .and_then(|info| open_decoder(info, surf.surf_w, surf.surf_h));
+                            if surf.decoder.is_some() { surf.next_frame = Instant::now(); }
+                        }
+                    }
+                }
+            }
+        }
 
         // ── wallpaper change → recreate decoders for non-pinned surfaces ──────
         while let Ok(new_wp) = wp_rx.try_recv() {

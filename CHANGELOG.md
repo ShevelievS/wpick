@@ -96,10 +96,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Scene and Web wallpaper types are parsed and displayed in the TUI but
   not rendered.
-- Wallpaper selection is not persisted across daemon restarts.
-- `on_battery` and `on_lid_close` pause triggers are config-only; logic
-  not yet implemented.
-- No systemd user service, shell completions, or man pages yet.
+- Wallpaper selection is not persisted across daemon restarts (fixed in v0.4.0).
+- Audio does not pause on `on_battery` / `on_lid_close` / fullscreen — only
+  frame rendering is suspended (architectural constraint of the streaming decoder).
+- No systemd user service, shell completions, or man pages yet (planned v0.4.0).
 
 ---
 

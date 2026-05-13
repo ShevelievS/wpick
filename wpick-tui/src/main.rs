@@ -8,6 +8,7 @@ use client::IpcClient;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use wpick_core::config::{AppDirs, WpickConfig};
 use wpick_core::ipc::{ClientCommand, DaemonResponse};
+use clap::CommandFactory;
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -26,8 +27,13 @@ enum Commands {
     List,
     /// Scan Steam Workshop dirs and rebuild cache
     Scan,
-    /// Set wallpaper by ID
-    Set { id: u64 },
+    /// Set wallpaper by ID (optionally on a specific monitor)
+    Set {
+        id: u64,
+        /// wl_output name to target (e.g. DP-1, HDMI-A-1). Omit to apply to all monitors.
+        #[arg(long)]
+        monitor: Option<String>,
+    },
     /// Set volume (0-100)
     Volume { percent: u8 },
     /// Toggle mute
@@ -38,8 +44,16 @@ enum Commands {
     Info { id: u64 },
     /// Start daemon in foreground (replaces current process)
     Daemon,
+    /// List connected monitors (wl_output names)
+    Outputs,
     /// Kill daemon
     Kill,
+    /// Print shell completion script to stdout
+    #[command(hide = true)]
+    Completions { shell: clap_complete::Shell },
+    /// Print man page to stdout
+    #[command(hide = true)]
+    Man,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -79,6 +93,17 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
             );
             return Err(anyhow::anyhow!("Failed to exec wpick-daemon: {err}"));
         }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            return Ok(());
+        }
+        Commands::Man => {
+            let cmd = Cli::command();
+            clap_mangen::Man::new(cmd).render(&mut std::io::stdout())?;
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -103,9 +128,12 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
             println!("\n{} wallpapers found", items.len());
         }
 
-        Commands::Set { id } => {
-            client.set_wallpaper(id).await?;
-            println!("\u{2713} Wallpaper set: {}", id);
+        Commands::Set { id, monitor } => {
+            client.send(&ClientCommand::Set { id, monitor: monitor.clone() }).await?;
+            match &monitor {
+                Some(m) => println!("\u{2713} Wallpaper {} set on {}", id, m),
+                None    => println!("\u{2713} Wallpaper set: {}", id),
+            }
         }
 
         Commands::Volume { percent } => {
@@ -160,12 +188,28 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
             }
         }
 
+        Commands::Outputs => {
+            match client.send(&ClientCommand::ListOutputs).await? {
+                DaemonResponse::OutputList { names } if names.is_empty() => {
+                    println!("No monitors reported (daemon may still be initializing)");
+                }
+                DaemonResponse::OutputList { names } => {
+                    for name in &names {
+                        println!("{}", name);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         Commands::Kill => {
             client.send(&ClientCommand::Kill).await.ok();
             println!("\u{2713} Daemon killed");
         }
 
-        Commands::Tui | Commands::Daemon => unreachable!("handled above"),
+        Commands::Tui | Commands::Daemon | Commands::Completions { .. } | Commands::Man => {
+            unreachable!("handled above")
+        }
     }
 
     Ok(())

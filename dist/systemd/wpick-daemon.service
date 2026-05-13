@@ -1,0 +1,26 @@
+[Unit]
+Description=wpick Wallpaper Engine daemon
+Documentation=man:wpick-daemon(1)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/wpick-daemon
+Restart=on-failure
+RestartSec=5s
+
+# Logging — systemd captures stdout/stderr; tracing is directed to stderr
+# when JOURNAL_STREAM is set (detected automatically by wpick-daemon).
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=%h/.config/wpick %h/.local/share/wpick %h/.cache/wpick
+ProtectSystem=strict
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

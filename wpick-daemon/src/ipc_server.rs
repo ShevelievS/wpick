@@ -99,7 +99,7 @@ async fn dispatch(
         // Scan is handled before dispatch() is called in handle_connection.
         ClientCommand::Scan => unreachable!("Scan is handled by handle_scan"),
 
-        ClientCommand::Set { id } => {
+        ClientCommand::Set { id, monitor } => {
             let info = {
                 let guard = cache.lock().await;
                 match guard.get_by_id(id) {
@@ -117,8 +117,23 @@ async fn dispatch(
                 };
             }
 
-            state.lock().await.set_wallpaper(info);
+            match monitor {
+                Some(name) => {
+                    state.lock().await.set_wallpaper_for_monitor(name.clone(), info);
+                    save_monitor_wallpaper_id(name, id);
+                }
+                None => {
+                    state.lock().await.set_wallpaper(info);
+                    save_last_wallpaper_id(id);
+                }
+            }
             DaemonResponse::Ok
+        }
+
+        ClientCommand::ListOutputs => {
+            let outputs_arc = state.lock().await.outputs.clone();
+            let names = outputs_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            DaemonResponse::OutputList { names }
         }
 
         ClientCommand::Volume { level } => {
@@ -177,19 +192,38 @@ async fn dispatch(
     }
 }
 
-// ─── Config persistence helper ────────────────────────────────────────────────
+// ─── Config persistence helpers ───────────────────────────────────────────────
 
 /// Persist volume and muted state to config.
-/// Reads current config from disk once to preserve other fields, then saves.
-/// Errors are logged and swallowed — a failed volume save is not fatal.
 fn save_volume_config(volume: f32, muted: bool) {
-    // Spawn blocking I/O off the async executor.
     tokio::task::spawn_blocking(move || {
         let mut cfg = WpickConfig::load().unwrap_or_default();
         cfg.general.volume = volume;
         cfg.general.muted  = muted;
         if let Err(e) = cfg.save() {
             tracing::warn!("Config save failed: {}", e);
+        }
+    });
+}
+
+/// Persist the last-applied wallpaper id so the daemon can restore it on restart.
+fn save_last_wallpaper_id(id: u64) {
+    tokio::task::spawn_blocking(move || {
+        let mut cfg = WpickConfig::load().unwrap_or_default();
+        cfg.last_wallpaper_id = Some(id);
+        if let Err(e) = cfg.save() {
+            tracing::warn!("Config save (last_wallpaper_id) failed: {}", e);
+        }
+    });
+}
+
+/// Persist a per-monitor wallpaper assignment to config so the renderer reloads it after restart.
+fn save_monitor_wallpaper_id(monitor: String, id: u64) {
+    tokio::task::spawn_blocking(move || {
+        let mut cfg = WpickConfig::load().unwrap_or_default();
+        cfg.monitors.entry(monitor).or_default().wallpaper_id = Some(id);
+        if let Err(e) = cfg.save() {
+            tracing::warn!("Config save (monitor wallpaper_id) failed: {}", e);
         }
     });
 }

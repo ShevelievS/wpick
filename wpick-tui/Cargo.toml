@@ -18,5 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ratatui            = "0.30"
 crossterm          = "0.29"
 clap               = { version = "4", features = ["derive"] }
+clap_complete      = "4"
+clap_mangen        = "0.2"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 image         = { version = "0.25", default-features = false, features = ["jpeg", "gif", "png", "webp"] }
