@@ -260,10 +260,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 9. Cleanup helper — removes socket, kills webviews, resumes any SIGSTOP'd competitors.
-    let webview_children_cleanup = {
-        let s = state.blocking_lock();
-        Arc::clone(&s.webview_children)
-    };
+    let webview_children_cleanup = state.lock().await.webview_children.clone();
     let cleanup = {
         let sp       = socket_path.clone();
         let pids     = Arc::clone(&paused_pids);
