@@ -316,7 +316,9 @@ pub fn extract_and_parse(
     let json_content = std::fs::read_to_string(&project_json_path)?;
     let project: ProjectJson = serde_json::from_str(&json_content)?;
 
-    build_wallpaper_info(wallpaper_dir.id, project, &out_dir, &out_dir)
+    // Preview image lives in the original wallpaper directory, not in out_dir.
+    // Video/HTML assets are in out_dir (extracted from PKG).
+    build_wallpaper_info(wallpaper_dir.id, project, &out_dir, &wallpaper_dir.path)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -498,7 +500,7 @@ mod tests {
         let tmp       = TempDir::new()?;
         let cache_dir = TempDir::new()?;
 
-        // Minimal preview.gif in the wallpaper dir.
+        // Minimal preview.gif in the wallpaper dir (no scene.pkg — direct).
         std::fs::write(tmp.path().join("preview.gif"), b"GIF89a")?;
         let project_json = r#"{"title":"My Scene","type":"scene","preview":"preview.gif"}"#;
         std::fs::write(tmp.path().join("project.json"), project_json)?;
@@ -512,6 +514,37 @@ mod tests {
         assert!(info.file_path.ends_with("preview.gif"));
         assert!(info.preview_path.as_ref().map(|p| p.ends_with("preview.gif")).unwrap_or(false));
         assert!(!info.has_audio);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scene_pkg_preview_in_wallpaper_dir() -> crate::error::Result<()> {
+        // PKG-based scene: preview.gif lives in the original wallpaper dir, NOT in out_dir.
+        // This is the common real-world layout: scene.pkg + preview.gif side by side.
+        let tmp       = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        // preview.gif is in the wallpaper dir (not inside the PKG).
+        std::fs::write(tmp.path().join("preview.gif"), b"GIF89a")?;
+
+        // Minimal PKG containing only project.json.
+        let project_json_bytes = br#"{"title":"PKG Scene","type":"scene","preview":"preview.gif"}"#;
+        let mut pkg = b"PKGV0001".to_vec();
+        pkg.extend_from_slice(&1u32.to_le_bytes());
+        let name = b"project.json";
+        pkg.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        pkg.extend_from_slice(name);
+        pkg.extend_from_slice(&(project_json_bytes.len() as u32).to_le_bytes());
+        pkg.extend_from_slice(project_json_bytes);
+        std::fs::write(tmp.path().join("scene.pkg"), &pkg)?;
+
+        let wd     = make_wallpaper_dir(99985, tmp.path());
+        let result = extract_and_parse(&wd, cache_dir.path())?;
+        let info   = result.expect("PKG scene with preview in wallpaper dir must return Some");
+
+        assert_eq!(info.wallpaper_type, WallpaperType::Scene);
+        assert!(info.file_path.ends_with("preview.gif"),
+            "file_path must resolve to wallpaper dir preview, got: {}", info.file_path);
         Ok(())
     }
 
