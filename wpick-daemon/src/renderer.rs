@@ -529,14 +529,19 @@ struct StaticDecoder {
 impl StaticDecoder {
     fn try_open(path: &str, target_w: u32, target_h: u32) -> Option<Self> {
         let img = image::open(path).ok()?;
-        let img = img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Lanczos3);
-        // Convert to BGRA8 (what wl_shm expects).
-        let rgba = img.to_rgba8();
-        let mut bgra = rgba.into_raw();
+        // Scale to fit within target dimensions, preserving aspect ratio (letterbox/pillarbox).
+        // resize_to_fill crops to fill which makes images look zoomed-in; resize keeps the
+        // full image visible, black-padding any leftover area.
+        let img = img.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
+        let mut bg = image::RgbaImage::new(target_w, target_h);
+        // Fill background with opaque black.
+        for px in bg.pixels_mut() { *px = image::Rgba([0, 0, 0, 255]); }
+        let x = (target_w.saturating_sub(img.width()))  / 2;
+        let y = (target_h.saturating_sub(img.height())) / 2;
+        image::imageops::overlay(&mut bg, &img.to_rgba8(), x as i64, y as i64);
+        let mut bgra = bg.into_raw();
         // RGBA → BGRA: swap R and B channels in place.
-        for px in bgra.chunks_exact_mut(4) {
-            px.swap(0, 2);
-        }
+        for px in bgra.chunks_exact_mut(4) { px.swap(0, 2); }
         Some(Self { data: bgra, w: target_w, h: target_h })
     }
 
@@ -1246,7 +1251,7 @@ fn is_static_image(path: &str) -> bool {
     let lower = path.to_lowercase();
     matches!(
         std::path::Path::new(&lower).extension().and_then(|e| e.to_str()),
-        Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif" | "gif")
+        Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif")
     )
 }
 

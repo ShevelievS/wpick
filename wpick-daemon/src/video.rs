@@ -14,6 +14,13 @@ pub struct VideoDecoder {
     fps:              f64,
     /// Set to true once we've sent a flush (null) packet so we stop reading.
     eof_sent:         bool,
+    // Letterbox geometry: scaler outputs scaled_w×scaled_h, centered in target_w×target_h.
+    target_w:  u32,
+    target_h:  u32,
+    scaled_w:  u32,
+    scaled_h:  u32,
+    offset_x:  u32,
+    offset_y:  u32,
 }
 
 impl VideoDecoder {
@@ -54,15 +61,22 @@ impl VideoDecoder {
             v.max(1.0)
         };
 
-        // Scaler: source native format → BGRA at screen dimensions.
-        // One SIMD pass replaces the former (RGBA + manual scale-in-renderer).
+        // Scale-to-fit: preserve aspect ratio, letterbox/pillarbox with black.
+        let src_w = decoder.width()  as f64;
+        let src_h = decoder.height() as f64;
+        let scale = (target_w as f64 / src_w).min(target_h as f64 / src_h);
+        let scaled_w = ((src_w * scale).round() as u32).max(1);
+        let scaled_h = ((src_h * scale).round() as u32).max(1);
+        let offset_x = (target_w.saturating_sub(scaled_w)) / 2;
+        let offset_y = (target_h.saturating_sub(scaled_h)) / 2;
+
         let scaler = ffmpeg::software::scaling::context::Context::get(
             decoder.format(),
             decoder.width(),
             decoder.height(),
             Pixel::BGRA,
-            target_w,
-            target_h,
+            scaled_w,
+            scaled_h,
             Flags::LANCZOS,
         )
         .context("Failed to create scaler context")?;
@@ -74,6 +88,12 @@ impl VideoDecoder {
             scaler,
             fps,
             eof_sent: false,
+            target_w,
+            target_h,
+            scaled_w,
+            scaled_h,
+            offset_x,
+            offset_y,
         })
     }
 
@@ -102,39 +122,38 @@ impl VideoDecoder {
                 let row_bytes = width * 4;
                 let needed    = row_bytes * height;
 
-                if dst.len() < needed {
-                    tracing::warn!("dst too small: {} < {} — skipping frame", dst.len(), needed);
+                if src.len() < needed {
+                    tracing::warn!(
+                        "Corrupt frame: src.len()={} < needed={}, skipping",
+                        src.len(), needed
+                    );
                     continue;
                 }
 
-                if stride == row_bytes {
-                    if src.len() < needed {
+                let full = (self.target_w * self.target_h * 4) as usize;
+                if dst.len() < full {
+                    tracing::warn!("dst too small: {} < {} — skipping frame", dst.len(), full);
+                    continue;
+                }
+
+                // Letterbox: clear to black, then blit scaled frame to center.
+                dst[..full].fill(0);
+                let dst_stride = self.target_w as usize * 4;
+                for row in 0..height {
+                    let src_start = row * stride;
+                    let src_end   = src_start + row_bytes;
+                    if src_end > src.len() {
                         tracing::warn!(
-                            "Corrupt frame: src.len()={} < needed={}, skipping",
-                            src.len(), needed
+                            "Corrupt frame row {}: stride={} src.len()={}, skipping",
+                            row, stride, src.len()
                         );
-                        continue;
+                        break;
                     }
-                    dst[..needed].copy_from_slice(&src[..needed]);
-                } else {
-                    // ffmpeg added per-row padding — strip it
-                    let mut corrupt = false;
-                    for row in 0..height {
-                        let src_start = row * stride;
-                        let src_end   = src_start + row_bytes;
-                        if src_end > src.len() {
-                            tracing::warn!(
-                                "Corrupt frame row {}: stride={} src.len()={}, skipping",
-                                row, stride, src.len()
-                            );
-                            corrupt = true;
-                            break;
-                        }
-                        let dst_start = row * row_bytes;
-                        dst[dst_start..dst_start + row_bytes]
-                            .copy_from_slice(&src[src_start..src_end]);
-                    }
-                    if corrupt { continue; }
+                    let dst_row = self.offset_y as usize + row;
+                    let dst_col = self.offset_x as usize;
+                    let dst_start = dst_row * dst_stride + dst_col * 4;
+                    dst[dst_start..dst_start + row_bytes]
+                        .copy_from_slice(&src[src_start..src_end]);
                 }
 
                 return Ok(true);
