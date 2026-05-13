@@ -614,6 +614,7 @@ fn make_output_surface(
     (wl, ls)
 }
 
+#[allow(dead_code)]
 fn nudge_surface(ctx: &mut RendererCtx, i: usize) {
     let ev_idx = ctx.surfaces[i].ev_idx;
     ctx.surfaces[i].layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);

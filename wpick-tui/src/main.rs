@@ -8,7 +8,6 @@ use client::IpcClient;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use wpick_core::config::{AppDirs, WpickConfig};
 use wpick_core::ipc::{ClientCommand, DaemonResponse};
-use clap::CommandFactory;
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -94,13 +93,13 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
             return Err(anyhow::anyhow!("Failed to exec wpick-daemon: {err}"));
         }
         Commands::Completions { shell } => {
-            let mut cmd = Cli::command();
+            let mut cmd = <Cli as clap::CommandFactory>::command();
             let name = cmd.get_name().to_string();
             clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
             return Ok(());
         }
         Commands::Man => {
-            let cmd = Cli::command();
+            let cmd = <Cli as clap::CommandFactory>::command();
             clap_mangen::Man::new(cmd).render(&mut std::io::stdout())?;
             return Ok(());
         }
@@ -207,9 +206,7 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
             println!("\u{2713} Daemon killed");
         }
 
-        Commands::Tui | Commands::Daemon | Commands::Completions { .. } | Commands::Man => {
-            unreachable!("handled above")
-        }
+        _ => unreachable!("handled above"),
     }
 
     Ok(())
