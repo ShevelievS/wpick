@@ -529,6 +529,13 @@ struct StaticDecoder {
 impl StaticDecoder {
     fn try_open(path: &str, target_w: u32, target_h: u32) -> Option<Self> {
         let img = image::open(path).ok()?;
+        // Exact match: no scaling needed, just convert pixel format.
+        if img.width() == target_w && img.height() == target_h {
+            let rgba = img.to_rgba8();
+            let mut bgra = rgba.into_raw();
+            for px in bgra.chunks_exact_mut(4) { px.swap(0, 2); }
+            return Some(Self { data: bgra, w: target_w, h: target_h });
+        }
         // Scale to fit within target dimensions, preserving aspect ratio (letterbox/pillarbox).
         // resize_to_fill crops to fill which makes images look zoomed-in; resize keeps the
         // full image visible, black-padding any leftover area.
@@ -802,7 +809,7 @@ pub async fn run(
     cache:               Arc<tokio::sync::Mutex<Cache>>,
     on_fullscreen_exit:  Option<Arc<dyn Fn() + Send + Sync>>,
     mut per_monitor_rx:  watch::Receiver<HashMap<String, Option<WallpaperInfo>>>,
-    outputs_out:         Arc<std::sync::Mutex<Vec<String>>>,
+    outputs_out:         Arc<std::sync::Mutex<Vec<(String, u32, u32)>>>,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
     let mut init_failures = 0u32;
@@ -832,9 +839,11 @@ pub async fn run(
             }
         };
 
-        // Publish connected output names so IPC can serve ListOutputs.
+        // Publish connected output names and resolutions so IPC can serve ListOutputs.
         if let Ok(mut g) = outputs_out.lock() {
-            *g = ctx.surfaces.iter().map(|s| s.output_name.clone()).collect();
+            *g = ctx.surfaces.iter()
+                .map(|s| (s.output_name.clone(), s.surf_w, s.surf_h))
+                .collect();
         }
 
         let (wp_tx, wp_rx) = std::sync::mpsc::channel::<Option<WallpaperInfo>>();

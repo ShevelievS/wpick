@@ -17,8 +17,8 @@ pub struct DaemonState {
     /// Per-monitor wallpaper overrides — `None` in the map value means "unpin".
     /// Renderer subscribes via `per_monitor_rx` and updates surface decoders.
     pub per_monitor_tx:  watch::Sender<HashMap<String, Option<WallpaperInfo>>>,
-    /// Connected wl_output names published by the renderer after each init.
-    pub outputs:         Arc<Mutex<Vec<String>>>,
+    /// Connected wl_output names and resolutions published by the renderer after each init.
+    pub outputs:         Arc<Mutex<Vec<(String, u32, u32)>>>,
     /// Running wpick-webview child processes (one per active web wallpaper).
     /// Killed when a new wallpaper is set or the daemon exits.
     pub webview_children: Arc<Mutex<Vec<std::process::Child>>>,

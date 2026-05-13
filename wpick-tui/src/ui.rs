@@ -350,6 +350,29 @@ fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     let mut lines = vec![title_line, meta_line];
 
+    // Row 3: resolution (if known)
+    if w.width > 0 && w.height > 0 {
+        let res_text = format!("{}×{}", w.width, w.height);
+        let screen_res = app.screen_resolution_for_wallpaper(w);
+        match screen_res {
+            Some((sw, sh)) if sw > 0 && sh > 0 && (sw != w.width || sh != w.height) => {
+                // Resolution mismatch warning
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("\u{26a0} {}  \u{2260}  screen {}×{}", res_text, sw, sh),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            }
+            _ => {
+                lines.push(Line::from(Span::styled(
+                    res_text,
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+        }
+    }
+
     if !w.is_supported() {
         lines.push(Line::from(Span::styled(
             "\u{26a0} scene/web not yet supported",
@@ -438,7 +461,7 @@ fn render_monitor_overlay(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut items: Vec<ListItem> = Vec::with_capacity(item_count);
     items.push(ListItem::new("  All monitors"));
-    for name in &app.monitors {
+    for (name, _, _) in &app.monitors {
         items.push(ListItem::new(format!("  {}", name)));
     }
 

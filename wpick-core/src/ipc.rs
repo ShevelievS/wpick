@@ -57,7 +57,11 @@ pub enum DaemonResponse {
     /// `done` wallpapers have been processed out of `total` discovered.
     ScanProgress { done: usize, total: usize },
     /// Response to `ListOutputs` — the wl_output names currently connected.
-    OutputList { names: Vec<String> },
+    OutputList {
+        names: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resolutions: Vec<(u32, u32)>,
+    },
 }
 
 // ─── Send / Receive helpers ───────────────────────────────────────────────────
@@ -187,6 +191,8 @@ mod tests {
             preview_path:    None,
             has_audio:       false,
             file_size_bytes: 0,
+            width:           0,
+            height:          0,
         };
 
         // Every variant must be present — if a new variant is added without
@@ -199,7 +205,7 @@ mod tests {
             DaemonResponse::VolumeState { volume: 0.75, muted: false, current_id: None },
             DaemonResponse::VolumeState { volume: 0.5,  muted: true,  current_id: Some(99) },
             DaemonResponse::ScanProgress { done: 5, total: 100 },
-            DaemonResponse::OutputList { names: vec!["DP-1".into(), "HDMI-A-1".into()] },
+            DaemonResponse::OutputList { names: vec!["DP-1".into(), "HDMI-A-1".into()], resolutions: vec![(1920, 1080), (2560, 1440)] },
         ];
 
         for resp in &responses {

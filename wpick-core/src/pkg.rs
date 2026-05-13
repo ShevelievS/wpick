@@ -183,6 +183,8 @@ fn build_wallpaper_info(
                 preview_path,
                 has_audio:      project.sound_enabled,
                 file_size_bytes,
+                width:          0,
+                height:         0,
             }))
         }
 
@@ -196,6 +198,7 @@ fn build_wallpaper_info(
             let preview_pb = Path::new(&preview_file);
             if !preview_pb.exists() { return Ok(None); }
             let file_size_bytes = std::fs::metadata(preview_pb).map(|m| m.len()).unwrap_or(0);
+            let (width, height) = image::image_dimensions(preview_pb).unwrap_or((0, 0));
             Ok(Some(WallpaperInfo {
                 id,
                 title:          project.title,
@@ -204,6 +207,8 @@ fn build_wallpaper_info(
                 preview_path:   Some(preview_file),
                 has_audio:      false,
                 file_size_bytes,
+                width,
+                height,
             }))
         }
 
@@ -225,6 +230,8 @@ fn build_wallpaper_info(
                 preview_path,
                 has_audio:      false,
                 file_size_bytes,
+                width:          0,
+                height:         0,
             }))
         }
     }

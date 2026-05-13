@@ -37,6 +37,12 @@ pub struct WallpaperInfo {
     pub has_audio: bool,
     /// File size of the primary asset in bytes
     pub file_size_bytes: u64,
+    /// Width of the primary asset in pixels (0 if unknown)
+    #[serde(default)]
+    pub width:  u32,
+    /// Height of the primary asset in pixels (0 if unknown)
+    #[serde(default)]
+    pub height: u32,
 }
 
 impl WallpaperInfo {

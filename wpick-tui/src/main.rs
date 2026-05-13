@@ -189,11 +189,17 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
 
         Commands::Outputs => {
             match client.send(&ClientCommand::ListOutputs).await? {
-                DaemonResponse::OutputList { names } if names.is_empty() => {
+                DaemonResponse::OutputList { names, .. } if names.is_empty() => {
                     println!("No monitors reported (daemon may still be initializing)");
                 }
-                DaemonResponse::OutputList { names } => {
-                    for name in &names {
+                DaemonResponse::OutputList { names, resolutions } => {
+                    for (i, name) in names.iter().enumerate() {
+                        if let Some(&(w, h)) = resolutions.get(i) {
+                            if w > 0 && h > 0 {
+                                println!("{} ({}x{})", name, w, h);
+                                continue;
+                            }
+                        }
                         println!("{}", name);
                     }
                 }

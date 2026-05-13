@@ -52,8 +52,8 @@ pub struct App {
     pub preview:                 Option<StatefulProtocol>,
     pub preview_id:              Option<u64>,
     // Monitor selector
-    /// Connected wl_output names fetched from the daemon.
-    pub monitors:                Vec<String>,
+    /// Connected wl_output names and resolutions fetched from the daemon.
+    pub monitors:                Vec<(String, u32, u32)>,
     /// Whether the monitor-picker overlay is open.
     pub monitor_select_mode:     bool,
     /// Cursor inside the monitor picker (0 = "All monitors").
@@ -364,7 +364,7 @@ impl App {
         let monitor = if self.monitor_selected == 0 {
             None
         } else {
-            self.monitors.get(self.monitor_selected - 1).cloned()
+            self.monitors.get(self.monitor_selected - 1).map(|(n, _, _)| n.clone())
         };
         let label = monitor.clone()
             .map(|n| format!("\u{2713} Applied to {}", n))
@@ -576,11 +576,22 @@ impl App {
     /// Query the daemon for the list of connected monitors.
     pub async fn refresh_monitors(&mut self) {
         match self.send(ClientCommand::ListOutputs).await {
-            Ok(DaemonResponse::OutputList { names }) => {
-                self.monitors = names;
+            Ok(DaemonResponse::OutputList { names, resolutions }) => {
+                self.monitors = names.into_iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let (w, h) = resolutions.get(i).copied().unwrap_or((0, 0));
+                        (name, w, h)
+                    })
+                    .collect();
             }
             _ => {}
         }
+    }
+
+    /// Returns the resolution of the first connected monitor, if known.
+    pub fn screen_resolution_for_wallpaper(&self, _info: &WallpaperInfo) -> Option<(u32, u32)> {
+        self.monitors.first().map(|(_, w, h)| (*w, *h))
     }
 
     /// Query the daemon for current volume/muted/wallpaper and update local state.
@@ -646,6 +657,8 @@ mod tests {
             preview_path:    preview_path.map(String::from),
             has_audio:       false,
             file_size_bytes: 1024,
+            width:           0,
+            height:          0,
         }
     }
 

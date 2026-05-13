@@ -144,8 +144,10 @@ async fn dispatch(
 
         ClientCommand::ListOutputs => {
             let outputs_arc = state.lock().await.outputs.clone();
-            let names = outputs_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            DaemonResponse::OutputList { names }
+            let outputs = outputs_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let names       = outputs.iter().map(|(n, _, _)| n.clone()).collect();
+            let resolutions = outputs.iter().map(|(_, w, h)| (*w, *h)).collect();
+            DaemonResponse::OutputList { names, resolutions }
         }
 
         ClientCommand::Volume { level } => {

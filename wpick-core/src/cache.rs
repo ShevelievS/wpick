@@ -18,7 +18,9 @@ const SCHEMA_SQL: &str = "
         preview_path     TEXT,
         has_audio        INTEGER NOT NULL DEFAULT 0,
         file_size_bytes  INTEGER NOT NULL DEFAULT 0,
-        pkg_mtime_secs   INTEGER NOT NULL
+        pkg_mtime_secs   INTEGER NOT NULL,
+        width            INTEGER NOT NULL DEFAULT 0,
+        height           INTEGER NOT NULL DEFAULT 0
     ) STRICT;
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
@@ -37,6 +39,16 @@ impl Cache {
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
+        // Migrate existing DBs that predate the width/height columns.
+        // "duplicate column name" errors are ignored — the column already exists.
+        conn.execute(
+            "ALTER TABLE wallpapers ADD COLUMN width INTEGER NOT NULL DEFAULT 0",
+            [],
+        ).ok();
+        conn.execute(
+            "ALTER TABLE wallpapers ADD COLUMN height INTEGER NOT NULL DEFAULT 0",
+            [],
+        ).ok();
         Ok(Self { conn })
     }
 
@@ -44,7 +56,7 @@ impl Cache {
     pub fn get_all(&self) -> Result<Vec<WallpaperInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, wallpaper_type, file_path, preview_path, \
-             has_audio, file_size_bytes FROM wallpapers ORDER BY title ASC",
+             has_audio, file_size_bytes, width, height FROM wallpapers ORDER BY title ASC",
         )?;
         let rows = stmt.query_map([], row_to_info)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -54,7 +66,7 @@ impl Cache {
     pub fn get_by_id(&self, id: u64) -> Result<Option<WallpaperInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, wallpaper_type, file_path, preview_path, \
-             has_audio, file_size_bytes FROM wallpapers WHERE id = ?1",
+             has_audio, file_size_bytes, width, height FROM wallpapers WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id as i64], row_to_info)?;
         match rows.next() {
@@ -68,8 +80,8 @@ impl Cache {
         self.conn.execute(
             "INSERT OR REPLACE INTO wallpapers \
              (id, title, wallpaper_type, file_path, preview_path, \
-              has_audio, file_size_bytes, pkg_mtime_secs) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+              has_audio, file_size_bytes, pkg_mtime_secs, width, height) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 info.id as i64,
                 info.title,
@@ -79,6 +91,8 @@ impl Cache {
                 info.has_audio,
                 info.file_size_bytes as i64,
                 pkg_mtime_secs as i64,
+                info.width as i64,
+                info.height as i64,
             ],
         )?;
         Ok(())
@@ -161,6 +175,8 @@ fn row_to_info(row: &rusqlite::Row) -> rusqlite::Result<WallpaperInfo> {
         preview_path:    row.get(4)?,
         has_audio:       row.get(5)?,
         file_size_bytes: row.get::<_, i64>(6)? as u64,
+        width:           row.get::<_, i64>(7)? as u32,
+        height:          row.get::<_, i64>(8)? as u32,
     })
 }
 
@@ -181,6 +197,8 @@ mod tests {
             preview_path:    None,
             has_audio:       false,
             file_size_bytes: 1024,
+            width:           0,
+            height:          0,
         }
     }
 

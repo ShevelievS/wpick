@@ -166,8 +166,8 @@ async fn main() -> anyhow::Result<()> {
     let (per_monitor_tx, per_monitor_rx) =
         sync::watch::channel(std::collections::HashMap::<String, Option<WallpaperInfo>>::new());
     // Shared output list published by the renderer and read by the IPC server.
-    let outputs: Arc<std::sync::Mutex<Vec<String>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outputs: Arc<std::sync::Mutex<Vec<(String, u32, u32)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::<(String, u32, u32)>::new()));
     let outputs_renderer = Arc::clone(&outputs);
 
     // 5. DaemonState

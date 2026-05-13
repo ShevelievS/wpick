@@ -14,11 +14,9 @@ pub struct VideoDecoder {
     fps:              f64,
     /// Set to true once we've sent a flush (null) packet so we stop reading.
     eof_sent:         bool,
-    // Letterbox geometry: scaler outputs scaled_w×scaled_h, centered in target_w×target_h.
+    // Letterbox geometry: scaler outputs at fit-scale, centered in target_w×target_h.
     target_w:  u32,
     target_h:  u32,
-    scaled_w:  u32,
-    scaled_h:  u32,
     offset_x:  u32,
     offset_y:  u32,
 }
@@ -90,8 +88,6 @@ impl VideoDecoder {
             eof_sent: false,
             target_w,
             target_h,
-            scaled_w,
-            scaled_h,
             offset_x,
             offset_y,
         })
