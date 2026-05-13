@@ -988,7 +988,10 @@ fn render_loop(
         while let Ok(new_wp) = wp_rx.try_recv() {
             if let Some(ref info) = new_wp {
                 tracing::info!("wallpaper: {}", info.title);
+            } else {
+                tracing::info!("wallpaper cleared — blanking shm surfaces");
             }
+            let clearing = new_wp.is_none();
             current_wp = new_wp.clone();
             for surf in &mut ctx.surfaces {
                 // Surfaces with a per-monitor override ignore global wallpaper changes.
@@ -999,6 +1002,21 @@ fn render_loop(
                     surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h);
                     surf.next_frame = Instant::now();
                 }
+            }
+            // When the wallpaper is cleared (e.g. a web wallpaper was just set),
+            // commit a fully-transparent/black frame on every non-pinned surface so
+            // the wl_shm layer no longer occludes the webview's layer-shell surface.
+            if clearing {
+                for i in 0..ctx.surfaces.len() {
+                    if ctx.surfaces[i].pinned_wp.is_some() { continue; }
+                    if let Some(slot_i) = ctx.surfaces[i].pool.as_ref().and_then(|p| p.free_idx()) {
+                        if let Some(pool) = ctx.surfaces[i].pool.as_mut() {
+                            pool.slots[slot_i].canvas.pixels_mut().fill(0);
+                        }
+                        commit_slot(&mut ctx, i, slot_i);
+                    }
+                }
+                let _ = ctx.evq.flush();
             }
         }
 

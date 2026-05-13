@@ -123,6 +123,9 @@ async fn dispatch(
                 let children_arc = state.lock().await.webview_children.clone();
                 spawn_webview(children_arc, &info.file_path, monitor.as_deref());
                 save_last_wallpaper_id(id);
+                // Clear the wl_shm surface so it no longer occludes the
+                // wpick-webview GTK layer-shell surface on the Background layer.
+                state.lock().await.clear_wallpaper();
                 return DaemonResponse::Ok;
             }
 

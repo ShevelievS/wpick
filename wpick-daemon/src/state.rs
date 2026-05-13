@@ -36,6 +36,14 @@ impl DaemonState {
         let _ = self.wallpaper_tx.send(None);
     }
 
+    /// Clear the current wallpaper and tell the renderer to blank its surface.
+    /// Used when a web wallpaper is set so the wl_shm surface stops occluding
+    /// the wpick-webview GTK layer-shell surface.
+    pub fn clear_wallpaper(&mut self) {
+        self.current = None;
+        let _ = self.wallpaper_tx.send(None);
+    }
+
     /// Apply `info` to one specific monitor without changing the global wallpaper.
     pub fn set_wallpaper_for_monitor(&mut self, monitor: String, info: WallpaperInfo) {
         let mut pins = self.per_monitor_tx.borrow().clone();
