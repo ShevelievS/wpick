@@ -19,6 +19,9 @@ pub struct DaemonState {
     pub per_monitor_tx:  watch::Sender<HashMap<String, Option<WallpaperInfo>>>,
     /// Connected wl_output names published by the renderer after each init.
     pub outputs:         Arc<Mutex<Vec<String>>>,
+    /// Running wpick-webview child processes (one per active web wallpaper).
+    /// Killed when a new wallpaper is set or the daemon exits.
+    pub webview_children: Arc<Mutex<Vec<std::process::Child>>>,
 }
 
 impl DaemonState {

@@ -27,7 +27,8 @@ build() {
 
 package() {
     cd "$pkgname"
-    install -Dm755 target/release/wpick        "$pkgdir/usr/bin/wpick"
-    install -Dm755 target/release/wpick-daemon "$pkgdir/usr/bin/wpick-daemon"
+    install -Dm755 target/release/wpick          "$pkgdir/usr/bin/wpick"
+    install -Dm755 target/release/wpick-daemon   "$pkgdir/usr/bin/wpick-daemon"
+    install -Dm755 target/release/wpick-webview  "$pkgdir/usr/bin/wpick-webview"
     install -Dm644 LICENSE                     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

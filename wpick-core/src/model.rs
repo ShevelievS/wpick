@@ -50,8 +50,13 @@ impl WallpaperInfo {
         }
     }
 
-    /// Returns `true` only for `Video` wallpapers (the only type supported in MVP).
+    /// Returns `true` when the daemon can render this wallpaper.
+    /// - Video: always supported.
+    /// - Scene/Web: supported when `file_path` is non-empty (preview image/gif present).
     pub fn is_supported(&self) -> bool {
-        matches!(self.wallpaper_type, WallpaperType::Video)
+        match self.wallpaper_type {
+            WallpaperType::Video => true,
+            WallpaperType::Scene | WallpaperType::Web => !self.file_path.is_empty(),
+        }
     }
 }

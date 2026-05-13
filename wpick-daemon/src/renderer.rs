@@ -515,22 +515,72 @@ impl ShmPool {
     }
 }
 
+// ─── StaticDecoder ────────────────────────────────────────────────────────────
+
+/// Single-frame decoder for static images (JPEG, PNG, WebP, etc.).
+/// Decodes once at construction; `next_frame_bgra` copies the same data every call.
+/// Used for Scene / Web wallpapers whose preview is a static image.
+struct StaticDecoder {
+    data: Vec<u8>,
+    w:    u32,
+    h:    u32,
+}
+
+impl StaticDecoder {
+    fn try_open(path: &str, target_w: u32, target_h: u32) -> Option<Self> {
+        let img = image::open(path).ok()?;
+        let img = img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Lanczos3);
+        // Convert to BGRA8 (what wl_shm expects).
+        let rgba = img.to_rgba8();
+        let mut bgra = rgba.into_raw();
+        // RGBA → BGRA: swap R and B channels in place.
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        Some(Self { data: bgra, w: target_w, h: target_h })
+    }
+
+    fn next_frame_bgra(&mut self, dst: &mut [u8]) -> anyhow::Result<bool> {
+        if dst.len() < self.data.len() {
+            anyhow::bail!("StaticDecoder: dst too small ({} < {})", dst.len(), self.data.len());
+        }
+        dst[..self.data.len()].copy_from_slice(&self.data);
+        Ok(true)
+    }
+
+    fn frame_duration(&self) -> Duration {
+        // Refresh once per second — no animation, saves CPU.
+        Duration::from_secs(1)
+    }
+
+    fn dimensions(&self) -> (u32, u32) { (self.w, self.h) }
+}
+
 // ─── AnyDecoder ──────────────────────────────────────────────────────────────
 
-enum AnyDecoder { Hw(HwDecoder), Sw(VideoDecoder) }
+enum AnyDecoder { Hw(HwDecoder), Sw(VideoDecoder), Static(StaticDecoder) }
 
 impl AnyDecoder {
     fn next_frame_bgra(&mut self, dst: &mut [u8]) -> anyhow::Result<bool> {
         match self {
-            AnyDecoder::Hw(d) => d.next_frame_bgra(dst),
-            AnyDecoder::Sw(d) => d.next_frame_bgra(dst),
+            AnyDecoder::Hw(d)     => d.next_frame_bgra(dst),
+            AnyDecoder::Sw(d)     => d.next_frame_bgra(dst),
+            AnyDecoder::Static(d) => d.next_frame_bgra(dst),
         }
     }
     fn seek_to_start(&mut self) -> anyhow::Result<()> {
-        match self { AnyDecoder::Hw(d) => d.seek_to_start(), AnyDecoder::Sw(d) => d.seek_to_start() }
+        match self {
+            AnyDecoder::Hw(d)     => d.seek_to_start(),
+            AnyDecoder::Sw(d)     => d.seek_to_start(),
+            AnyDecoder::Static(_) => Ok(()), // nothing to seek
+        }
     }
     fn frame_duration(&self) -> Duration {
-        match self { AnyDecoder::Hw(d) => d.frame_duration(), AnyDecoder::Sw(d) => d.frame_duration() }
+        match self {
+            AnyDecoder::Hw(d)     => d.frame_duration(),
+            AnyDecoder::Sw(d)     => d.frame_duration(),
+            AnyDecoder::Static(d) => d.frame_duration(),
+        }
     }
     fn is_hw(&self) -> bool { matches!(self, AnyDecoder::Hw(_)) }
 }
@@ -1173,7 +1223,32 @@ fn process_surface(
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Detect whether a file path is a static image (not a video or animated GIF).
+fn is_static_image(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    matches!(
+        std::path::Path::new(&lower).extension().and_then(|e| e.to_str()),
+        Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif")
+    )
+}
+
 fn open_decoder(info: &WallpaperInfo, target_w: u32, target_h: u32) -> Option<AnyDecoder> {
+    // Static images (JPEG/PNG/WebP/…) go through the image crate; no ffmpeg needed.
+    // GIFs and videos (including animated preview GIFs for Scene wallpapers) go
+    // through the existing hw/sw video pipeline — ffmpeg handles GIF natively.
+    if is_static_image(&info.file_path) {
+        match StaticDecoder::try_open(&info.file_path, target_w, target_h) {
+            Some(d) => {
+                tracing::info!("static image {}x{}", d.dimensions().0, d.dimensions().1);
+                return Some(AnyDecoder::Static(d));
+            }
+            None => {
+                tracing::warn!("static image decode failed: {}", info.file_path);
+                return None;
+            }
+        }
+    }
+
     if let Some(hw) = HwDecoder::try_open(&info.file_path, target_w, target_h) {
         tracing::info!(
             "hw decode (va-api) {}x{} → {}x{} bgra",
