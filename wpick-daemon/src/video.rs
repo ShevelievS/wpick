@@ -63,7 +63,7 @@ impl VideoDecoder {
             Pixel::BGRA,
             target_w,
             target_h,
-            Flags::BILINEAR,
+            Flags::LANCZOS,
         )
         .context("Failed to create scaler context")?;
 

@@ -1228,7 +1228,7 @@ fn is_static_image(path: &str) -> bool {
     let lower = path.to_lowercase();
     matches!(
         std::path::Path::new(&lower).extension().and_then(|e| e.to_str()),
-        Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif")
+        Some("jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "tif" | "gif")
     )
 }
 
