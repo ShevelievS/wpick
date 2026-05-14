@@ -30,10 +30,6 @@ pub enum WpickError {
     #[error("VDF parse error in {path}: {reason}")]
     VdfParse { path: String, reason: String },
 
-    /// depkg / manual PKG extraction failed for a specific wallpaper id
-    #[error("PKG extract error: id={id}, reason={reason}")]
-    PkgExtract { id: u64, reason: String },
-
     /// IPC connection was closed cleanly by the remote side
     #[error("IPC connection closed")]
     IpcClosed,

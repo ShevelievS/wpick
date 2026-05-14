@@ -24,12 +24,6 @@ impl DaemonState {
         let _ = self.wallpaper_tx.send(Some(info));
     }
 
-    #[allow(dead_code)]
-    pub fn stop(&mut self) {
-        self.current = None;
-        let _ = self.wallpaper_tx.send(None);
-    }
-
     pub fn set_fit(&mut self, monitor: Option<String>, fit: FitMode) {
         let key = monitor.unwrap_or_else(|| "*".to_owned());
         let _ = self.fit_tx.send((key, fit));

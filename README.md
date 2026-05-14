@@ -4,7 +4,7 @@
 > No Wine, no `linux-wallpaperengine`, no DRM hacks — pure Rust.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
 
 wpick plays Wallpaper Engine video wallpapers directly on `wlr-layer-shell`
 background surfaces, with streaming audio, PulseAudio ducking,
@@ -24,16 +24,19 @@ your Steam Workshop library.
 | PulseAudio ducking (fade on foreign audio) | ✅ |
 | Volume / mute control | ✅ |
 | Multi-monitor support | ✅ |
+| Per-monitor wallpaper & fit mode | ✅ |
+| Fit modes: Fit / Fill / Stretch / Center | ✅ |
 | Fullscreen auto-pause (Hyprland) | ✅ |
 | Competitor tool handling (SIGSTOP / SIGKILL) | ✅ |
+| Wallpaper persist on restart | ✅ |
 | TUI — browse, search, filter, image preview | ✅ |
+| TUI source filter (Workshop / Local folders) | ✅ |
+| Custom video folders (`extra_dirs`) | ✅ |
 | CLI one-shot commands | ✅ |
 | SQLite metadata cache | ✅ |
-| Per-monitor config | ✅ |
+| Systemd user service | ✅ |
 | Scene wallpapers | ❌ planned |
 | Web wallpapers | ❌ planned |
-| Wallpaper persist on restart | ❌ planned |
-| Systemd user service | ❌ planned |
 | Shell completions / man pages | ❌ planned |
 
 **Compositor requirements:** `wlr-layer-shell` (Hyprland, Sway, river, niri).  
@@ -67,11 +70,25 @@ dnf install ffmpeg-devel libpulse-devel wayland-devel
 git clone https://github.com/ShevelievS/wpick
 cd wpick
 cargo build --workspace --release
-sudo install -Dm755 target/release/wpick        /usr/local/bin/wpick
-sudo install -Dm755 target/release/wpick-daemon /usr/local/bin/wpick-daemon
+install -Dm755 target/release/wpick        ~/.local/bin/wpick
+install -Dm755 target/release/wpick-daemon ~/.local/bin/wpick-daemon
 ```
 
+Make sure `~/.local/bin` is in your `PATH`.
+
 `wpick-daemon` must be in `PATH` — `wpick` auto-starts it on first run.
+
+### Autostart with systemd (recommended)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp dist/systemd/wpick-daemon.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now wpick-daemon
+```
+
+Check status: `systemctl --user status wpick-daemon`  
+View logs:    `journalctl --user -u wpick-daemon -f`
 
 ---
 
@@ -88,7 +105,7 @@ wpick volume 60         # set volume to 60 %
 wpick mute              # toggle mute
 wpick info 1234567890   # show wallpaper details
 wpick status            # show current wallpaper, volume, mute state
-wpick scan              # rescan Steam Workshop dirs
+wpick scan              # rescan Workshop dirs and extra_dirs
 wpick kill              # stop daemon
 ```
 
@@ -112,7 +129,9 @@ wpick
 | `m` | Toggle mute |
 | `r` | Rescan library |
 | `/` | Live search |
-| `Tab` | Cycle type filter (All → Video → Scene → Web) |
+| `Tab` | Cycle source filter (All → Workshop → Local folders) |
+| `f` | Cycle fit mode (Fit → Fill → Stretch → Center) |
+| `s` | Open folder picker — add/remove custom video folders |
 | `i` | Toggle detail / full-screen view |
 | `q` | Quit TUI (daemon keeps running) |
 | `Q` / `Ctrl-C` | Quit TUI **and** kill daemon |
@@ -142,11 +161,34 @@ on_fullscreen = true      # pause when a fullscreen window is detected (Hyprland
 on_battery    = false     # not yet implemented
 on_lid_close  = false     # not yet implemented
 
+[paths]
+# Extra directories scanned for local video files (mp4, webm, mkv, avi, mov, …)
+extra_dirs = [
+    "/home/user/Videos/wallpapers",
+    "/mnt/nas/wallpapers",
+]
+
 # Per-monitor wallpaper (key = wl_output name, e.g. "eDP-1", "HDMI-A-1")
 [monitors."eDP-1"]
 wallpaper_id = 1234567890
-fit          = "stretch"  # stretch | fit | fill | center
+fit          = "fill"     # fit | fill | stretch | center
 ```
+
+### Fit modes
+
+| Mode | Description |
+|------|-------------|
+| `fit` | Scale to fit inside screen — letterbox/pillarbox borders |
+| `fill` | Scale to fill screen — center-crops overflow |
+| `stretch` | Stretch to fill — ignores aspect ratio |
+| `center` | No scaling — 1:1 pixels, centered, black borders if smaller |
+
+### Custom video folders
+
+Add any directory to `[paths] extra_dirs` in the config, or use the TUI folder
+picker (`s` key) to browse the filesystem and add/remove directories interactively.
+Local files are assigned stable IDs based on their path and appear in the TUI
+under their folder name in the source filter (`Tab`).
 
 ### Competing wallpaper tools
 
@@ -196,7 +238,7 @@ workspace also triggers the correct pause/resume.
 ## Development
 
 ```bash
-cargo test   --workspace          # 64 tests, 0 failures expected
+cargo test   --workspace          # ~70 tests, 0 failures expected
 cargo clippy --workspace -- -D warnings
 cargo build  --workspace --release
 ```

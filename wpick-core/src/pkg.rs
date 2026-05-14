@@ -3,7 +3,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::discovery::WallpaperDir;
-use crate::error::{Result, WpickError};
+use crate::error::Result;
 use crate::model::{WallpaperInfo, WallpaperSource, WallpaperType};
 
 // ─── project.json schema ─────────────────────────────────────────────────────
@@ -25,119 +25,6 @@ pub struct ProjectJson {
 fn default_sound_enabled() -> bool { true }
 fn default_volume() -> f32 {
     1.0
-}
-
-// ─── PKG extraction fallback ─────────────────────────────────────────────────
-
-/// Minimal PKG extractor for PKGV0001 / PKGV0005 format.
-///
-/// Not used by the main code path (scene.pkg uses a different proprietary binary
-/// format), but retained for potential future use.
-#[allow(dead_code)]
-fn extract_pkg(pkg_path: &Path, out_dir: &Path) -> Result<()> {
-    let data = std::fs::read(pkg_path)?;
-
-    if data.len() < 8 {
-        return Err(WpickError::PkgExtract {
-            id:     0,
-            reason: "File too small to be a valid PKG".into(),
-        });
-    }
-
-    let magic = &data[0..8];
-    if magic != b"PKGV0001" && magic != b"PKGV0005" {
-        return Err(WpickError::PkgExtract {
-            id:     0,
-            reason: format!("Unknown magic: {}", magic.iter().map(|b| format!("{b:02x}")).collect::<String>()),
-        });
-    }
-
-    if data.len() < 12 {
-        return Err(WpickError::PkgExtract {
-            id:     0,
-            reason: "Truncated PKG header".into(),
-        });
-    }
-
-    let mut pos = 8usize;
-    let file_count = u32::from_le_bytes(
-        data[pos..pos + 4]
-            .try_into()
-            .map_err(|_| WpickError::PkgExtract { id: 0, reason: "Bad file count bytes".into() })?,
-    ) as usize;
-    pos += 4;
-
-    if file_count > 65_536 {
-        return Err(WpickError::PkgExtract {
-            id:     0,
-            reason: format!("Implausible file_count={file_count} — refusing to process"),
-        });
-    }
-
-    for _ in 0..file_count {
-        if pos + 4 > data.len() {
-            return Err(WpickError::PkgExtract { id: 0, reason: "Truncated name length".into() });
-        }
-        let name_len = u32::from_le_bytes(
-            data[pos..pos + 4]
-                .try_into()
-                .map_err(|_| WpickError::PkgExtract { id: 0, reason: "Bad name_len bytes".into() })?,
-        ) as usize;
-        pos += 4;
-
-        if pos + name_len > data.len() {
-            return Err(WpickError::PkgExtract { id: 0, reason: "Truncated filename".into() });
-        }
-        let name = std::str::from_utf8(&data[pos..pos + name_len]).map_err(|e| {
-            WpickError::PkgExtract { id: 0, reason: format!("Non-UTF8 filename: {e}") }
-        })?;
-        pos += name_len;
-
-        if pos + 4 > data.len() {
-            return Err(WpickError::PkgExtract { id: 0, reason: "Truncated data length".into() });
-        }
-        let data_len = u32::from_le_bytes(
-            data[pos..pos + 4]
-                .try_into()
-                .map_err(|_| WpickError::PkgExtract { id: 0, reason: "Bad data_len bytes".into() })?,
-        ) as usize;
-        pos += 4;
-
-        if pos + data_len > data.len() {
-            return Err(WpickError::PkgExtract { id: 0, reason: "Truncated file data".into() });
-        }
-        let file_data = &data[pos..pos + data_len];
-        pos += data_len;
-
-        // Sanitize: strip leading slashes and any ".." components to prevent
-        // path traversal (e.g. "../../.bashrc" in a crafted PKG). (H-6)
-        let safe_name = name
-            .trim_start_matches('/')
-            .split('/')
-            .filter(|c| *c != ".." && !c.is_empty())
-            .collect::<Vec<_>>()
-            .join("/");
-
-        if safe_name.is_empty() {
-            tracing::debug!("PKG: skipping empty/unsafe name {:?}", name);
-            continue;
-        }
-
-        let out_path = out_dir.join(&safe_name);
-        // Final guard: out_path must be inside out_dir
-        if !out_path.starts_with(out_dir) {
-            return Err(WpickError::PkgExtract {
-                id:     0,
-                reason: format!("Path traversal attempt: {name:?}"),
-            });
-        }
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&out_path, file_data)?;
-    }
-
-    Ok(())
 }
 
 // ─── Shared builder ──────────────────────────────────────────────────────────
@@ -204,8 +91,7 @@ pub fn extract_and_parse(
     }
 
     let json_content = std::fs::read_to_string(&project_json_path)?;
-    let project: ProjectJson = serde_json::from_str(&json_content)
-        .map_err(|e| crate::error::WpickError::Io(std::io::Error::other(e)))?;
+    let project: ProjectJson = serde_json::from_str(&json_content)?;
 
     // All assets (video, preview, HTML) live in the original wallpaper directory.
     let base = &wallpaper_dir.path;

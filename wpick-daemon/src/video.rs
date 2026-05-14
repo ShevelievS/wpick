@@ -8,7 +8,6 @@ use ffmpeg_next::software::scaling::flag::Flags;
 
 use wpick_core::config::FitMode;
 
-#[allow(dead_code)]
 pub struct VideoDecoder {
     input_ctx:        ffmpeg::format::context::Input,
     video_stream_idx: usize,
@@ -16,18 +15,10 @@ pub struct VideoDecoder {
     scaler:           ffmpeg::software::scaling::context::Context,
     fps:              f64,
     eof_sent:         bool,
-    #[allow(dead_code)]
-    fit:              FitMode,
     target_w:         u32,
     target_h:         u32,
-    // Blit geometry (filled from fit + source dimensions)
-    blit_w:           u32,
-    blit_h:           u32,
     offset_x:         u32,
     offset_y:         u32,
-    // For Fill/Center: crop source region fed to scaler
-    crop_x:           u32,
-    crop_y:           u32,
 }
 
 impl VideoDecoder {
@@ -73,7 +64,7 @@ impl VideoDecoder {
         let th     = target_h as f64;
 
         // Compute blit/scaler geometry from FitMode.
-        let (blit_w, blit_h, offset_x, offset_y, crop_x, crop_y, scaler_src_w, scaler_src_h) =
+        let (blit_w, blit_h, offset_x, offset_y, scaler_src_w, scaler_src_h) =
             match fit {
                 FitMode::Fit => {
                     // Scale to fit inside target, preserving aspect ratio (letterbox/pillarbox).
@@ -82,40 +73,29 @@ impl VideoDecoder {
                     let blit_h   = ((src_h * scale).round() as u32).max(1);
                     let offset_x = (target_w.saturating_sub(blit_w)) / 2;
                     let offset_y = (target_h.saturating_sub(blit_h)) / 2;
-                    (blit_w, blit_h, offset_x, offset_y, 0u32, 0u32,
+                    (blit_w, blit_h, offset_x, offset_y,
                      decoder.width(), decoder.height())
                 }
                 FitMode::Fill => {
-                    // Scale to fill target, then center-crop overflow.
-                    let scale    = (tw / src_w).max(th / src_h);
-                    let scaled_w = (src_w * scale).round() as u32;
-                    let scaled_h = (src_h * scale).round() as u32;
-                    // Crop region in the *scaled* space — taken from center.
-                    // We implement by cropping *source* pixels before scaling.
-                    // Source crop: map target back to source coordinates.
+                    // Scale to fill target, center-crop source to preserve aspect ratio.
+                    let scale      = (tw / src_w).max(th / src_h);
                     let crop_src_w = (tw / scale).round() as u32;
                     let crop_src_h = (th / scale).round() as u32;
-                    let crop_x = (decoder.width().saturating_sub(crop_src_w)) / 2;
-                    let crop_y = (decoder.height().saturating_sub(crop_src_h)) / 2;
-                    let _ = (scaled_w, scaled_h); // not needed below
-                    (target_w, target_h, 0, 0, crop_x, crop_y,
+                    (target_w, target_h, 0, 0,
                      crop_src_w.max(1), crop_src_h.max(1))
                 }
                 FitMode::Stretch => {
                     // Stretch to fill — no aspect ratio preservation.
-                    (target_w, target_h, 0, 0, 0, 0,
+                    (target_w, target_h, 0, 0,
                      decoder.width(), decoder.height())
                 }
                 FitMode::Center => {
                     // No scaling — 1:1 pixels, centered, black borders if smaller.
-                    let blit_w   = (decoder.width()).min(target_w);
-                    let blit_h   = (decoder.height()).min(target_h);
+                    let blit_w   = decoder.width().min(target_w);
+                    let blit_h   = decoder.height().min(target_h);
                     let offset_x = (target_w.saturating_sub(blit_w)) / 2;
                     let offset_y = (target_h.saturating_sub(blit_h)) / 2;
-                    // If source is larger than target, crop center of source.
-                    let crop_x   = (decoder.width().saturating_sub(blit_w)) / 2;
-                    let crop_y   = (decoder.height().saturating_sub(blit_h)) / 2;
-                    (blit_w, blit_h, offset_x, offset_y, crop_x, crop_y,
+                    (blit_w, blit_h, offset_x, offset_y,
                      blit_w.max(1), blit_h.max(1))
                 }
             };
@@ -138,15 +118,10 @@ impl VideoDecoder {
             scaler,
             fps,
             eof_sent: false,
-            fit,
             target_w,
             target_h,
-            blit_w,
-            blit_h,
             offset_x,
             offset_y,
-            crop_x,
-            crop_y,
         })
     }
 
@@ -239,8 +214,6 @@ impl VideoDecoder {
         (self.decoder.width(), self.decoder.height())
     }
 
-    #[allow(dead_code)]
-    pub fn fit_mode(&self) -> FitMode { self.fit }
 }
 
 #[cfg(test)]

@@ -701,18 +701,6 @@ fn make_output_surface(
     (wl, ls)
 }
 
-#[allow(dead_code)]
-fn nudge_surface(ctx: &mut RendererCtx, i: usize) {
-    let ev_idx = ctx.surfaces[i].ev_idx;
-    ctx.surfaces[i].layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-    ctx.surfaces[i].layer_surface.set_size(0, 0);
-    ctx.surfaces[i].layer_surface.set_exclusive_zone(-1);
-    ctx.surfaces[i].wl_surface.commit();
-    ctx.wls.surf_ev[ev_idx].configured = false;
-    ctx.wls.surf_ev[ev_idx].needs_ack  = false;
-    let _ = ctx.evq.flush();
-}
-
 fn recreate_surface(ctx: &mut RendererCtx, i: usize) {
     let ev_idx  = ctx.surfaces[i].ev_idx;
     let out_idx = ctx.surfaces[i].output_idx;
