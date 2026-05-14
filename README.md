@@ -135,9 +135,13 @@ wpick
 | `i` | Toggle detail / full-screen view |
 | `q` | Quit TUI (daemon keeps running) |
 | `Q` / `Ctrl-C` | Quit TUI **and** kill daemon |
+| `Esc` | Cancel active scan / close overlays |
 
 The right panel shows an image preview of the selected wallpaper.
 Protocol is auto-detected: Kitty graphics → Sixel → halfblocks fallback.
+
+Scans run in the background — the TUI stays responsive. Press `Esc` at any
+time to cancel a running scan.
 
 ---
 
@@ -189,6 +193,19 @@ Add any directory to `[paths] extra_dirs` in the config, or use the TUI folder
 picker (`s` key) to browse the filesystem and add/remove directories interactively.
 Local files are assigned stable IDs based on their path and appear in the TUI
 under their folder name in the source filter (`Tab`).
+
+The folder picker shows a colour-coded badge for each directory:
+
+| Badge | Colour | Meaning |
+|-------|--------|---------|
+| `[V]` | green  | Contains video files directly — good candidate |
+| `[·]` | yellow | No direct videos, but has sub-directories |
+| `[-]` | gray   | Empty |
+| `[?]` | gray   | Permission denied |
+| `[!]` | red    | System path (`/proc`, `/sys`, `/dev`, `/run`) — blocked |
+
+Scan depth is limited to 6 levels, so adding a large directory (e.g. Downloads)
+will not cause a runaway scan.
 
 ### Competing wallpaper tools
 
