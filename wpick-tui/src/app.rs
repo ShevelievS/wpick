@@ -26,6 +26,7 @@ pub enum FilterType {
 pub enum AppMode {
     Browse,
     Detail,
+    FolderPicker,
 }
 
 pub struct App {
@@ -60,6 +61,13 @@ pub struct App {
     pub monitor_select_mode:     bool,
     /// Cursor inside the monitor picker (0 = "All monitors").
     pub monitor_selected:        usize,
+    // ── Folder picker ────────────────────────────────────────────────────────
+    /// Current directory being browsed in the folder picker.
+    pub fp_path:                 std::path::PathBuf,
+    /// Sorted list of subdirectory names in fp_path (first entry is ".." if not root).
+    pub fp_entries:              Vec<String>,
+    /// Selected index inside fp_entries.
+    pub fp_selected:             usize,
 }
 
 impl App {
@@ -90,6 +98,11 @@ impl App {
             monitors:                Vec::new(),
             monitor_select_mode:     false,
             monitor_selected:        0,
+            fp_path:                 std::env::var("HOME")
+                                         .map(std::path::PathBuf::from)
+                                         .unwrap_or_else(|_| std::path::PathBuf::from("/")),
+            fp_entries:              Vec::new(),
+            fp_selected:             0,
         }
     }
 
@@ -232,6 +245,12 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        // ── Folder picker overlay ─────────────────────────────────────────────
+        if self.mode == AppMode::FolderPicker {
+            self.handle_key_folder_picker(key, terminal).await;
+            return;
+        }
+
         // ── Monitor selector overlay ──────────────────────────────────────────
         if self.monitor_select_mode {
             match key.code {
@@ -333,13 +352,17 @@ impl App {
                     self.set_status_error("No monitors reported by daemon (try 'r' to refresh)");
                 }
             }
+            KeyCode::Char('s') => {
+                self.open_folder_picker();
+            }
             KeyCode::Char('f') => {
                 self.cmd_cycle_fit().await;
             }
             KeyCode::Char('i') => {
                 self.mode = match self.mode {
-                    AppMode::Browse => AppMode::Detail,
-                    AppMode::Detail => AppMode::Browse,
+                    AppMode::Browse       => AppMode::Detail,
+                    AppMode::Detail       => AppMode::Browse,
+                    AppMode::FolderPicker => AppMode::Browse,
                 };
             }
             KeyCode::Char('/') => {
@@ -656,6 +679,142 @@ impl App {
     }
 }
 
+// ── Folder picker ─────────────────────────────────────────────────────────────
+
+impl App {
+    /// Open the folder picker starting at home dir (or last browsed path).
+    pub fn open_folder_picker(&mut self) {
+        self.mode = AppMode::FolderPicker;
+        self.load_fp_entries();
+    }
+
+    /// Read subdirectories of `fp_path` into `fp_entries`.
+    pub fn load_fp_entries(&mut self) {
+        let mut entries: Vec<String> = std::fs::read_dir(&self.fp_path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.')) // hide dotfiles by default
+            .collect();
+        entries.sort();
+
+        // Prepend ".." unless we're at root.
+        if self.fp_path.parent().is_some() {
+            entries.insert(0, "..".to_owned());
+        }
+        self.fp_entries = entries;
+        self.fp_selected = self.fp_selected.min(
+            self.fp_entries.len().saturating_sub(1)
+        );
+    }
+
+    async fn handle_key_folder_picker(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) {
+        match key.code {
+            // ── Navigation ──────────────────────────────────────────────────
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.fp_selected > 0 {
+                    self.fp_selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.fp_selected + 1 < self.fp_entries.len() {
+                    self.fp_selected += 1;
+                }
+            }
+
+            // ── Enter directory ─────────────────────────────────────────────
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(name) = self.fp_entries.get(self.fp_selected).cloned() {
+                    let next = if name == ".." {
+                        self.fp_path.parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| self.fp_path.clone())
+                    } else {
+                        self.fp_path.join(&name)
+                    };
+                    self.fp_path  = next;
+                    self.fp_selected = 0;
+                    self.load_fp_entries();
+                }
+            }
+
+            // ── Go up (backspace / left) ─────────────────────────────────────
+            KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(parent) = self.fp_path.parent().map(|p| p.to_path_buf()) {
+                    self.fp_path    = parent;
+                    self.fp_selected = 0;
+                    self.load_fp_entries();
+                }
+            }
+
+            // ── Add current directory ────────────────────────────────────────
+            KeyCode::Char('a') => {
+                self.fp_add_current_dir(terminal).await;
+            }
+
+            // ── Delete selected extra_dir (if in list) ───────────────────────
+            KeyCode::Char('d') | KeyCode::Delete => {
+                let path_str = self.fp_path.to_string_lossy().into_owned();
+                let already  = self.config.paths.extra_dirs.contains(&path_str);
+                if already {
+                    self.fp_remove_dir(&path_str, terminal).await;
+                }
+            }
+
+            // ── Close ────────────────────────────────────────────────────────
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = AppMode::Browse;
+            }
+
+            _ => {}
+        }
+    }
+
+    async fn fp_add_current_dir(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        let path_str = self.fp_path.to_string_lossy().into_owned();
+        if self.config.paths.extra_dirs.contains(&path_str) {
+            self.set_status_error(format!("Already added: {}", path_str));
+            return;
+        }
+
+        self.config.paths.extra_dirs.push(path_str.clone());
+        if let Err(e) = self.config.save() {
+            self.config.paths.extra_dirs.retain(|d| d != &path_str);
+            self.set_status_error(format!("Save failed: {}", e));
+            return;
+        }
+
+        self.set_status_ok(format!("Added: {}", path_str));
+        self.mode = AppMode::Browse;
+        self.refresh_list(terminal).await;
+    }
+
+    async fn fp_remove_dir(
+        &mut self,
+        path_str: &str,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) {
+        self.config.paths.extra_dirs.retain(|d| d != path_str);
+        if let Err(e) = self.config.save() {
+            self.set_status_error(format!("Save failed: {}", e));
+            return;
+        }
+        self.set_status_ok(format!("Removed: {}", path_str));
+        self.refresh_list(terminal).await;
+    }
+
+    /// List of currently configured extra_dirs.
+    pub fn extra_dirs(&self) -> &[String] {
+        &self.config.paths.extra_dirs
+    }
+}
+
 pub fn fit_label(fit: FitMode) -> &'static str {
     match fit {
         FitMode::Fit     => "letterbox",
@@ -702,6 +861,9 @@ mod tests {
             monitors:               Vec::new(),
             monitor_select_mode:    false,
             monitor_selected:       0,
+            fp_path:                std::path::PathBuf::from("/tmp"),
+            fp_entries:             Vec::new(),
+            fp_selected:            0,
         }
     }
 

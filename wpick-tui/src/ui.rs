@@ -40,6 +40,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         AppMode::Detail => {
             render_detail(frame, app, main);
         }
+        AppMode::FolderPicker => {
+            // Show main UI dimmed behind the overlay.
+            let [list_area, detail_area] = Layout::horizontal([
+                Constraint::Percentage(30),
+                Constraint::Percentage(70),
+            ])
+            .areas(main);
+            render_list(frame, app, list_area);
+            render_detail(frame, app, detail_area);
+            render_folder_picker(frame, app, frame.area());
+        }
     }
 
     if app.monitor_select_mode {
@@ -399,6 +410,7 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
     ]);
     let line2 = Line::from(vec![
         key("Tab"),   lbl(" filter  "),
+        key("s"),     lbl(" folders  "),
         key("i"),     lbl(" detail  "),
         key("q"),     lbl(" quit (daemon runs)  "),
         key("Q"),     lbl(" kill daemon"),
@@ -461,4 +473,120 @@ fn render_monitor_overlay(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("\u{25b6} ");
 
     frame.render_stateful_widget(list, inner, &mut list_state);
+}
+
+// ── Folder picker overlay ─────────────────────────────────────────────────────
+
+fn render_folder_picker(frame: &mut Frame, app: &App, area: Rect) {
+    // Центрований overlay — 70% ширини, 70% висоти.
+    let popup_w = (area.width  * 70 / 100).max(60).min(area.width);
+    let popup_h = (area.height * 70 / 100).max(16).min(area.height);
+    let popup_x = area.x + (area.width.saturating_sub(popup_w))  / 2;
+    let popup_y = area.y + (area.height.saturating_sub(popup_h)) / 2;
+    let popup   = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
+
+    frame.render_widget(Clear, popup);
+
+    // Розбиваємо на три зони: шлях, список папок, існуючі extra_dirs.
+    let extra_count = app.extra_dirs().len() as u16;
+    let extra_h     = (extra_count + 2).min(popup_h / 3); // зона існуючих
+    let path_h      = 3u16;
+    let list_h      = popup_h.saturating_sub(path_h + extra_h);
+
+    let [path_area, list_area, saved_area] = ratatui::layout::Layout::vertical([
+        Constraint::Length(path_h),
+        Constraint::Length(list_h),
+        Constraint::Length(extra_h),
+    ])
+    .areas(popup);
+
+    // ── Поточний шлях ─────────────────────────────────────────────────────────
+    let path_str    = app.fp_path.to_string_lossy();
+    let is_added    = app.extra_dirs().iter().any(|d| d == path_str.as_ref());
+    let add_label   = if is_added { " [вже додано]" } else { " [a] Додати цю папку" };
+    let add_color   = if is_added { Color::DarkGray } else { Color::Green };
+
+    let path_block  = Block::default()
+        .borders(Borders::ALL)
+        .title(" \u{1f4c1} Вибір папки (s/Esc — закрити) ")
+        .style(Style::default().fg(Color::Cyan));
+
+    let path_inner  = path_block.inner(path_area);
+    frame.render_widget(path_block, path_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {}", path_str),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(add_label, Style::default().fg(add_color)),
+        ])),
+        path_inner,
+    );
+
+    // ── Список піддиректорій ───────────────────────────────────────────────────
+    let entries: Vec<ListItem> = app.fp_entries.iter().map(|name| {
+        let icon  = if name == ".." { "\u{2b06} " } else { "\u{1f4c1} " };
+        let color = if name == ".." { Color::DarkGray } else { Color::White };
+        ListItem::new(Line::from(Span::styled(
+            format!(" {}{}", icon, name),
+            Style::default().fg(color),
+        )))
+    }).collect();
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(if app.fp_entries.is_empty() { None } else { Some(app.fp_selected) });
+
+    let list_widget = List::new(entries)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Enter — відкрити  ← — назад ")
+                .style(Style::default().fg(Color::DarkGray)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("\u{25b6} ");
+
+    frame.render_stateful_widget(list_widget, list_area, &mut list_state);
+
+    // ── Збережені папки ───────────────────────────────────────────────────────
+    let saved_items: Vec<ListItem> = app.extra_dirs().iter().map(|d| {
+        let current = d == path_str.as_ref();
+        let style   = if current {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(format!(" \u{2714} {}", d), style),
+            Span::styled(
+                if current { "  [d] видалити" } else { "" },
+                Style::default().fg(Color::Red),
+            ),
+        ]))
+    }).collect();
+
+    let title = if app.extra_dirs().is_empty() {
+        " Збережені папки: немає ".to_owned()
+    } else {
+        format!(" Збережені папки ({}) [d — видалити поточну] ", app.extra_dirs().len())
+    };
+
+    let saved_widget = if saved_items.is_empty() {
+        List::new(vec![ListItem::new(Span::styled(
+            " (додайте папку клавішею a)",
+            Style::default().fg(Color::DarkGray),
+        ))])
+        .block(Block::default().borders(Borders::ALL).title(title).style(Style::default().fg(Color::DarkGray)))
+    } else {
+        List::new(saved_items)
+            .block(Block::default().borders(Borders::ALL).title(title).style(Style::default().fg(Color::DarkGray)))
+    };
+
+    frame.render_widget(saved_widget, saved_area);
 }
