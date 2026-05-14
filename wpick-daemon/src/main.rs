@@ -135,12 +135,20 @@ async fn main() -> anyhow::Result<()> {
             .with_env_filter(env_filter)
             .init();
     } else {
+        let log_path = dirs.log_dir.join("wpick.log");
         let file_appender = tracing_appender::rolling::daily(&dirs.log_dir, "wpick.log");
         let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
         tracing_subscriber::fmt()
             .with_writer(non_blocking)
             .with_env_filter(env_filter)
             .init();
+
+        // Redirect raw stderr (fd 2) to the log file so ffmpeg/libva/VAAPI
+        // C-library messages don't bleed into the user's terminal.
+        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            use std::os::unix::io::IntoRawFd;
+            unsafe { libc::dup2(f.into_raw_fd(), 2); }
+        }
     }
 
     tracing::info!("wpick-daemon starting");
