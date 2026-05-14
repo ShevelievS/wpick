@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
 use wpick_core::model::{WallpaperInfo, WallpaperSource};
 
-use crate::app::{App, AppMode, FilterType, fit_label};
+use crate::app::{App, AppMode, FilterType, FpHint, fit_label, fp_is_system};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     if frame.area().width < 80 || frame.area().height < 20 {
@@ -502,13 +502,19 @@ fn render_folder_picker(frame: &mut Frame, app: &App, area: Rect) {
 
     // ── Поточний шлях ─────────────────────────────────────────────────────────
     let path_str    = app.fp_path.to_string_lossy();
+    let is_system   = fp_is_system(&app.fp_path);
     let is_added    = app.extra_dirs().iter().any(|d| d == path_str.as_ref());
-    let add_label   = if is_added { " [вже додано]" } else { " [a] Додати цю папку" };
-    let add_color   = if is_added { Color::DarkGray } else { Color::Green };
+    let (add_label, add_color) = if is_system {
+        (" [⚠ system path]", Color::Red)
+    } else if is_added {
+        (" [already added]", Color::DarkGray)
+    } else {
+        (" [a] Add this folder", Color::Green)
+    };
 
     let path_block  = Block::default()
         .borders(Borders::ALL)
-        .title(" \u{1f4c1} Вибір папки (s/Esc — закрити) ")
+        .title(" \u{1f4c1} Folder picker  (Esc/s — close) ")
         .style(Style::default().fg(Color::Cyan));
 
     let path_inner  = path_block.inner(path_area);
@@ -526,12 +532,27 @@ fn render_folder_picker(frame: &mut Frame, app: &App, area: Rect) {
 
     // ── Список піддиректорій ───────────────────────────────────────────────────
     let entries: Vec<ListItem> = app.fp_entries.iter().map(|name| {
-        let icon  = if name == ".." { "\u{2b06} " } else { "\u{1f4c1} " };
-        let color = if name == ".." { Color::DarkGray } else { Color::White };
-        ListItem::new(Line::from(Span::styled(
-            format!(" {}{}", icon, name),
-            Style::default().fg(color),
-        )))
+        if name == ".." {
+            return ListItem::new(Line::from(Span::styled(
+                " \u{2b06}  ..".to_owned(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let full  = app.fp_path.join(name.as_str());
+        let hint  = app.fp_hints.get(&full);
+        let (badge, badge_color, name_color) = match hint {
+            Some(FpHint::HasVideos)  => ("[V] ", Color::Green,    Color::White),
+            Some(FpHint::HasSubdirs) => ("[·] ", Color::Yellow,   Color::White),
+            Some(FpHint::Empty)      => ("[-] ", Color::DarkGray, Color::DarkGray),
+            Some(FpHint::Unreadable) => ("[?] ", Color::DarkGray, Color::DarkGray),
+            Some(FpHint::System)     => ("[!] ", Color::Red,      Color::Red),
+            None                     => ("    ", Color::White,    Color::White),
+        };
+        ListItem::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(badge, Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("\u{1f4c1} {}", name), Style::default().fg(name_color)),
+        ]))
     }).collect();
 
     let mut list_state = ratatui::widgets::ListState::default();
@@ -541,7 +562,7 @@ fn render_folder_picker(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Enter — відкрити  ← — назад ")
+                .title(" Enter — open  ← — back  [V]=has videos  [·]=subdirs  [!]=system ")
                 .style(Style::default().fg(Color::DarkGray)),
         )
         .highlight_style(
@@ -554,7 +575,7 @@ fn render_folder_picker(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_stateful_widget(list_widget, list_area, &mut list_state);
 
-    // ── Збережені папки ───────────────────────────────────────────────────────
+    // ── Saved folders ─────────────────────────────────────────────────────────
     let saved_items: Vec<ListItem> = app.extra_dirs().iter().map(|d| {
         let current = d == path_str.as_ref();
         let style   = if current {
@@ -565,21 +586,21 @@ fn render_folder_picker(frame: &mut Frame, app: &App, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled(format!(" \u{2714} {}", d), style),
             Span::styled(
-                if current { "  [d] видалити" } else { "" },
+                if current { "  [d] remove" } else { "" },
                 Style::default().fg(Color::Red),
             ),
         ]))
     }).collect();
 
     let title = if app.extra_dirs().is_empty() {
-        " Збережені папки: немає ".to_owned()
+        " Saved folders: none ".to_owned()
     } else {
-        format!(" Збережені папки ({}) [d — видалити поточну] ", app.extra_dirs().len())
+        format!(" Saved folders ({}) [d — remove current] ", app.extra_dirs().len())
     };
 
     let saved_widget = if saved_items.is_empty() {
         List::new(vec![ListItem::new(Span::styled(
-            " (додайте папку клавішею a)",
+            " (press a to add this folder)",
             Style::default().fg(Color::DarkGray),
         ))])
         .block(Block::default().borders(Borders::ALL).title(title).style(Style::default().fg(Color::DarkGray)))

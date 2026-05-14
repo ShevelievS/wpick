@@ -14,6 +14,16 @@ use wpick_core::model::{WallpaperInfo, WallpaperSource};
 use crate::client::IpcClient;
 use crate::ui;
 
+/// Shallow scan hint for a directory entry in the folder picker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FpHint {
+    HasVideos,   // contains video files directly — show green
+    HasSubdirs,  // no direct videos but has sub-dirs — show yellow
+    Empty,       // nothing inside — show dim
+    Unreadable,  // permission denied — show dim
+    System,      // virtual/OS filesystem — blocked, show red
+}
+
 /// Source-based filter: All wallpapers, Workshop only, or a specific local folder by label.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterType {
@@ -68,6 +78,8 @@ pub struct App {
     pub fp_entries:              Vec<String>,
     /// Selected index inside fp_entries.
     pub fp_selected:             usize,
+    /// Shallow content hints for each entry in fp_entries (keyed by full path).
+    pub fp_hints:                std::collections::HashMap<std::path::PathBuf, FpHint>,
 }
 
 impl App {
@@ -103,6 +115,7 @@ impl App {
                                          .unwrap_or_else(|_| std::path::PathBuf::from("/")),
             fp_entries:              Vec::new(),
             fp_selected:             0,
+            fp_hints:                std::collections::HashMap::new(),
         }
     }
 
@@ -524,24 +537,37 @@ impl App {
         }
 
         // Drain responses: ScanProgress* then WallpaperList (or Error).
-        // Between each recv we redraw so the user sees live progress.
+        // Use a short per-iteration timeout so we can poll key events between
+        // each recv — this keeps the UI responsive during long scans.
         let items = loop {
-            // Redraw with current status before blocking on next message.
             let _ = terminal.draw(|f| ui::render(f, self));
+
+            // Non-blocking check for Esc — lets the user cancel a slow scan.
+            if crossterm::event::poll(Duration::ZERO).unwrap_or(false) {
+                if let Ok(Event::Key(k)) = crossterm::event::read() {
+                    if k.code == KeyCode::Esc {
+                        self.set_status_error("Scan cancelled");
+                        self.loading = false;
+                        break None;
+                    }
+                }
+            }
 
             let resp = match self.client.as_mut() {
                 None => break None,
+                // Short timeout so we return to the key-poll above often enough
+                // to feel responsive, while still batching daemon messages.
                 Some(c) => tokio::time::timeout(
-                    Duration::from_secs(120),
+                    Duration::from_millis(50),
                     c.recv_resp(),
                 ).await,
             };
 
             match resp {
                 Ok(Ok(DaemonResponse::ScanProgress { done, total })) => {
-                    self.status_message  = Some(format!("Scanning… {done}/{total}"));
+                    self.status_message  = Some(format!("Scanning… {done}/{total}  [Esc] cancel"));
                     self.status_is_error = false;
-                    self.status_clear_at = None; // hold until scan finishes
+                    self.status_clear_at = None;
                 }
                 Ok(Ok(DaemonResponse::WallpaperList { items })) => break Some(items),
                 Ok(Ok(DaemonResponse::Error { message })) => {
@@ -555,12 +581,8 @@ impl App {
                     self.set_status_error(e.to_string());
                     break None;
                 }
-                Err(_timeout) => {
-                    self.client = None;
-                    self.daemon_connected = false;
-                    self.set_status_error("Scan timeout");
-                    break None;
-                }
+                // Short timeout — just loop again to redraw and check keys.
+                Err(_timeout) => continue,
             }
         };
 
@@ -676,6 +698,41 @@ impl App {
     }
 }
 
+// ── Folder picker helpers ─────────────────────────────────────────────────────
+
+const VIDEO_EXTS_FP: &[&str] = &["mp4", "webm", "mkv", "avi", "mov", "gif", "wmv", "flv"];
+
+/// Virtual / OS filesystems that should never be added as wallpaper dirs.
+const SYSTEM_PATHS: &[&str] = &[
+    "/proc", "/sys", "/dev", "/run",
+];
+
+pub fn fp_is_system(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    SYSTEM_PATHS.iter().any(|sp| s == *sp || s.starts_with(&format!("{}/", sp)))
+}
+
+/// Shallow (non-recursive) directory scan — reads at most 500 entries.
+/// Returns a hint that describes what the directory visibly contains.
+pub fn fp_dir_hint(path: &std::path::Path) -> FpHint {
+    if fp_is_system(path) { return FpHint::System; }
+    let Ok(rd) = std::fs::read_dir(path) else { return FpHint::Unreadable };
+    let mut has_subdirs = false;
+    for entry in rd.flatten().take(500) {
+        let p = entry.path();
+        if p.is_file() {
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if VIDEO_EXTS_FP.contains(&ext.to_lowercase().as_str()) {
+                    return FpHint::HasVideos;
+                }
+            }
+        } else if p.is_dir() {
+            has_subdirs = true;
+        }
+    }
+    if has_subdirs { FpHint::HasSubdirs } else { FpHint::Empty }
+}
+
 // ── Folder picker ─────────────────────────────────────────────────────────────
 
 impl App {
@@ -685,7 +742,7 @@ impl App {
         self.load_fp_entries();
     }
 
-    /// Read subdirectories of `fp_path` into `fp_entries`.
+    /// Read subdirectories of `fp_path` into `fp_entries` and compute hints.
     pub fn load_fp_entries(&mut self) {
         let mut entries: Vec<String> = std::fs::read_dir(&self.fp_path)
             .into_iter()
@@ -705,6 +762,14 @@ impl App {
         self.fp_selected = self.fp_selected.min(
             self.fp_entries.len().saturating_sub(1)
         );
+
+        // Compute shallow hints for each entry (skip ".." — it's just navigation).
+        self.fp_hints.clear();
+        for name in &self.fp_entries {
+            if name == ".." { continue; }
+            let full = self.fp_path.join(name);
+            self.fp_hints.insert(full.clone(), fp_dir_hint(&full));
+        }
     }
 
     async fn handle_key_folder_picker(
@@ -735,7 +800,11 @@ impl App {
                     } else {
                         self.fp_path.join(&name)
                     };
-                    self.fp_path  = next;
+                    if fp_is_system(&next) {
+                        self.set_status_error("System path — cannot browse");
+                        return;
+                    }
+                    self.fp_path     = next;
                     self.fp_selected = 0;
                     self.load_fp_entries();
                 }
@@ -775,6 +844,10 @@ impl App {
 
     async fn fp_add_current_dir(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
         let path_str = self.fp_path.to_string_lossy().into_owned();
+        if fp_is_system(&self.fp_path) {
+            self.set_status_error("System path — cannot add");
+            return;
+        }
         if self.config.paths.extra_dirs.contains(&path_str) {
             self.set_status_error("Folder already added");
             return;
@@ -861,6 +934,7 @@ mod tests {
             fp_path:                std::path::PathBuf::from("/tmp"),
             fp_entries:             Vec::new(),
             fp_selected:            0,
+            fp_hints:               std::collections::HashMap::new(),
         }
     }
 
