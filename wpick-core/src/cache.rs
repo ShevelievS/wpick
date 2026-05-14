@@ -3,7 +3,7 @@ use std::path::Path;
 use rusqlite::{params, Connection};
 
 use crate::error::Result;
-use crate::model::{WallpaperInfo, WallpaperType};
+use crate::model::{WallpaperInfo, WallpaperSource, WallpaperType};
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
 
@@ -20,13 +20,33 @@ const SCHEMA_SQL: &str = "
         file_size_bytes  INTEGER NOT NULL DEFAULT 0,
         pkg_mtime_secs   INTEGER NOT NULL,
         width            INTEGER NOT NULL DEFAULT 0,
-        height           INTEGER NOT NULL DEFAULT 0
+        height           INTEGER NOT NULL DEFAULT 0,
+        source           TEXT NOT NULL DEFAULT 'workshop'
     ) STRICT;
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     ) STRICT;
 ";
+
+// ─── Source serialization ─────────────────────────────────────────────────────
+
+fn source_to_str(s: &WallpaperSource) -> String {
+    match s {
+        WallpaperSource::Workshop            => "workshop".to_owned(),
+        WallpaperSource::Local { label }     => format!("local:{}", label),
+    }
+}
+
+fn str_to_source(s: &str) -> WallpaperSource {
+    if s == "workshop" {
+        WallpaperSource::Workshop
+    } else if let Some(label) = s.strip_prefix("local:") {
+        WallpaperSource::Local { label: label.to_owned() }
+    } else {
+        WallpaperSource::Workshop
+    }
+}
 
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
@@ -39,7 +59,7 @@ impl Cache {
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(SCHEMA_SQL)?;
-        // Migrate existing DBs that predate the width/height columns.
+        // Migrate existing DBs that predate each column.
         // "duplicate column name" errors are ignored — the column already exists.
         conn.execute(
             "ALTER TABLE wallpapers ADD COLUMN width INTEGER NOT NULL DEFAULT 0",
@@ -49,14 +69,19 @@ impl Cache {
             "ALTER TABLE wallpapers ADD COLUMN height INTEGER NOT NULL DEFAULT 0",
             [],
         ).ok();
+        conn.execute(
+            "ALTER TABLE wallpapers ADD COLUMN source TEXT NOT NULL DEFAULT 'workshop'",
+            [],
+        ).ok();
         Ok(Self { conn })
     }
 
-    /// Retrieve all wallpapers sorted by title ascending.
+    /// Retrieve all wallpapers sorted by source then title ascending.
     pub fn get_all(&self) -> Result<Vec<WallpaperInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, wallpaper_type, file_path, preview_path, \
-             has_audio, file_size_bytes, width, height FROM wallpapers ORDER BY title ASC",
+             has_audio, file_size_bytes, width, height, source \
+             FROM wallpapers ORDER BY source ASC, title ASC",
         )?;
         let rows = stmt.query_map([], row_to_info)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -66,7 +91,8 @@ impl Cache {
     pub fn get_by_id(&self, id: u64) -> Result<Option<WallpaperInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, wallpaper_type, file_path, preview_path, \
-             has_audio, file_size_bytes, width, height FROM wallpapers WHERE id = ?1",
+             has_audio, file_size_bytes, width, height, source \
+             FROM wallpapers WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id as i64], row_to_info)?;
         match rows.next() {
@@ -80,8 +106,8 @@ impl Cache {
         self.conn.execute(
             "INSERT OR REPLACE INTO wallpapers \
              (id, title, wallpaper_type, file_path, preview_path, \
-              has_audio, file_size_bytes, pkg_mtime_secs, width, height) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              has_audio, file_size_bytes, pkg_mtime_secs, width, height, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 info.id as i64,
                 info.title,
@@ -93,6 +119,7 @@ impl Cache {
                 pkg_mtime_secs as i64,
                 info.width as i64,
                 info.height as i64,
+                source_to_str(&info.source),
             ],
         )?;
         Ok(())
@@ -124,16 +151,8 @@ impl Cache {
             return Ok(());
         }
 
-        // Build a parameterised placeholder string: "?,?,?..."
-        let placeholders = active_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let sql = format!(
-            "DELETE FROM wallpapers WHERE id NOT IN ({placeholders})"
-        );
+        let placeholders = active_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("DELETE FROM wallpapers WHERE id NOT IN ({placeholders})");
 
         let params: Vec<rusqlite::types::Value> = active_ids
             .iter()
@@ -157,16 +176,21 @@ impl Cache {
 
 fn row_to_info(row: &rusqlite::Row) -> rusqlite::Result<WallpaperInfo> {
     let type_str: String = row.get(2)?;
-    let id: i64 = row.get(0)?;
-    let wallpaper_type = match type_str.as_str() {
+    let id: i64          = row.get(0)?;
+    let wallpaper_type   = match type_str.as_str() {
         "video" => WallpaperType::Video,
         other   => {
-            tracing::debug!(id, type_str = other, "Unsupported wallpaper_type in DB — defaulting to Video (will be pruned on next scan)");
+            tracing::debug!(
+                id,
+                type_str = other,
+                "Unsupported wallpaper_type in DB — treating as Video (pruned on next scan)"
+            );
             WallpaperType::Video
         }
     };
+    let source_str: String = row.get(9)?;
     Ok(WallpaperInfo {
-        id:              row.get::<_, i64>(0)? as u64,
+        id:              id as u64,
         title:           row.get(1)?,
         wallpaper_type,
         file_path:       row.get(3)?,
@@ -175,6 +199,7 @@ fn row_to_info(row: &rusqlite::Row) -> rusqlite::Result<WallpaperInfo> {
         file_size_bytes: row.get::<_, i64>(6)? as u64,
         width:           row.get::<_, i64>(7)? as u32,
         height:          row.get::<_, i64>(8)? as u32,
+        source:          str_to_source(&source_str),
     })
 }
 
@@ -183,7 +208,7 @@ fn row_to_info(row: &rusqlite::Row) -> rusqlite::Result<WallpaperInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{WallpaperInfo, WallpaperType};
+    use crate::model::{WallpaperInfo, WallpaperSource, WallpaperType};
     use tempfile::TempDir;
 
     fn make_info(id: u64, title: &str) -> WallpaperInfo {
@@ -197,6 +222,7 @@ mod tests {
             file_size_bytes: 1024,
             width:           0,
             height:          0,
+            source:          WallpaperSource::Workshop,
         }
     }
 
@@ -221,6 +247,21 @@ mod tests {
         assert_eq!(result.title, "Test Wallpaper");
         assert_eq!(result.wallpaper_type, WallpaperType::Video);
         assert_eq!(result.id, 12345);
+        assert_eq!(result.source, WallpaperSource::Workshop);
+        Ok(())
+    }
+
+    #[test]
+    fn test_source_local_roundtrip() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache = Cache::open(&tmp.path().join("test.db"))?;
+
+        let mut info = make_info(99, "Local Video");
+        info.source = WallpaperSource::Local { label: "my-videos".to_owned() };
+        cache.upsert(&info, 0)?;
+
+        let result = cache.get_by_id(99)?.expect("must exist");
+        assert_eq!(result.source, WallpaperSource::Local { label: "my-videos".to_owned() });
         Ok(())
     }
 
@@ -244,8 +285,8 @@ mod tests {
         let tmp = TempDir::new()?;
         let cache = Cache::open(&tmp.path().join("test.db"))?;
 
-        cache.upsert(&make_info(1, "One"), 1)?;
-        cache.upsert(&make_info(2, "Two"), 2)?;
+        cache.upsert(&make_info(1, "One"),   1)?;
+        cache.upsert(&make_info(2, "Two"),   2)?;
         cache.upsert(&make_info(3, "Three"), 3)?;
 
         cache.prune(&[1, 3])?;
@@ -297,12 +338,12 @@ mod tests {
         cache.upsert(&info, 100)?;
 
         info.title = "Updated".to_owned();
-        cache.upsert(&info, 200)?; // same id, new title + new mtime
+        cache.upsert(&info, 200)?;
 
         let result = cache.get_by_id(42)?.expect("must exist after upsert");
-        assert_eq!(result.title, "Updated", "title must be updated");
-        assert_eq!(cache.count()?, 1, "upsert must not create a duplicate row");
-        assert_eq!(cache.get_pkg_mtime(42)?, Some(200), "mtime must be updated");
+        assert_eq!(result.title, "Updated");
+        assert_eq!(cache.count()?, 1);
+        assert_eq!(cache.get_pkg_mtime(42)?, Some(200));
         Ok(())
     }
 
@@ -316,12 +357,11 @@ mod tests {
         assert_eq!(cache.count()?, 2);
 
         cache.remove(1)?;
-        assert!(cache.get_by_id(1)?.is_none(), "removed entry must not be found");
-        assert_eq!(cache.count()?, 1, "count must decrease after remove");
+        assert!(cache.get_by_id(1)?.is_none());
+        assert_eq!(cache.count()?, 1);
 
-        // Removing a non-existent ID must not error.
         cache.remove(9999)?;
-        assert_eq!(cache.count()?, 1, "count must be unchanged after no-op remove");
+        assert_eq!(cache.count()?, 1);
         Ok(())
     }
 
@@ -335,8 +375,8 @@ mod tests {
         assert_eq!(cache.count()?, 1);
         cache.upsert(&make_info(2, "B"), 0)?;
         assert_eq!(cache.count()?, 2);
-        cache.upsert(&make_info(1, "A-updated"), 1)?; // re-upsert same id
-        assert_eq!(cache.count()?, 2, "re-upsert must not increase count");
+        cache.upsert(&make_info(1, "A-updated"), 1)?;
+        assert_eq!(cache.count()?, 2);
         cache.remove(1)?;
         assert_eq!(cache.count()?, 1);
         Ok(())

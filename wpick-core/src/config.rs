@@ -51,6 +51,11 @@ pub struct PathsConfig {
     pub cache_dir: String,
     #[serde(default)]
     pub wallpapers_dir: String,
+    /// Additional directories to scan for video files (mp4, webm, mkv, etc.).
+    /// Each entry is an absolute path.  Wallpapers found here get
+    /// `WallpaperSource::Local { label: <dirname> }`.
+    #[serde(default)]
+    pub extra_dirs: Vec<String>,
 }
 
 /// Wayland / GPU preferences.

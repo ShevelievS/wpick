@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::config::FitMode;
 use crate::error::{Result, WpickError};
 use crate::model::WallpaperInfo;
 
@@ -32,6 +33,12 @@ pub enum ClientCommand {
     Info   { id: u64 },
     /// Return the names of all currently connected wl_outputs.
     ListOutputs,
+    /// Set the fit/scale mode for a specific monitor (or all if `monitor` is absent).
+    SetFit {
+        fit: FitMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monitor: Option<String>,
+    },
     Kill,
 }
 
@@ -193,6 +200,7 @@ mod tests {
             file_size_bytes: 0,
             width:           0,
             height:          0,
+            source:          crate::model::WallpaperSource::Workshop,
         };
 
         // Every variant must be present — if a new variant is added without

@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use walkdir::WalkDir;
 
 use crate::config::WpickConfig;
 use crate::error::{Result, WpickError};
+use crate::model::{WallpaperInfo, WallpaperSource, WallpaperType};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -171,6 +173,90 @@ pub fn find_wallpaper_dirs(_config: &WpickConfig) -> Result<Vec<WallpaperDir>> {
     Ok(results)
 }
 
+// ─── Local video discovery ────────────────────────────────────────────────────
+
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mkv", "avi", "mov", "gif", "wmv", "flv"];
+const PREVIEW_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp"];
+
+/// FNV-1a 64-bit hash — small, no deps, stable across runs.
+fn fnv1a(data: &[u8]) -> u64 {
+    const OFFSET: u64 = 14695981039346656037;
+    const PRIME:  u64 = 1099511628211;
+    let mut h = OFFSET;
+    for &b in data { h ^= b as u64; h = h.wrapping_mul(PRIME); }
+    h
+}
+
+/// Stable u64 ID for a local file path.
+/// High bit is always set so local IDs never collide with Workshop IDs (< 2³²).
+fn local_id(path: &Path) -> u64 {
+    fnv1a(path.to_string_lossy().as_bytes()) | (1u64 << 63)
+}
+
+/// Walk each directory in `extra_dirs`, collect all video files, and return them
+/// as `WallpaperInfo` with `source = Local { label: dir_basename }`.
+///
+/// Errors per-entry are logged and skipped — never propagated.
+pub fn find_local_video_files(extra_dirs: &[String]) -> Vec<WallpaperInfo> {
+    let mut results = Vec::new();
+
+    for dir_str in extra_dirs {
+        let dir = Path::new(dir_str);
+        if !dir.exists() {
+            tracing::warn!(path = dir_str, "extra_dir does not exist — skipping");
+            continue;
+        }
+
+        let label = dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(dir_str)
+            .to_owned();
+
+        for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+            if !entry.file_type().is_file() { continue; }
+
+            let path = entry.path();
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+            let Some(ext) = ext else { continue };
+            if !VIDEO_EXTENSIONS.contains(&ext.as_str()) { continue; }
+
+            let id               = local_id(path);
+            let file_size_bytes  = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let title            = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_owned();
+
+            // Look for a sibling thumbnail with same stem but image extension.
+            let preview_path = PREVIEW_EXTENSIONS.iter().find_map(|pext| {
+                let candidate = path.with_extension(pext);
+                if candidate.exists() && candidate != path {
+                    candidate.to_str().map(|s| s.to_owned())
+                } else {
+                    None
+                }
+            });
+
+            results.push(WallpaperInfo {
+                id,
+                title,
+                wallpaper_type:  WallpaperType::Video,
+                file_path:       path.to_string_lossy().into_owned(),
+                preview_path,
+                has_audio:       false,
+                file_size_bytes,
+                width:           0,
+                height:          0,
+                source:          WallpaperSource::Local { label: label.clone() },
+            });
+        }
+    }
+
+    results
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -333,5 +419,43 @@ mod tests {
             "non-numeric dir 'not_a_number' must be excluded");
 
         Ok(())
+    }
+
+    #[test]
+    fn test_find_local_video_files_basic() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+
+        std::fs::write(tmp.path().join("ocean.mp4"),  b"fake-mp4").unwrap();
+        std::fs::write(tmp.path().join("ocean.jpg"),  b"fake-jpg").unwrap(); // sibling thumbnail
+        std::fs::write(tmp.path().join("loop.webm"),  b"fake-webm").unwrap();
+        std::fs::write(tmp.path().join("readme.txt"), b"text").unwrap(); // must be ignored
+
+        let dir = tmp.path().to_str().unwrap().to_owned();
+        let results = find_local_video_files(&[dir]);
+
+        assert_eq!(results.len(), 2, "only video files should be returned");
+
+        let ocean = results.iter().find(|w| w.title == "ocean").expect("ocean.mp4 missing");
+        assert!(ocean.preview_path.is_some(), "ocean.jpg should be detected as preview");
+        assert!(matches!(ocean.source, WallpaperSource::Local { .. }));
+
+        let ids: std::collections::HashSet<u64> = results.iter().map(|w| w.id).collect();
+        assert_eq!(ids.len(), 2, "each file must get a unique stable ID");
+        assert!(ids.iter().all(|&id| id >= (1u64 << 63)), "local IDs must have high bit set");
+    }
+
+    #[test]
+    fn test_find_local_video_files_missing_dir() {
+        let results = find_local_video_files(&["/nonexistent/path/xyz".to_owned()]);
+        assert!(results.is_empty(), "missing dir must return empty, not panic");
+    }
+
+    #[test]
+    fn test_local_id_is_stable() {
+        let path = Path::new("/home/user/videos/test.mp4");
+        assert_eq!(local_id(path), local_id(path), "same path → same ID");
+        assert_ne!(local_id(path), local_id(Path::new("/other.mp4")), "different paths → different IDs");
+        assert!(local_id(path) >= (1u64 << 63), "high bit must be set");
     }
 }

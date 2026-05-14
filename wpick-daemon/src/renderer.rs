@@ -26,7 +26,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 use std::collections::HashMap;
 
 use wpick_core::cache::Cache;
-use wpick_core::config::{MonitorConfig, PauseConfig};
+use wpick_core::config::{FitMode, MonitorConfig, PauseConfig};
 use wpick_core::model::WallpaperInfo;
 
 use crate::hw_decode::HwDecoder;
@@ -519,7 +519,6 @@ impl ShmPool {
 
 /// Single-frame decoder for static images (JPEG, PNG, WebP, etc.).
 /// Decodes once at construction; `next_frame_bgra` copies the same data every call.
-/// Used for Scene / Web wallpapers whose preview is a static image.
 struct StaticDecoder {
     data: Vec<u8>,
     w:    u32,
@@ -527,27 +526,51 @@ struct StaticDecoder {
 }
 
 impl StaticDecoder {
-    fn try_open(path: &str, target_w: u32, target_h: u32) -> Option<Self> {
+    fn try_open(path: &str, target_w: u32, target_h: u32, fit: FitMode) -> Option<Self> {
         let img = image::open(path).ok()?;
-        // Exact match: no scaling needed, just convert pixel format.
+
+        // Exact pixel match — direct RGBA→BGRA, no scaling.
         if img.width() == target_w && img.height() == target_h {
             let rgba = img.to_rgba8();
             let mut bgra = rgba.into_raw();
             for px in bgra.chunks_exact_mut(4) { px.swap(0, 2); }
             return Some(Self { data: bgra, w: target_w, h: target_h });
         }
-        // Scale to fit within target dimensions, preserving aspect ratio (letterbox/pillarbox).
-        // resize_to_fill crops to fill which makes images look zoomed-in; resize keeps the
-        // full image visible, black-padding any leftover area.
-        let img = img.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
-        let mut bg = image::RgbaImage::new(target_w, target_h);
-        // Fill background with opaque black.
-        for px in bg.pixels_mut() { *px = image::Rgba([0, 0, 0, 255]); }
-        let x = (target_w.saturating_sub(img.width()))  / 2;
-        let y = (target_h.saturating_sub(img.height())) / 2;
-        image::imageops::overlay(&mut bg, &img.to_rgba8(), x as i64, y as i64);
-        let mut bgra = bg.into_raw();
-        // RGBA → BGRA: swap R and B channels in place.
+
+        let scaled = match fit {
+            FitMode::Fit => {
+                // Letterbox: resize preserving aspect ratio, black bars.
+                let resized = img.resize(target_w, target_h, image::imageops::FilterType::Lanczos3);
+                let mut bg = image::RgbaImage::new(target_w, target_h);
+                for px in bg.pixels_mut() { *px = image::Rgba([0, 0, 0, 255]); }
+                let x = (target_w.saturating_sub(resized.width()))  / 2;
+                let y = (target_h.saturating_sub(resized.height())) / 2;
+                image::imageops::overlay(&mut bg, &resized.to_rgba8(), x as i64, y as i64);
+                bg.into_raw()
+            }
+            FitMode::Fill => {
+                // Scale to fill, center-crop overflow.
+                let resized = img.resize_to_fill(target_w, target_h, image::imageops::FilterType::Lanczos3);
+                resized.to_rgba8().into_raw()
+            }
+            FitMode::Stretch => {
+                // Stretch to fill — no aspect ratio preservation.
+                let resized = img.resize_exact(target_w, target_h, image::imageops::FilterType::Lanczos3);
+                resized.to_rgba8().into_raw()
+            }
+            FitMode::Center => {
+                // No scaling — center, black borders.
+                let mut bg = image::RgbaImage::new(target_w, target_h);
+                for px in bg.pixels_mut() { *px = image::Rgba([0, 0, 0, 255]); }
+                let x = (target_w.saturating_sub(img.width()))  / 2;
+                let y = (target_h.saturating_sub(img.height())) / 2;
+                image::imageops::overlay(&mut bg, &img.to_rgba8(), x as i64, y as i64);
+                bg.into_raw()
+            }
+        };
+
+        // RGBA → BGRA.
+        let mut bgra = scaled;
         for px in bgra.chunks_exact_mut(4) { px.swap(0, 2); }
         Some(Self { data: bgra, w: target_w, h: target_h })
     }
@@ -628,6 +651,8 @@ struct OutputSurface {
     /// When Some, this surface is pinned to a specific wallpaper from `[monitors]` config
     /// and ignores global `Set` commands.
     pinned_wp:     Option<WallpaperInfo>,
+    /// Active fit mode for this monitor — settable at runtime via SetFit.
+    fit:           FitMode,
 }
 
 // ─── Renderer context ─────────────────────────────────────────────────────────
@@ -788,6 +813,7 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
             recreate_after: None,
             last_commit_at: None,
             pinned_wp:     None,
+            fit:           FitMode::default(),
         });
 
         wls.surf_ev[i].needs_ack   = false;
@@ -809,6 +835,7 @@ pub async fn run(
     cache:               Arc<tokio::sync::Mutex<Cache>>,
     on_fullscreen_exit:  Option<Arc<dyn Fn() + Send + Sync>>,
     mut per_monitor_rx:  watch::Receiver<HashMap<String, Option<WallpaperInfo>>>,
+    fit_rx:              watch::Receiver<(String, FitMode)>,
     outputs_out:         Arc<std::sync::Mutex<Vec<(String, u32, u32)>>>,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
@@ -846,9 +873,10 @@ pub async fn run(
                 .collect();
         }
 
-        let (wp_tx, wp_rx) = std::sync::mpsc::channel::<Option<WallpaperInfo>>();
-        let (sd_tx, sd_rx) = std::sync::mpsc::channel::<()>();
+        let (wp_tx, wp_rx)   = std::sync::mpsc::channel::<Option<WallpaperInfo>>();
+        let (sd_tx, sd_rx)   = std::sync::mpsc::channel::<()>();
         let (pin_tx, pin_rx) = std::sync::mpsc::channel::<HashMap<String, Option<WallpaperInfo>>>();
+        let (fit_fwd_tx, fit_fwd_rx) = std::sync::mpsc::channel::<(String, FitMode)>();
         let _ = wp_tx.send(wallpaper_rx.borrow_and_update().clone());
         let _ = pin_tx.send(per_monitor_rx.borrow_and_update().clone());
 
@@ -871,6 +899,13 @@ pub async fn run(
                 if pin_tx.send(pm_rx2.borrow_and_update().clone()).is_err() { break; }
             }
         });
+        let mut fit_rx2 = fit_rx.clone();
+        let fit_fwd = tokio::spawn(async move {
+            loop {
+                if fit_rx2.changed().await.is_err() { break; }
+                if fit_fwd_tx.send(fit_rx2.borrow_and_update().clone()).is_err() { break; }
+            }
+        });
 
         // Resolve per-monitor wallpapers from cache (async, before entering blocking task).
         // Re-resolved each reinit so a re-scan between reinits picks up new entries.
@@ -883,12 +918,15 @@ pub async fn run(
             battery:       Arc::clone(&pause.battery),
             lid:           Arc::clone(&pause.lid),
         };
-        let result = tokio::task::spawn_blocking(move || render_loop(ctx, wp_rx, pin_rx, sd_rx, fs, pm, monitor_wallpapers))
-            .await.context("render loop panic")?;
+        let monitors_cfg = monitors.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            render_loop(ctx, wp_rx, pin_rx, sd_rx, fit_fwd_rx, fs, pm, monitors_cfg, monitor_wallpapers)
+        }).await.context("render loop panic")?;
 
         wp_fwd.abort();
         sd_fwd.abort();
         pin_fwd.abort();
+        fit_fwd.abort();
 
         match result {
             Ok(()) => break,
@@ -933,18 +971,27 @@ fn render_loop(
     wp_rx:              std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
     pin_rx:             std::sync::mpsc::Receiver<HashMap<String, Option<WallpaperInfo>>>,
     sd_rx:              std::sync::mpsc::Receiver<()>,
+    fit_rx:             std::sync::mpsc::Receiver<(String, FitMode)>,
     fullscreen:         Arc<AtomicBool>,
     pause:              PauseMonitors,
+    monitors_cfg:       HashMap<String, MonitorConfig>,
     monitor_wallpapers: HashMap<String, WallpaperInfo>,
 ) -> anyhow::Result<()> {
     let mut current_wp: Option<WallpaperInfo> = None;
+
+    // Apply per-monitor fit modes from config.
+    for surf in &mut ctx.surfaces {
+        if let Some(cfg) = monitors_cfg.get(&surf.output_name) {
+            surf.fit = cfg.fit;
+        }
+    }
 
     // Apply per-monitor pinned wallpapers from config before the first frame.
     for surf in &mut ctx.surfaces {
         if let Some(info) = monitor_wallpapers.get(&surf.output_name) {
             tracing::info!("surface[{}] ({}) pinned to wallpaper '{}'",
                 surf.ev_idx, surf.output_name, info.title);
-            surf.decoder   = open_decoder(info, surf.surf_w, surf.surf_h);
+            surf.decoder   = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
             surf.next_frame = Instant::now();
             surf.pinned_wp  = Some(info.clone());
         }
@@ -968,6 +1015,22 @@ fn render_loop(
         }
         let _ = ctx.evq.flush();
 
+        // ── fit mode changes (IPC SetFit) ─────────────────────────────────────
+        while let Ok((monitor_key, new_fit)) = fit_rx.try_recv() {
+            for surf in &mut ctx.surfaces {
+                if monitor_key == "*" || monitor_key == surf.output_name {
+                    surf.fit = new_fit;
+                    // Recreate decoder with new fit mode.
+                    let active_wp = surf.pinned_wp.clone().or_else(|| current_wp.clone());
+                    if let Some(ref info) = active_wp {
+                        surf.decoder      = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
+                        surf.next_frame   = Instant::now();
+                        surf.canvas_ready = false;
+                    }
+                }
+            }
+        }
+
         // ── dynamic per-monitor pins (IPC Set with monitor=) ─────────────────
         // Consume only the most-recent snapshot — watch semantics mean older
         // intermediate values don't matter.
@@ -980,7 +1043,7 @@ fn render_loop(
                         Some(info) => {
                             tracing::info!("pin update: surface '{}' → '{}'",
                                 surf.output_name, info.title);
-                            surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h);
+                            surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
                             surf.next_frame = Instant::now();
                             surf.pinned_wp  = Some(info.clone());
                             surf.canvas_ready = false;
@@ -990,7 +1053,7 @@ fn render_loop(
                             surf.pinned_wp    = None;
                             surf.canvas_ready = false;
                             surf.decoder = current_wp.as_ref()
-                                .and_then(|info| open_decoder(info, surf.surf_w, surf.surf_h));
+                                .and_then(|info| open_decoder(info, surf.surf_w, surf.surf_h, surf.fit));
                             if surf.decoder.is_some() { surf.next_frame = Instant::now(); }
                         }
                     }
@@ -1013,7 +1076,7 @@ fn render_loop(
                 surf.decoder      = None;
                 surf.canvas_ready = false;
                 if let Some(ref info) = new_wp {
-                    surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h);
+                    surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
                     surf.next_frame = Instant::now();
                 }
             }
@@ -1147,7 +1210,7 @@ fn process_surface(
                     ctx.surfaces[i].canvas_ready  = false;
                     let active_wp = ctx.surfaces[i].pinned_wp.clone().or_else(|| current_wp.clone());
                     if let Some(ref info) = active_wp {
-                        ctx.surfaces[i].decoder = open_decoder(info, new_w, new_h);
+                        ctx.surfaces[i].decoder = open_decoder(info, new_w, new_h, ctx.surfaces[i].fit);
                     }
                 }
                 Err(e) => tracing::warn!("pool resize surface[{}]: {}", i, e),
@@ -1239,7 +1302,8 @@ fn process_surface(
                 tracing::warn!("hw surface[{}]: {} — sw fallback", i, e);
                 let active_wp = ctx.surfaces[i].pinned_wp.clone().or_else(|| current_wp.clone());
                 if let Some(ref info) = active_wp {
-                    ctx.surfaces[i].decoder = match VideoDecoder::open(&info.file_path, sw, sh) {
+                    let fit = ctx.surfaces[i].fit;
+                    ctx.surfaces[i].decoder = match VideoDecoder::open(&info.file_path, sw, sh, fit) {
                         Ok(d)  => { tracing::info!("sw fallback surface[{}]", i); Some(AnyDecoder::Sw(d)) }
                         Err(e2) => { tracing::warn!("sw fallback surface[{}]: {}", i, e2); None }
                     };
@@ -1264,12 +1328,9 @@ fn is_static_image(path: &str) -> bool {
     )
 }
 
-fn open_decoder(info: &WallpaperInfo, target_w: u32, target_h: u32) -> Option<AnyDecoder> {
-    // Static images (JPEG/PNG/WebP/…) go through the image crate; no ffmpeg needed.
-    // GIFs and videos (including animated preview GIFs for Scene wallpapers) go
-    // through the existing hw/sw video pipeline — ffmpeg handles GIF natively.
+fn open_decoder(info: &WallpaperInfo, target_w: u32, target_h: u32, fit: FitMode) -> Option<AnyDecoder> {
     if is_static_image(&info.file_path) {
-        match StaticDecoder::try_open(&info.file_path, target_w, target_h) {
+        match StaticDecoder::try_open(&info.file_path, target_w, target_h, fit) {
             Some(d) => {
                 tracing::info!("static image {}x{}", d.dimensions().0, d.dimensions().1);
                 return Some(AnyDecoder::Static(d));
@@ -1288,11 +1349,11 @@ fn open_decoder(info: &WallpaperInfo, target_w: u32, target_h: u32) -> Option<An
         );
         return Some(AnyDecoder::Hw(hw));
     }
-    match VideoDecoder::open(&info.file_path, target_w, target_h) {
+    match VideoDecoder::open(&info.file_path, target_w, target_h, fit) {
         Ok(sw) => {
             tracing::info!(
-                "sw decode {}x{} → {}x{} bgra",
-                sw.dimensions().0, sw.dimensions().1, target_w, target_h
+                "sw decode {}x{} → {}x{} bgra fit={:?}",
+                sw.dimensions().0, sw.dimensions().1, target_w, target_h, fit
             );
             Some(AnyDecoder::Sw(sw))
         }

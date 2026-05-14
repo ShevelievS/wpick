@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, watch};
+use wpick_core::config::FitMode;
 use wpick_core::model::WallpaperInfo;
 
 pub struct DaemonState {
@@ -12,6 +13,8 @@ pub struct DaemonState {
     pub volume_tx:       watch::Sender<(f32, bool)>,
     pub shutdown_tx:     broadcast::Sender<()>,
     pub per_monitor_tx:  watch::Sender<HashMap<String, Option<WallpaperInfo>>>,
+    /// (monitor_name_or_"*", fit) — "*" means all monitors.
+    pub fit_tx:          watch::Sender<(String, FitMode)>,
     pub outputs:         Arc<Mutex<Vec<(String, u32, u32)>>>,
 }
 
@@ -25,6 +28,11 @@ impl DaemonState {
     pub fn stop(&mut self) {
         self.current = None;
         let _ = self.wallpaper_tx.send(None);
+    }
+
+    pub fn set_fit(&mut self, monitor: Option<String>, fit: FitMode) {
+        let key = monitor.unwrap_or_else(|| "*".to_owned());
+        let _ = self.fit_tx.send((key, fit));
     }
 
     /// Apply `info` to one specific monitor without changing the global wallpaper.

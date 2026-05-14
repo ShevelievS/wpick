@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use wpick_core::cache::Cache;
 use wpick_core::config::{AppDirs, WpickConfig};
 use wpick_core::ipc::{recv_command, send_response};
+use wpick_core::config::FitMode;
 use wpick_core::model::WallpaperInfo;
 use wpick_core::{ClientCommand, DaemonResponse};
 
@@ -171,6 +172,12 @@ async fn dispatch(
             }
         }
 
+        ClientCommand::SetFit { fit, monitor } => {
+            state.lock().await.set_fit(monitor.clone(), fit);
+            save_fit_config(monitor, fit);
+            DaemonResponse::Ok
+        }
+
         ClientCommand::Kill => {
             tracing::info!("Kill received — initiating graceful shutdown");
             // Grab the shutdown sender from state before releasing the lock.
@@ -209,6 +216,20 @@ fn save_last_wallpaper_id(id: u64) {
         cfg.last_wallpaper_id = Some(id);
         if let Err(e) = cfg.save() {
             tracing::warn!("Config save (last_wallpaper_id) failed: {}", e);
+        }
+    });
+}
+
+/// Persist fit mode to config so the renderer uses it after restart.
+fn save_fit_config(monitor: Option<String>, fit: FitMode) {
+    tokio::task::spawn_blocking(move || {
+        let mut cfg = WpickConfig::load().unwrap_or_default();
+        match monitor {
+            Some(name) => { cfg.monitors.entry(name).or_default().fit = fit; }
+            None       => { for m in cfg.monitors.values_mut() { m.fit = fit; } }
+        }
+        if let Err(e) = cfg.save() {
+            tracing::warn!("Config save (fit) failed: {}", e);
         }
     });
 }
@@ -264,23 +285,35 @@ async fn scan_and_populate(
 ) -> anyhow::Result<Vec<WallpaperInfo>> {
     tokio::task::spawn_blocking(move || {
         let config = WpickConfig::load().context("load config")?;
+
+        // ── Phase 1: Steam Workshop wallpapers ────────────────────────────────
         let wallpaper_dirs = wpick_core::discovery::find_wallpaper_dirs(&config)
             .context("find wallpaper dirs")?;
 
-        let total = wallpaper_dirs.len();
-        tracing::info!("Scanning {} wallpaper dirs", total);
+        // ── Phase 2: local extra_dirs ─────────────────────────────────────────
+        let local_infos = wpick_core::discovery::find_local_video_files(
+            &config.paths.extra_dirs,
+        );
 
-        let mut results = Vec::new();
+        let workshop_total = wallpaper_dirs.len();
+        let total          = workshop_total + local_infos.len();
+        tracing::info!(
+            workshop = workshop_total,
+            local    = local_infos.len(),
+            "Scanning wallpapers"
+        );
 
-        for (i, wd) in wallpaper_dirs.into_iter().enumerate() {
+        let mut results   = Vec::new();
+        let mut done: usize = 0;
+
+        // Workshop items
+        for wd in wallpaper_dirs {
             match wpick_core::pkg::extract_and_parse(&wd, &dirs.wallpapers_dir) {
                 Ok(Some(info)) => {
                     let mtime = std::fs::metadata(wd.path.join("project.json"))
                         .and_then(|m| m.modified())
                         .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
                         .unwrap_or(0);
-
-                    // Lock held only for the brief upsert — IPC commands stay responsive.
                     {
                         let guard = cache.blocking_lock();
                         if let Err(e) = guard.upsert(&info, mtime) {
@@ -292,16 +325,29 @@ async fn scan_and_populate(
                 Ok(None) => tracing::debug!("Skipping non-video wallpaper {}", wd.id),
                 Err(e)   => tracing::warn!("Failed to process wallpaper {}: {}", wd.id, e),
             }
-
-            // Ignore send errors — client may have disconnected mid-scan.
-            let _ = progress.blocking_send(DaemonResponse::ScanProgress {
-                done:  i + 1,
-                total,
-            });
+            done += 1;
+            let _ = progress.blocking_send(DaemonResponse::ScanProgress { done, total });
         }
 
-        // One final lock acquisition for prune + get_all.
-        let guard = cache.blocking_lock();
+        // Local files — file mtime used as cache key (same role as pkg_mtime_secs)
+        for info in local_infos {
+            let mtime = std::fs::metadata(&info.file_path)
+                .and_then(|m| m.modified())
+                .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+                .unwrap_or(0);
+            {
+                let guard = cache.blocking_lock();
+                if let Err(e) = guard.upsert(&info, mtime) {
+                    tracing::warn!("Cache upsert failed for local '{}': {}", info.file_path, e);
+                }
+            }
+            results.push(info);
+            done += 1;
+            let _ = progress.blocking_send(DaemonResponse::ScanProgress { done, total });
+        }
+
+        // Prune entries that no longer exist on disk, then return full list.
+        let guard      = cache.blocking_lock();
         let active_ids: Vec<u64> = results.iter().map(|w| w.id).collect();
         if let Err(e) = guard.prune(&active_ids) {
             tracing::warn!("Cache prune failed: {}", e);

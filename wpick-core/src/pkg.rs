@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::discovery::WallpaperDir;
 use crate::error::{Result, WpickError};
-use crate::model::{WallpaperInfo, WallpaperType};
+use crate::model::{WallpaperInfo, WallpaperSource, WallpaperType};
 
 // ─── project.json schema ─────────────────────────────────────────────────────
 
@@ -180,6 +180,7 @@ fn build_wallpaper_info(
         file_size_bytes,
         width:          0,
         height:         0,
+        source:         WallpaperSource::Workshop,
     }))
 }
 

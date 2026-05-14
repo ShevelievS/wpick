@@ -9,4 +9,4 @@ pub mod pkg;
 pub use config::{AppDirs, WpickConfig};
 pub use error::{Result, WpickError};
 pub use ipc::{ClientCommand, DaemonResponse};
-pub use model::{WallpaperInfo, WallpaperType};
+pub use model::{WallpaperInfo, WallpaperSource, WallpaperType};

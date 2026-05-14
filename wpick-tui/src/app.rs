@@ -7,17 +7,19 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use std::io::Stdout;
 use std::time::Duration;
-use wpick_core::config::{AppDirs, WpickConfig};
+use wpick_core::config::{AppDirs, FitMode, WpickConfig};
 use wpick_core::ipc::{ClientCommand, DaemonResponse};
-use wpick_core::model::WallpaperInfo;
+use wpick_core::model::{WallpaperInfo, WallpaperSource};
 
 use crate::client::IpcClient;
 use crate::ui;
 
+/// Source-based filter: All wallpapers, Workshop only, or a specific local folder by label.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterType {
     All,
-    Video,
+    Workshop,
+    Local(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +51,8 @@ pub struct App {
     pub picker:                  Option<Picker>,
     pub preview:                 Option<StatefulProtocol>,
     pub preview_id:              Option<u64>,
+    /// Current active fit mode (for display and cycling).
+    pub current_fit:             FitMode,
     // Monitor selector
     /// Connected wl_output names and resolutions fetched from the daemon.
     pub monitors:                Vec<(String, u32, u32)>,
@@ -79,6 +83,7 @@ impl App {
             search_query:            String::new(),
             search_active:           false,
             filter_type:             FilterType::All,
+            current_fit:             FitMode::default(),
             picker:                  Some(picker),
             preview:                 None,
             preview_id:              None,
@@ -141,10 +146,41 @@ impl App {
 
     pub fn filtered_wallpapers(&self) -> Vec<&WallpaperInfo> {
         self.wallpapers.iter().filter(|w| {
+            let source_ok = match &self.filter_type {
+                FilterType::All          => true,
+                FilterType::Workshop     => w.source == WallpaperSource::Workshop,
+                FilterType::Local(label) => matches!(
+                    &w.source, WallpaperSource::Local { label: l } if l == label
+                ),
+            };
             let search_ok = self.search_query.is_empty()
                 || w.title.to_lowercase().contains(&self.search_query.to_lowercase());
-            search_ok
+            source_ok && search_ok
         }).collect()
+    }
+
+    /// Collect distinct source labels from the wallpaper list for Tab cycling.
+    /// Order: Workshop first, then Local labels alphabetically.
+    pub fn available_sources(&self) -> Vec<FilterType> {
+        let mut sources = vec![FilterType::All];
+        let has_workshop = self.wallpapers.iter()
+            .any(|w| w.source == WallpaperSource::Workshop);
+        if has_workshop {
+            sources.push(FilterType::Workshop);
+        }
+        let mut local_labels: Vec<String> = self.wallpapers.iter()
+            .filter_map(|w| match &w.source {
+                WallpaperSource::Local { label } => Some(label.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        local_labels.sort();
+        for label in local_labels {
+            sources.push(FilterType::Local(label));
+        }
+        sources
     }
 
     fn select_next(&mut self) {
@@ -297,6 +333,9 @@ impl App {
                     self.set_status_error("No monitors reported by daemon (try 'r' to refresh)");
                 }
             }
+            KeyCode::Char('f') => {
+                self.cmd_cycle_fit().await;
+            }
             KeyCode::Char('i') => {
                 self.mode = match self.mode {
                     AppMode::Browse => AppMode::Detail,
@@ -313,10 +352,12 @@ impl App {
                 self.update_preview();
             }
             KeyCode::Tab => {
-                self.filter_type = match self.filter_type {
-                    FilterType::All   => FilterType::Video,
-                    FilterType::Video => FilterType::All,
-                };
+                let sources = self.available_sources();
+                if sources.len() > 1 {
+                    let cur = sources.iter().position(|s| s == &self.filter_type)
+                        .unwrap_or(0);
+                    self.filter_type = sources[(cur + 1) % sources.len()].clone();
+                }
                 self.selected = 0;
                 let empty = self.filtered_wallpapers().is_empty();
                 self.list_state.select(if empty { None } else { Some(0) });
@@ -410,6 +451,25 @@ impl App {
                 self.config.general.muted = !self.config.general.muted;
                 let label = if self.config.general.muted { "Muted" } else { "Unmuted" };
                 self.set_status_ok(label);
+            }
+            Err(e) => self.set_status_error(e.to_string()),
+        }
+    }
+
+    async fn cmd_cycle_fit(&mut self) {
+        let next = match self.current_fit {
+            FitMode::Fit     => FitMode::Fill,
+            FitMode::Fill    => FitMode::Stretch,
+            FitMode::Stretch => FitMode::Center,
+            FitMode::Center  => FitMode::Fit,
+        };
+        let monitor = self.monitors.get(
+            self.monitor_selected.saturating_sub(1)
+        ).map(|(n, _, _)| n.clone());
+        match self.send(ClientCommand::SetFit { fit: next, monitor }).await {
+            Ok(_) => {
+                self.current_fit = next;
+                self.set_status_ok(format!("Fit: {}", fit_label(next)));
             }
             Err(e) => self.set_status_error(e.to_string()),
         }
@@ -596,6 +656,15 @@ impl App {
     }
 }
 
+pub fn fit_label(fit: FitMode) -> &'static str {
+    match fit {
+        FitMode::Fit     => "letterbox",
+        FitMode::Fill    => "fill",
+        FitMode::Stretch => "stretch",
+        FitMode::Center  => "center",
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -626,6 +695,7 @@ mod tests {
             search_query:           String::new(),
             search_active:          false,
             filter_type:            FilterType::All,
+            current_fit:            FitMode::default(),
             picker:                 None,
             preview:                None,
             preview_id:             None,
@@ -646,6 +716,7 @@ mod tests {
             file_size_bytes: 1024,
             width:           0,
             height:          0,
+            source:          wpick_core::model::WallpaperSource::Workshop,
         }
     }
 

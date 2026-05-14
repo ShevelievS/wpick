@@ -4,9 +4,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
-use wpick_core::model::WallpaperInfo;
+use wpick_core::model::{WallpaperInfo, WallpaperSource};
 
-use crate::app::{App, AppMode, FilterType};
+use crate::app::{App, AppMode, FilterType, fit_label};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     if frame.area().width < 80 || frame.area().height < 20 {
@@ -129,33 +129,67 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     // before calling app.list_state.select() (avoids simultaneous mut + immut borrow)
     let (title, items, maybe_list_idx) = {
         let filtered = app.filtered_wallpapers();
-        let total = app.wallpapers.len();
-        let fc = filtered.len();
+        let total    = app.wallpapers.len();
+        let fc       = filtered.len();
 
-        let title = match (&app.filter_type, app.search_query.is_empty()) {
-            (FilterType::All, true)  => format!("Wallpapers ({})", total),
-            (FilterType::All, false) => format!("Search: {} ({})", app.search_query, fc),
-            (f, true)                => format!("{:?} ({})", f, fc),
-            (f, false)               => format!("{:?}: {} ({})", f, app.search_query, fc),
+        let filter_label = match &app.filter_type {
+            FilterType::All          => "All".to_owned(),
+            FilterType::Workshop     => "Workshop".to_owned(),
+            FilterType::Local(label) => label.clone(),
+        };
+        let title = if app.search_query.is_empty() {
+            format!("{} ({}/{})", filter_label, fc, total)
+        } else {
+            format!("{}: \"{}\" ({})", filter_label, app.search_query, fc)
         };
 
         if app.loading {
             (title, vec![ListItem::new(" Loading\u{2026}")], None)
         } else if filtered.is_empty() {
-            let msg = if app.wallpapers.is_empty() {
-                " No wallpapers found."
-            } else {
-                " No matches."
-            };
+            let msg = if app.wallpapers.is_empty() { " No wallpapers found." } else { " No matches." };
             (title, vec![ListItem::new(msg)], None)
         } else {
             let idx = app.selected.min(filtered.len().saturating_sub(1));
-            let v: Vec<ListItem> = filtered.iter()
-                .map(|w| make_wallpaper_item(w, app.current_wallpaper_id))
-                .collect();
-            (title, v, Some(idx))
+
+            // Group by source only when showing All — add section separators.
+            let show_separators = app.filter_type == FilterType::All
+                && app.available_sources().len() > 2; // All + at least two real sources
+
+            let mut v: Vec<ListItem> = Vec::new();
+            let mut list_idx = idx; // default: flat index = list index
+
+            if show_separators {
+                let mut current_source_label: Option<String> = None;
+                let mut flat_pos = 0usize; // position in the flat `filtered` slice
+                let mut list_pos = 0usize; // position in the `v` vec (includes separators)
+                let mut target_list_pos = 0usize;
+
+                for (i, w) in filtered.iter().enumerate() {
+                    let src_label = match &w.source {
+                        WallpaperSource::Workshop          => "Workshop".to_owned(),
+                        WallpaperSource::Local { label }   => label.clone(),
+                    };
+                    if current_source_label.as_deref() != Some(src_label.as_str()) {
+                        v.push(separator(format!("  \u{2500}\u{2500} {} \u{2500}\u{2500}", src_label)));
+                        if flat_pos <= idx { target_list_pos = list_pos; }
+                        list_pos += 1;
+                        current_source_label = Some(src_label);
+                    }
+                    if i == idx { target_list_pos = list_pos; }
+                    v.push(make_wallpaper_item(w, app.current_wallpaper_id));
+                    flat_pos += 1;
+                    list_pos += 1;
+                }
+                list_idx = target_list_pos;
+            } else {
+                v = filtered.iter()
+                    .map(|w| make_wallpaper_item(w, app.current_wallpaper_id))
+                    .collect();
+            }
+
+            (title, v, Some(list_idx))
         }
-        // `filtered` drops here, releasing the immutable borrow of app
+        // `filtered` drops here
     };
 
     app.list_state.select(maybe_list_idx);
@@ -166,6 +200,13 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, list_area, &mut app.list_state);
+}
+
+fn separator(text: String) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        text,
+        Style::default().fg(Color::DarkGray),
+    )))
 }
 
 fn make_wallpaper_item(w: &WallpaperInfo, current_id: Option<u64>) -> ListItem<'static> {
@@ -290,7 +331,6 @@ fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let screen_res = app.screen_resolution_for_wallpaper(w);
         match screen_res {
             Some((sw, sh)) if sw > 0 && sh > 0 && (sw != w.width || sh != w.height) => {
-                // Resolution mismatch warning
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("\u{26a0} {}  \u{2260}  screen {}×{}", res_text, sw, sh),
@@ -306,6 +346,19 @@ fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             }
         }
     }
+
+    // Row 4: source + fit mode
+    let source_str = match &w.source {
+        WallpaperSource::Workshop          => "Workshop".to_owned(),
+        WallpaperSource::Local { label }   => format!("Local: {}", label),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(source_str, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  fit: {}", fit_label(app.current_fit)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
 
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -333,16 +386,19 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect) {
     let lbl  = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
     let mkey = Span::styled("m", Style::default().fg(Color::Yellow));
 
+    let fkey = |s: &'static str| Span::styled(s, Style::default().fg(Color::Magenta));
+
     let line1 = Line::from(vec![
         key("\u{2191}\u{2193}/jk"), lbl(" nav  "),
         key("Enter"),               lbl(" apply  "),
         key("+/-"),                 lbl(" vol  "),
         mkey,                       lbl(" mute  "),
+        fkey("f"),                  lbl(" fitmode  "),
         key("r"),                   lbl(" refresh  "),
-        key("/"),                   lbl(" search  "),
-        key("Tab"),                 lbl(" filter"),
+        key("/"),                   lbl(" search"),
     ]);
     let line2 = Line::from(vec![
+        key("Tab"),   lbl(" filter  "),
         key("i"),     lbl(" detail  "),
         key("q"),     lbl(" quit (daemon runs)  "),
         key("Q"),     lbl(" kill daemon"),

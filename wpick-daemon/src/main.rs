@@ -165,6 +165,9 @@ async fn main() -> anyhow::Result<()> {
     // Per-monitor overrides channel — renderer subscribes to apply dynamic pins.
     let (per_monitor_tx, per_monitor_rx) =
         sync::watch::channel(std::collections::HashMap::<String, Option<WallpaperInfo>>::new());
+    // FitMode updates: (monitor_name or "*", fit) — renderer subscribes.
+    let (fit_tx, fit_rx) =
+        sync::watch::channel(("*".to_owned(), wpick_core::config::FitMode::default()));
     // Shared output list published by the renderer and read by the IPC server.
     let outputs: Arc<std::sync::Mutex<Vec<(String, u32, u32)>>> =
         Arc::new(std::sync::Mutex::new(Vec::<(String, u32, u32)>::new()));
@@ -179,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
         volume_tx,
         shutdown_tx: shutdown_tx.clone(),
         per_monitor_tx,
+        fit_tx,
         outputs,
     }));
 
@@ -368,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit, per_monitor_rx, outputs_renderer))
+        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit, per_monitor_rx, fit_rx, outputs_renderer))
         .await
         .context("Renderer error")?;
 
