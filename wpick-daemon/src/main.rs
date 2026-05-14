@@ -172,27 +172,25 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. DaemonState
     let state = Arc::new(sync::Mutex::new(DaemonState {
-        current:          None,
-        volume:           config.general.volume,
-        muted:            config.general.muted,
+        current:     None,
+        volume:      config.general.volume,
+        muted:       config.general.muted,
         wallpaper_tx,
         volume_tx,
-        shutdown_tx:      shutdown_tx.clone(),
+        shutdown_tx: shutdown_tx.clone(),
         per_monitor_tx,
         outputs,
-        webview_children: Arc::new(std::sync::Mutex::new(Vec::new())),
     }));
 
     // 5b. Restore last wallpaper from config (persist-on-restart).
     if let Some(last_id) = config.last_wallpaper_id {
         let guard = cache.lock().await;
         match guard.get_by_id(last_id) {
-            Ok(Some(info)) if info.is_supported() => {
+            Ok(Some(info)) => {
                 tracing::info!("restoring last wallpaper id={}", last_id);
                 state.lock().await.set_wallpaper(info);
             }
-            Ok(Some(_)) => tracing::info!("last wallpaper id={} unsupported — skipping", last_id),
-            Ok(None)    => tracing::info!("last wallpaper id={} not in cache — skipping", last_id),
+            Ok(None) => tracing::info!("last wallpaper id={} not in cache — skipping", last_id),
             Err(e)      => tracing::warn!("failed to look up last wallpaper id={}: {}", last_id, e),
         }
     }
@@ -259,17 +257,11 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to spawn competitor watchdog thread")?;
     }
 
-    // 9. Cleanup helper — removes socket, kills webviews, resumes any SIGSTOP'd competitors.
-    let webview_children_cleanup = state.lock().await.webview_children.clone();
+    // 9. Cleanup helper — removes socket, resumes any SIGSTOP'd competitors.
     let cleanup = {
-        let sp       = socket_path.clone();
-        let pids     = Arc::clone(&paused_pids);
-        let children = webview_children_cleanup;
+        let sp   = socket_path.clone();
+        let pids = Arc::clone(&paused_pids);
         move || {
-            if let Ok(mut g) = children.lock() {
-                for child in g.iter_mut() { let _ = child.kill(); }
-                g.clear();
-            }
             let _ = std::fs::remove_file(&sp);
             if let Ok(g) = pids.lock() { resume_paused_tools(&g); }
         }

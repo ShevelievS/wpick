@@ -1,5 +1,5 @@
 [workspace]
-members = ["wpick-core", "wpick-tui", "wpick-daemon", "wpick-webview"]
+members = ["wpick-core", "wpick-tui", "wpick-daemon"]
 resolver = "2"
 
 [workspace.dependencies]

@@ -8,20 +8,11 @@ pub struct DaemonState {
     pub current:         Option<WallpaperInfo>,
     pub volume:          f32,
     pub muted:           bool,
-    /// Single channel — both renderer and audio subscribe to the same receiver.
-    /// Sending once guarantees they see the change in the same Tokio tick,
-    /// eliminating the A/V skew caused by two sequential sends.
     pub wallpaper_tx:    watch::Sender<Option<WallpaperInfo>>,
     pub volume_tx:       watch::Sender<(f32, bool)>,
     pub shutdown_tx:     broadcast::Sender<()>,
-    /// Per-monitor wallpaper overrides — `None` in the map value means "unpin".
-    /// Renderer subscribes via `per_monitor_rx` and updates surface decoders.
     pub per_monitor_tx:  watch::Sender<HashMap<String, Option<WallpaperInfo>>>,
-    /// Connected wl_output names and resolutions published by the renderer after each init.
     pub outputs:         Arc<Mutex<Vec<(String, u32, u32)>>>,
-    /// Running wpick-webview child processes (one per active web wallpaper).
-    /// Killed when a new wallpaper is set or the daemon exits.
-    pub webview_children: Arc<Mutex<Vec<std::process::Child>>>,
 }
 
 impl DaemonState {
@@ -32,14 +23,6 @@ impl DaemonState {
 
     #[allow(dead_code)]
     pub fn stop(&mut self) {
-        self.current = None;
-        let _ = self.wallpaper_tx.send(None);
-    }
-
-    /// Clear the current wallpaper and tell the renderer to blank its surface.
-    /// Used when a web wallpaper is set so the wl_shm surface stops occluding
-    /// the wpick-webview GTK layer-shell surface.
-    pub fn clear_wallpaper(&mut self) {
         self.current = None;
         let _ = self.wallpaper_tx.send(None);
     }

@@ -12,7 +12,6 @@ tokio           = { workspace = true }
 toml            = "0.8"
 dirs            = "5"
 rusqlite        = { version = "0.32", features = ["bundled"] }
-image           = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 keyvalues-serde = "0.2"
 walkdir         = "2"
 

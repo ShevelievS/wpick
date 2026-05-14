@@ -6,16 +6,12 @@ use std::fmt;
 #[serde(rename_all = "lowercase")]
 pub enum WallpaperType {
     Video,
-    Scene,
-    Web,
 }
 
 impl fmt::Display for WallpaperType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WallpaperType::Video => write!(f, "video"),
-            WallpaperType::Scene => write!(f, "scene"),
-            WallpaperType::Web   => write!(f, "web"),
         }
     }
 }
@@ -27,7 +23,6 @@ pub struct WallpaperInfo {
     pub id: u64,
     /// Human-readable title from `project.json`
     pub title: String,
-    /// Video / Scene / Web
     pub wallpaper_type: WallpaperType,
     /// Absolute path to the playable file (e.g. the extracted mp4)
     pub file_path: String,
@@ -47,22 +42,7 @@ pub struct WallpaperInfo {
 
 impl WallpaperInfo {
     /// Returns a single Unicode character icon for the wallpaper type.
-    /// No allocation — returns `&'static str`.
     pub fn type_icon(&self) -> &'static str {
-        match self.wallpaper_type {
-            WallpaperType::Video => "\u{25b6}",  // ▶
-            WallpaperType::Scene => "\u{25c6}",  // ◆
-            WallpaperType::Web   => "\u{2295}",  // ⊕
-        }
-    }
-
-    /// Returns `true` when the daemon can render this wallpaper.
-    /// - Video: always supported.
-    /// - Scene/Web: supported when `file_path` is non-empty (preview image/gif present).
-    pub fn is_supported(&self) -> bool {
-        match self.wallpaper_type {
-            WallpaperType::Video => true,
-            WallpaperType::Scene | WallpaperType::Web => !self.file_path.is_empty(),
-        }
+        "\u{25b6}"  // ▶
     }
 }

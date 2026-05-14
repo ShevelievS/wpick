@@ -155,86 +155,32 @@ fn build_wallpaper_info(
     file_base:    &Path,
     preview_base: &Path,
 ) -> Result<Option<WallpaperInfo>> {
-    let wtype = match project.wallpaper_type.to_lowercase().as_str() {
-        "video" => WallpaperType::Video,
-        "scene" => WallpaperType::Scene,
-        "web"   => WallpaperType::Web,
-        _       => return Ok(None),
-    };
+    if project.wallpaper_type.to_lowercase() != "video" {
+        return Ok(None);
+    }
 
     let preview_path = project.preview.as_ref().map(|p| {
         preview_base.join(p).to_string_lossy().into_owned()
     });
 
-    match wtype {
-        WallpaperType::Video => {
-            let file_name = match project.file.as_ref() {
-                Some(f) => f.clone(),
-                None    => return Ok(None),
-            };
-            let video_path = file_base.join(&file_name);
-            if !video_path.exists() { return Ok(None); }
-            let file_size_bytes = std::fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
-            Ok(Some(WallpaperInfo {
-                id,
-                title:          project.title,
-                wallpaper_type: WallpaperType::Video,
-                file_path:      video_path.to_string_lossy().into_owned(),
-                preview_path,
-                has_audio:      project.sound_enabled,
-                file_size_bytes,
-                width:          0,
-                height:         0,
-            }))
-        }
-
-        WallpaperType::Scene => {
-            // Scene wallpapers are displayed via their preview image (gif or static).
-            // No preview → nothing to show → skip silently.
-            let preview_file = match &preview_path {
-                Some(p) => p.clone(),
-                None    => return Ok(None),
-            };
-            let preview_pb = Path::new(&preview_file);
-            if !preview_pb.exists() { return Ok(None); }
-            let file_size_bytes = std::fs::metadata(preview_pb).map(|m| m.len()).unwrap_or(0);
-            let (width, height) = image::image_dimensions(preview_pb).unwrap_or((0, 0));
-            Ok(Some(WallpaperInfo {
-                id,
-                title:          project.title,
-                wallpaper_type: WallpaperType::Scene,
-                file_path:      preview_file.clone(),
-                preview_path:   Some(preview_file),
-                has_audio:      false,
-                file_size_bytes,
-                width,
-                height,
-            }))
-        }
-
-        WallpaperType::Web => {
-            // Web wallpapers are rendered by wpick-webview via webkit2gtk.
-            // file_path = the HTML entry point; preview_path = thumbnail image.
-            let html_name = match project.file.as_ref() {
-                Some(f) => f.clone(),
-                None    => return Ok(None),
-            };
-            let html_path = file_base.join(&html_name);
-            if !html_path.exists() { return Ok(None); }
-            let file_size_bytes = std::fs::metadata(&html_path).map(|m| m.len()).unwrap_or(0);
-            Ok(Some(WallpaperInfo {
-                id,
-                title:          project.title,
-                wallpaper_type: WallpaperType::Web,
-                file_path:      html_path.to_string_lossy().into_owned(),
-                preview_path,
-                has_audio:      false,
-                file_size_bytes,
-                width:          0,
-                height:         0,
-            }))
-        }
-    }
+    let file_name = match project.file.as_ref() {
+        Some(f) => f.clone(),
+        None    => return Ok(None),
+    };
+    let video_path = file_base.join(&file_name);
+    if !video_path.exists() { return Ok(None); }
+    let file_size_bytes = std::fs::metadata(&video_path).map(|m| m.len()).unwrap_or(0);
+    Ok(Some(WallpaperInfo {
+        id,
+        title:          project.title,
+        wallpaper_type: WallpaperType::Video,
+        file_path:      video_path.to_string_lossy().into_owned(),
+        preview_path,
+        has_audio:      project.sound_enabled,
+        file_size_bytes,
+        width:          0,
+        height:         0,
+    }))
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -318,17 +264,33 @@ mod tests {
     }
 
     #[test]
-    fn test_scene_no_preview_returns_none() -> crate::error::Result<()> {
+    fn test_scene_type_returns_none() -> crate::error::Result<()> {
         let tmp       = TempDir::new()?;
         let cache_dir = TempDir::new()?;
 
-        // Scene with no preview field → nothing to display → None.
-        let project_json = r#"{"title":"Scene WP","type":"scene","file":"scene.pkg"}"#;
+        let project_json = r#"{"title":"Scene WP","type":"scene","file":"scene.pkg","preview":"p.gif"}"#;
         std::fs::write(tmp.path().join("project.json"), project_json)?;
+        std::fs::write(tmp.path().join("p.gif"), b"GIF89a")?;
 
         let wd     = make_wallpaper_dir(99990, tmp.path());
         let result = extract_and_parse(&wd, cache_dir.path())?;
-        assert!(result.is_none(), "scene with no preview must return None");
+        assert!(result.is_none(), "scene type must return None (not supported)");
+        Ok(())
+    }
+
+    #[test]
+    fn test_web_type_returns_none() -> crate::error::Result<()> {
+        let tmp       = TempDir::new()?;
+        let cache_dir = TempDir::new()?;
+
+        std::fs::write(tmp.path().join("index.html"), b"<html></html>")?;
+        let project_json = r#"{"title":"Web WP","type":"web","file":"index.html","preview":"p.jpg"}"#;
+        std::fs::write(tmp.path().join("project.json"), project_json)?;
+        std::fs::write(tmp.path().join("p.jpg"), b"\xff\xd8\xff")?;
+
+        let wd     = make_wallpaper_dir(99986, tmp.path());
+        let result = extract_and_parse(&wd, cache_dir.path())?;
+        assert!(result.is_none(), "web type must return None (not supported)");
         Ok(())
     }
 
@@ -347,84 +309,5 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_scene_with_preview_returns_some() -> crate::error::Result<()> {
-        let tmp       = TempDir::new()?;
-        let cache_dir = TempDir::new()?;
-
-        // Minimal preview.gif in the wallpaper dir (no scene.pkg — direct).
-        std::fs::write(tmp.path().join("preview.gif"), b"GIF89a")?;
-        let project_json = r#"{"title":"My Scene","type":"scene","preview":"preview.gif"}"#;
-        std::fs::write(tmp.path().join("project.json"), project_json)?;
-
-        let wd     = make_wallpaper_dir(99988, tmp.path());
-        let result = extract_and_parse(&wd, cache_dir.path())?;
-        let info   = result.expect("scene with preview must return Some");
-
-        assert_eq!(info.wallpaper_type, WallpaperType::Scene);
-        assert_eq!(info.title, "My Scene");
-        assert!(info.file_path.ends_with("preview.gif"));
-        assert!(info.preview_path.as_ref().map(|p| p.ends_with("preview.gif")).unwrap_or(false));
-        assert!(!info.has_audio);
-        Ok(())
-    }
-
-    #[test]
-    fn test_scene_with_pkg_still_works() -> crate::error::Result<()> {
-        // Real-world layout: scene.pkg + preview.gif + project.json side by side in wallpaper dir.
-        // scene.pkg is ignored; project.json and preview.gif are read from the dir directly.
-        let tmp       = TempDir::new()?;
-        let cache_dir = TempDir::new()?;
-
-        std::fs::write(tmp.path().join("preview.gif"), b"GIF89a")?;
-        std::fs::write(tmp.path().join("project.json"),
-            br#"{"title":"PKG Scene","type":"scene","preview":"preview.gif"}"#)?;
-        std::fs::write(tmp.path().join("scene.pkg"), b"some-binary-data")?;
-
-        let wd     = make_wallpaper_dir(99985, tmp.path());
-        let result = extract_and_parse(&wd, cache_dir.path())?;
-        let info   = result.expect("scene with scene.pkg must still parse correctly");
-
-        assert_eq!(info.wallpaper_type, WallpaperType::Scene);
-        assert!(info.file_path.ends_with("preview.gif"),
-            "file_path must point to preview, got: {}", info.file_path);
-        Ok(())
-    }
-
-    #[test]
-    fn test_web_with_html_returns_some() -> crate::error::Result<()> {
-        let tmp       = TempDir::new()?;
-        let cache_dir = TempDir::new()?;
-
-        std::fs::write(tmp.path().join("index.html"), b"<html></html>")?;
-        std::fs::write(tmp.path().join("preview.jpg"), b"\xff\xd8\xff")?;
-        let project_json = r#"{"title":"My Web","type":"web","file":"index.html","preview":"preview.jpg"}"#;
-        std::fs::write(tmp.path().join("project.json"), project_json)?;
-
-        let wd     = make_wallpaper_dir(99987, tmp.path());
-        let result = extract_and_parse(&wd, cache_dir.path())?;
-        let info   = result.expect("web with html file must return Some");
-
-        assert_eq!(info.wallpaper_type, WallpaperType::Web);
-        assert!(info.file_path.ends_with("index.html"), "file_path must point to HTML, got: {}", info.file_path);
-        assert!(info.preview_path.as_ref().map(|p| p.ends_with("preview.jpg")).unwrap_or(false));
-        Ok(())
-    }
-
-    #[test]
-    fn test_web_no_html_file_returns_none() -> crate::error::Result<()> {
-        let tmp       = TempDir::new()?;
-        let cache_dir = TempDir::new()?;
-
-        // No file field → None.
-        let project_json = r#"{"title":"Web","type":"web","preview":"preview.jpg"}"#;
-        std::fs::write(tmp.path().join("project.json"), project_json)?;
-        std::fs::write(tmp.path().join("preview.jpg"), b"\xff\xd8\xff")?;
-
-        let wd     = make_wallpaper_dir(99986, tmp.path());
-        let result = extract_and_parse(&wd, cache_dir.path())?;
-        assert!(result.is_none(), "web with no file field must return None");
-        Ok(())
-    }
 
 }

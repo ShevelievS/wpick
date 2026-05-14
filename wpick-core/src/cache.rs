@@ -160,11 +160,9 @@ fn row_to_info(row: &rusqlite::Row) -> rusqlite::Result<WallpaperInfo> {
     let id: i64 = row.get(0)?;
     let wallpaper_type = match type_str.as_str() {
         "video" => WallpaperType::Video,
-        "web"   => WallpaperType::Web,
-        "scene" => WallpaperType::Scene,
         other   => {
-            tracing::warn!(id, type_str = other, "Unknown wallpaper_type in DB — treating as Scene");
-            WallpaperType::Scene
+            tracing::debug!(id, type_str = other, "Unsupported wallpaper_type in DB — defaulting to Video (will be pruned on next scan)");
+            WallpaperType::Video
         }
     };
     Ok(WallpaperInfo {

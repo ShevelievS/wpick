@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use wpick_core::cache::Cache;
 use wpick_core::config::{AppDirs, WpickConfig};
 use wpick_core::ipc::{recv_command, send_response};
-use wpick_core::model::{WallpaperInfo, WallpaperType};
+use wpick_core::model::WallpaperInfo;
 use wpick_core::{ClientCommand, DaemonResponse};
 
 use crate::state::DaemonState;
@@ -111,24 +111,6 @@ async fn dispatch(
                 }
             };
 
-            if !info.is_supported() {
-                return DaemonResponse::Error {
-                    message: format!("Unsupported type: {}", info.wallpaper_type),
-                };
-            }
-
-            // Web wallpapers are rendered by wpick-webview (separate process).
-            // Scene and Video go through the normal wl_shm renderer.
-            if info.wallpaper_type == WallpaperType::Web {
-                let children_arc = state.lock().await.webview_children.clone();
-                spawn_webview(children_arc, &info.file_path, monitor.as_deref());
-                save_last_wallpaper_id(id);
-                // Clear the wl_shm surface so it no longer occludes the
-                // wpick-webview GTK layer-shell surface on the Background layer.
-                state.lock().await.clear_wallpaper();
-                return DaemonResponse::Ok;
-            }
-
             match monitor {
                 Some(name) => {
                     state.lock().await.set_wallpaper_for_monitor(name.clone(), info);
@@ -229,50 +211,6 @@ fn save_last_wallpaper_id(id: u64) {
             tracing::warn!("Config save (last_wallpaper_id) failed: {}", e);
         }
     });
-}
-
-/// Kill all running webview children and spawn a new wpick-webview process.
-///
-/// `wpick-webview` is expected to be in the same directory as `wpick-daemon`
-/// or anywhere in `PATH`.
-fn spawn_webview(
-    children: Arc<std::sync::Mutex<Vec<std::process::Child>>>,
-    html_path: &str,
-    monitor:   Option<&str>,
-) {
-    // Kill previous webview processes.
-    if let Ok(mut g) = children.lock() {
-        for child in g.iter_mut() {
-            let _ = child.kill();
-        }
-        g.clear();
-    }
-
-    // Locate wpick-webview next to the current executable, then fall back to PATH.
-    let exe = std::env::current_exe().ok();
-    let webview_bin = exe
-        .as_ref()
-        .and_then(|p| p.parent())
-        .map(|d| d.join("wpick-webview"))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("wpick-webview"));
-
-    let mut cmd = std::process::Command::new(&webview_bin);
-    cmd.arg("--file").arg(html_path);
-    if let Some(m) = monitor {
-        cmd.arg("--output").arg(m);
-    }
-    cmd.stdin(std::process::Stdio::null())
-       .stdout(std::process::Stdio::null())
-       .stderr(std::process::Stdio::null());
-
-    match cmd.spawn() {
-        Ok(child) => {
-            tracing::info!("spawned wpick-webview pid={}", child.id());
-            if let Ok(mut g) = children.lock() { g.push(child); }
-        }
-        Err(e) => tracing::warn!("failed to spawn wpick-webview: {}", e),
-    }
 }
 
 /// Persist a per-monitor wallpaper assignment to config so the renderer reloads it after restart.

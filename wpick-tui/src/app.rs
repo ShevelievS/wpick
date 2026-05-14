@@ -9,7 +9,7 @@ use std::io::Stdout;
 use std::time::Duration;
 use wpick_core::config::{AppDirs, WpickConfig};
 use wpick_core::ipc::{ClientCommand, DaemonResponse};
-use wpick_core::model::{WallpaperInfo, WallpaperType};
+use wpick_core::model::WallpaperInfo;
 
 use crate::client::IpcClient;
 use crate::ui;
@@ -18,8 +18,6 @@ use crate::ui;
 pub enum FilterType {
     All,
     Video,
-    Scene,
-    Web,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,18 +141,9 @@ impl App {
 
     pub fn filtered_wallpapers(&self) -> Vec<&WallpaperInfo> {
         self.wallpapers.iter().filter(|w| {
-            let type_ok = match self.filter_type {
-                FilterType::All   => true,
-                FilterType::Video => matches!(w.wallpaper_type, WallpaperType::Video),
-                FilterType::Scene => matches!(w.wallpaper_type, WallpaperType::Scene),
-                FilterType::Web   => matches!(w.wallpaper_type, WallpaperType::Web),
-            };
-            let search_ok = if self.search_query.is_empty() {
-                true
-            } else {
-                w.title.to_lowercase().contains(&self.search_query.to_lowercase())
-            };
-            type_ok && search_ok
+            let search_ok = self.search_query.is_empty()
+                || w.title.to_lowercase().contains(&self.search_query.to_lowercase());
+            search_ok
         }).collect()
     }
 
@@ -326,9 +315,7 @@ impl App {
             KeyCode::Tab => {
                 self.filter_type = match self.filter_type {
                     FilterType::All   => FilterType::Video,
-                    FilterType::Video => FilterType::Scene,
-                    FilterType::Scene => FilterType::Web,
-                    FilterType::Web   => FilterType::All,
+                    FilterType::Video => FilterType::All,
                 };
                 self.selected = 0;
                 let empty = self.filtered_wallpapers().is_empty();

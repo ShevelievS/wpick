@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
-use wpick_core::model::{WallpaperInfo, WallpaperType};
+use wpick_core::model::WallpaperInfo;
 
 use crate::app::{App, AppMode, FilterType};
 
@@ -150,33 +150,10 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
             (title, vec![ListItem::new(msg)], None)
         } else {
             let idx = app.selected.min(filtered.len().saturating_sub(1));
-            let list_idx = filtered_wallpaper_idx_to_list_idx(&filtered, idx);
-
-            let mut v: Vec<ListItem> = Vec::new();
-
-            let videos: Vec<&WallpaperInfo> = filtered.iter()
-                .copied()
-                .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
+            let v: Vec<ListItem> = filtered.iter()
+                .map(|w| make_wallpaper_item(w, app.current_wallpaper_id))
                 .collect();
-            let others: Vec<&WallpaperInfo> = filtered.iter()
-                .copied()
-                .filter(|w| !matches!(w.wallpaper_type, WallpaperType::Video))
-                .collect();
-
-            if !videos.is_empty() {
-                v.push(separator("  \u{2500}\u{2500} video \u{2500}\u{2500}"));
-                for w in &videos {
-                    v.push(make_wallpaper_item(w, app.current_wallpaper_id));
-                }
-            }
-            if !others.is_empty() {
-                v.push(separator("  \u{2500}\u{2500} scene \u{00b7} web \u{2500}\u{2500}"));
-                for w in &others {
-                    v.push(make_wallpaper_item(w, app.current_wallpaper_id));
-                }
-            }
-
-            (title, v, Some(list_idx))
+            (title, v, Some(idx))
         }
         // `filtered` drops here, releasing the immutable borrow of app
     };
@@ -191,38 +168,8 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     frame.render_stateful_widget(list, list_area, &mut app.list_state);
 }
 
-fn filtered_wallpaper_idx_to_list_idx(filtered: &[&WallpaperInfo], idx: usize) -> usize {
-    let n_videos = filtered.iter()
-        .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
-        .count();
-
-    let w = match filtered.get(idx) {
-        Some(w) => w,
-        None    => return 0,
-    };
-    if matches!(w.wallpaper_type, WallpaperType::Video) {
-        let video_rank = filtered[..idx].iter()
-            .filter(|w| matches!(w.wallpaper_type, WallpaperType::Video))
-            .count();
-        1 + video_rank
-    } else {
-        let non_video_rank = filtered[..idx].iter()
-            .filter(|w| !matches!(w.wallpaper_type, WallpaperType::Video))
-            .count();
-        let video_sep = if n_videos > 0 { 1 } else { 0 };
-        video_sep + n_videos + 1 + non_video_rank
-    }
-}
-
-fn separator(text: &'static str) -> ListItem<'static> {
-    ListItem::new(Line::from(Span::styled(
-        text,
-        Style::default().fg(Color::DarkGray),
-    )))
-}
-
 fn make_wallpaper_item(w: &WallpaperInfo, current_id: Option<u64>) -> ListItem<'static> {
-    let (icon, icon_color) = type_icon_and_color(&w.wallpaper_type);
+    let (icon, icon_color) = ("\u{25b6}", Color::Blue); // ▶
 
     let mut spans: Vec<Span<'static>> = vec![
         Span::raw(" "),
@@ -239,20 +186,7 @@ fn make_wallpaper_item(w: &WallpaperInfo, current_id: Option<u64>) -> ListItem<'
         spans.push(Span::styled(" \u{25cf}", Style::default().fg(Color::Green)));
     }
 
-    let item = ListItem::new(Line::from(spans));
-    if !w.is_supported() {
-        item.style(Style::default().fg(Color::DarkGray))
-    } else {
-        item
-    }
-}
-
-fn type_icon_and_color(t: &WallpaperType) -> (&'static str, Color) {
-    match t {
-        WallpaperType::Video => ("\u{25b6}", Color::Blue),    // ▶
-        WallpaperType::Scene => ("\u{25c8}", Color::Magenta), // ◈
-        WallpaperType::Web   => ("\u{2295}", Color::Green),   // ⊕
-    }
+    ListItem::new(Line::from(spans))
 }
 
 // ── Detail (right panel or full screen) ──────────────────────────────────────
@@ -322,7 +256,7 @@ fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         None    => return,
     };
 
-    let (icon, icon_color) = type_icon_and_color(&w.wallpaper_type);
+    let (icon, icon_color) = ("\u{25b6}", Color::Blue);
     let file_size = format_bytes(w.file_size_bytes);
 
     // Row 1: title — bold, full width
@@ -371,13 +305,6 @@ fn render_info(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
                 )));
             }
         }
-    }
-
-    if !w.is_supported() {
-        lines.push(Line::from(Span::styled(
-            "\u{26a0} scene/web not yet supported",
-            Style::default().fg(Color::Yellow),
-        )));
     }
 
     frame.render_widget(
