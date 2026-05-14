@@ -417,13 +417,10 @@ impl App {
         } else {
             self.monitors.get(self.monitor_selected - 1).map(|(n, _, _)| n.clone())
         };
-        let label = monitor.clone()
-            .map(|n| format!("\u{2713} Applied to {}", n))
-            .unwrap_or_else(|| "\u{2713} Applied (all monitors)".into());
         match self.send(ClientCommand::Set { id, monitor }).await {
             Ok(_) => {
                 self.current_wallpaper_id = Some(id);
-                self.set_status_ok(label);
+                self.set_status_ok("\u{2713} Applied");
             }
             Err(e) => self.set_status_error(e.to_string()),
         }
@@ -779,7 +776,7 @@ impl App {
     async fn fp_add_current_dir(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
         let path_str = self.fp_path.to_string_lossy().into_owned();
         if self.config.paths.extra_dirs.contains(&path_str) {
-            self.set_status_error(format!("Already added: {}", path_str));
+            self.set_status_error("Folder already added");
             return;
         }
 
@@ -790,7 +787,7 @@ impl App {
             return;
         }
 
-        self.set_status_ok(format!("Added: {}", path_str));
+        self.set_status_ok("\u{2713} Folder added");
         self.mode = AppMode::Browse;
         self.refresh_list(terminal).await;
     }
@@ -805,7 +802,7 @@ impl App {
             self.set_status_error(format!("Save failed: {}", e));
             return;
         }
-        self.set_status_ok(format!("Removed: {}", path_str));
+        self.set_status_ok("\u{2713} Folder removed");
         self.refresh_list(terminal).await;
     }
 
