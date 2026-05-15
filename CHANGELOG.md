@@ -6,6 +6,31 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.1] — 2026-05-15
+
+### Added
+
+- **Shell completions** — `wpick completions bash|zsh|fish` prints a
+  completion script for the respective shell. PKGBUILD installs them to
+  the system paths automatically. (`wpick-tui`)
+
+- **Man page** — `wpick man` prints a troff man page; `wpick man > wpick.1
+  && man ./wpick.1` to read locally. (`wpick-tui`)
+
+### Fixed
+
+- `Completions` and `Man` subcommands were hidden from `--help`; now
+  visible and documented. (`wpick-tui`)
+
+- PKGBUILD: added `libpulse` runtime dependency; fixed Fedora dep name
+  (`pulseaudio-libs-devel`); PKGBUILD now installs completions, man page,
+  and systemd service. (`PKGBUILD`)
+
+- Clippy `-D warnings` clean across all three crates. (`wpick-core`,
+  `wpick-daemon`, `wpick-tui`)
+
+---
+
 ## [0.4.0] — 2026-05-15
 
 ### Added

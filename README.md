@@ -4,7 +4,7 @@
 > No Wine, no `linux-wallpaperengine`, no DRM hacks — pure Rust.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.4.1-blue)](CHANGELOG.md)
 
 wpick plays Wallpaper Engine video wallpapers directly on `wlr-layer-shell`
 background surfaces, with streaming audio, PulseAudio ducking,

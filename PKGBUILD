@@ -1,7 +1,7 @@
 # Maintainer: ShevelievS <shevelievs@gmail.com>
 
 pkgname=wpick
-pkgver=0.4.0
+pkgver=0.4.1
 pkgrel=1
 pkgdesc="Native Wayland live wallpaper daemon for Wallpaper Engine (Steam) content"
 arch=(x86_64)
