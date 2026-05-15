@@ -1095,8 +1095,30 @@ fn render_loop(
             }
         }
 
+        // When no frame was decoded this iteration, block on the Wayland socket until a
+        // frame callback arrives or until the next video frame is due — whichever comes
+        // first.  Replaces the blind 1 ms sleep: the old sleep caused the render thread
+        // to spin ~1000 times/second between frames, stealing CPU from the compositor
+        // and producing cursor jitter on high-refresh-rate displays when two wallpapers
+        // play simultaneously.
         if !any_work {
-            std::thread::sleep(Duration::from_millis(1));
+            let now = Instant::now();
+            let timeout_ms: i32 = ctx.surfaces.iter()
+                .filter(|s| s.decoder.is_some())
+                .filter_map(|s| s.next_frame.checked_duration_since(now))
+                .min()
+                .map(|d| d.as_millis().clamp(1, 8) as i32)
+                .unwrap_or(8);
+            if let Some(guard) = ctx.conn.prepare_read() {
+                let fd = ctx.conn.as_fd().as_raw_fd();
+                let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+                unsafe { libc::poll(&mut pfd, 1, timeout_ms); }
+                let _ = guard.read();
+            } else {
+                // Events already buffered in the display queue; yield so the OS can
+                // schedule the compositor before we loop back to dispatch them.
+                std::thread::yield_now();
+            }
         }
     }
 

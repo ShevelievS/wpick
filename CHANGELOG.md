@@ -6,6 +6,78 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.0] — 2026-05-15
+
+### Added
+
+- **Wallpaper persistence** — active wallpaper ID is saved to config and
+  restored on daemon restart (`last_wallpaper_id`). (`wpick-daemon`,
+  `wpick-core`)
+
+- **Per-monitor wallpaper selection** — TUI shows a monitor picker when
+  pressing `Enter`; each connected `wl_output` can have an independent
+  wallpaper set independently via IPC `Set { id, monitor }`.
+  (`wpick-tui`, `wpick-daemon`)
+
+- **TUI folder picker** — press `s` to open an interactive directory browser
+  and add custom video folders (`paths.extra_dirs`) without editing the
+  config file manually. System paths (`/usr`, `/proc`, `/sys`, `/dev`,
+  `/run`) are blocked. (`wpick-tui`)
+
+- **Custom video folders** — `paths.extra_dirs` in config accepts a list of
+  absolute paths; video files found there appear as
+  `Local { label: <dirname> }` wallpapers and are deduplicated by stable
+  FNV-1a ID. (`wpick-core`, `wpick-daemon`)
+
+- **Source filter** — TUI `Tab` cycles between All / Workshop / Local
+  source views. (`wpick-tui`)
+
+- **FitMode per monitor** — `SetFit { fit, monitor }` IPC command applies a
+  scale mode to one output or all; persisted in `[monitors."<name>"]`.
+  (`wpick-core`, `wpick-daemon`)
+
+- **XDG socket path** — daemon socket moves to
+  `$XDG_RUNTIME_DIR/wpick.sock` (falls back to `~/.wpick.sock` for TTY
+  sessions). (`wpick-core`)
+
+- **systemd user service** — `dist/systemd/wpick-daemon.service` ships in
+  the package for `systemctl --user enable wpick-daemon`. (`dist/`)
+
+- **MIT license** — `LICENSE` file added.
+
+### Changed
+
+- **Video-only** — Scene and Web wallpaper types removed; wpick is
+  video/image focused. (`wpick-core`, `wpick-daemon`)
+
+- **Smart scaling** — `WallpaperInfo` now carries `width`/`height`;
+  renderer skips upscale when source matches display resolution.
+  Letterbox (`Fit`) and center (`Center`) modes preserve aspect ratio.
+  (`wpick-core`, `wpick-daemon`)
+
+- **Stderr redirect** — daemon redirects `fd 2` to the rolling log file
+  so VA-API / ffmpeg C-library noise does not appear in the terminal.
+  (`wpick-daemon`)
+
+- **Scan non-blocking** — `Scan` IPC command runs in a background task;
+  TUI remains responsive during large library scans. (`wpick-daemon`)
+
+- **Status messages simplified** — TUI status bar shows short strings
+  (`Applied`, `Folder added`, etc.) with no embedded paths. (`wpick-tui`)
+
+### Fixed
+
+- **fd leak** — `dup2()` for stderr redirect previously leaked the source
+  file descriptor; `close()` is now called after `dup2()`. (`wpick-daemon`)
+
+- **Cursor jitter on high-refresh displays** — the render loop replaced a
+  blind 1 ms `sleep()` with `poll()` on the Wayland connection fd.  The
+  thread now blocks until a frame callback (or next-frame deadline) arrives,
+  giving the compositor more CPU time and eliminating micro-stutter visible
+  at 120 Hz+ with two wallpapers playing simultaneously. (`wpick-daemon`)
+
+---
+
 ## [0.3.0] — 2026-05-12
 
 ### Added

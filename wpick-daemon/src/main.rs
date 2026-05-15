@@ -147,7 +147,10 @@ async fn main() -> anyhow::Result<()> {
         // C-library messages don't bleed into the user's terminal.
         if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
             use std::os::unix::io::IntoRawFd;
-            unsafe { libc::dup2(f.into_raw_fd(), 2); }
+            let raw = f.into_raw_fd();
+            // dup2 closes fd 2 and makes it an alias of raw; then close raw
+            // so we don't leak the original file descriptor.
+            unsafe { libc::dup2(raw, 2); libc::close(raw); }
         }
     }
 
