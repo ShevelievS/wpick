@@ -1,15 +1,15 @@
-# Maintainer: ederadar <shevelievs@gmail.com>
+# Maintainer: ShevelievS <shevelievs@gmail.com>
 
 pkgname=wpick
-pkgver=0.1.0
+pkgver=0.4.0
 pkgrel=1
-pkgdesc="Native Wayland live wallpaper manager for Wallpaper Engine"
+pkgdesc="Native Wayland live wallpaper daemon for Wallpaper Engine (Steam) content"
 arch=(x86_64)
-url="https://github.com/ederadar/wpick"
+url="https://github.com/ShevelievS/wpick"
 license=(MIT)
-depends=(ffmpeg wayland)
+depends=(ffmpeg libpulse wayland)
 makedepends=(rust cargo git)
-source=("$pkgname::git+https://github.com/ederadar/wpick#tag=v$pkgver")
+source=("$pkgname::git+https://github.com/ShevelievS/wpick#tag=v$pkgver")
 sha256sums=(SKIP)
 
 prepare() {
@@ -27,8 +27,9 @@ build() {
 
 package() {
     cd "$pkgname"
-    install -Dm755 target/release/wpick          "$pkgdir/usr/bin/wpick"
-    install -Dm755 target/release/wpick-daemon   "$pkgdir/usr/bin/wpick-daemon"
-    install -Dm755 target/release/wpick-webview  "$pkgdir/usr/bin/wpick-webview"
+    install -Dm755 target/release/wpick        "$pkgdir/usr/bin/wpick"
+    install -Dm755 target/release/wpick-daemon "$pkgdir/usr/bin/wpick-daemon"
     install -Dm644 LICENSE                     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 dist/systemd/wpick-daemon.service \
+        "$pkgdir/usr/lib/systemd/user/wpick-daemon.service"
 }

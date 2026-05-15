@@ -76,12 +76,8 @@ fn start_streaming_decoder(
         .name("wpick-audio-dec".into())
         .spawn(move || {
             ffmpeg::init().ok(); // idempotent
-            loop {
-                match decode_and_send(&path, &tx, chunk_size) {
-                    Ok(())  => {} // EOF — loop seamlessly
-                    Err(_)  => break, // E-29: channel closed or file error
-                }
-            }
+            // Loop until channel closed or file error (E-29).
+            while decode_and_send(&path, &tx, chunk_size).is_ok() {}
         })
         .ok();
     rx

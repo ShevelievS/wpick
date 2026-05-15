@@ -270,10 +270,8 @@ impl App {
                 KeyCode::Esc => {
                     self.monitor_select_mode = false;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if self.monitor_selected > 0 {
-                        self.monitor_selected -= 1;
-                    }
+                KeyCode::Up | KeyCode::Char('k') if self.monitor_selected > 0 => {
+                    self.monitor_selected -= 1;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     // 0 = "All monitors", 1..=N = specific monitors
@@ -301,14 +299,12 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.search_active = false;
                 }
-                KeyCode::Backspace => {
-                    if self.search_query.pop().is_some() {
-                        self.selected = 0;
-                        let empty = self.filtered_wallpapers().is_empty();
-                        self.list_state.select(if empty { None } else { Some(0) });
-                        self.preview_id = None;
-                        self.update_preview();
-                    }
+                KeyCode::Backspace if self.search_query.pop().is_some() => {
+                    self.selected = 0;
+                    let empty = self.filtered_wallpapers().is_empty();
+                    self.list_state.select(if empty { None } else { Some(0) });
+                    self.preview_id = None;
+                    self.update_preview();
                 }
                 KeyCode::Char(c) => {
                     self.search_query.push(c);
@@ -664,17 +660,16 @@ impl App {
 
     /// Query the daemon for the list of connected monitors.
     pub async fn refresh_monitors(&mut self) {
-        match self.send(ClientCommand::ListOutputs).await {
-            Ok(DaemonResponse::OutputList { names, resolutions }) => {
-                self.monitors = names.into_iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let (w, h) = resolutions.get(i).copied().unwrap_or((0, 0));
-                        (name, w, h)
-                    })
-                    .collect();
-            }
-            _ => {}
+        if let Ok(DaemonResponse::OutputList { names, resolutions }) =
+            self.send(ClientCommand::ListOutputs).await
+        {
+            self.monitors = names.into_iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let (w, h) = resolutions.get(i).copied().unwrap_or((0, 0));
+                    (name, w, h)
+                })
+                .collect();
         }
     }
 
@@ -685,15 +680,14 @@ impl App {
 
     /// Query the daemon for current volume/muted/wallpaper and update local state.
     async fn sync_volume_state(&mut self) {
-        match self.send(ClientCommand::Status).await {
-            Ok(DaemonResponse::VolumeState { volume, muted, current_id }) => {
-                self.config.general.volume = volume;
-                self.config.general.muted  = muted;
-                if current_id.is_some() {
-                    self.current_wallpaper_id = current_id;
-                }
+        if let Ok(DaemonResponse::VolumeState { volume, muted, current_id }) =
+            self.send(ClientCommand::Status).await
+        {
+            self.config.general.volume = volume;
+            self.config.general.muted  = muted;
+            if current_id.is_some() {
+                self.current_wallpaper_id = current_id;
             }
-            Ok(_) | Err(_) => {}
         }
     }
 }
@@ -779,15 +773,13 @@ impl App {
     ) {
         match key.code {
             // ── Navigation ──────────────────────────────────────────────────
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.fp_selected > 0 {
-                    self.fp_selected -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if self.fp_selected > 0 => {
+                self.fp_selected -= 1;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.fp_selected + 1 < self.fp_entries.len() {
-                    self.fp_selected += 1;
-                }
+            KeyCode::Down | KeyCode::Char('j')
+                if self.fp_selected + 1 < self.fp_entries.len() =>
+            {
+                self.fp_selected += 1;
             }
 
             // ── Enter directory ─────────────────────────────────────────────

@@ -278,6 +278,7 @@ impl Default for SurfaceEvent {
     }
 }
 
+#[derive(Default)]
 struct WaylandState {
     compositor:  Option<wl_compositor::WlCompositor>,
     layer_shell: Option<ZwlrLayerShellV1>,
@@ -286,16 +287,6 @@ struct WaylandState {
     outputs:     Vec<OutputEntry>,
     /// Per-surface event state; index matches the usize user-data on each layer surface.
     surf_ev:     Vec<SurfaceEvent>,
-}
-
-impl Default for WaylandState {
-    fn default() -> Self {
-        Self {
-            compositor: None, layer_shell: None, shm: None,
-            outputs: Vec::new(),
-            surf_ev: Vec::new(),
-        }
-    }
 }
 
 // ─── Dispatch impls ───────────────────────────────────────────────────────────
@@ -815,6 +806,7 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
 
 // ─── Async wrapper ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     mut wallpaper_rx:    watch::Receiver<Option<WallpaperInfo>>,
     shutdown_rx:         broadcast::Receiver<()>,
@@ -954,6 +946,7 @@ async fn resolve_monitor_wallpapers(
 
 const NUDGE_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[allow(clippy::too_many_arguments)]
 fn render_loop(
     mut ctx:            RendererCtx,
     wp_rx:              std::sync::mpsc::Receiver<Option<WallpaperInfo>>,

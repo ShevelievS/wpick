@@ -174,16 +174,15 @@ async fn run_cli(cmd: Commands, config: WpickConfig, dirs: AppDirs) -> Result<()
         }
 
         Commands::Status => {
-            match client.send(&ClientCommand::Status).await? {
-                DaemonResponse::VolumeState { volume, muted, current_id } => {
-                    let playing = current_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "none".to_string());
-                    println!("wallpaper : {}", playing);
-                    println!("volume    : {:.0}%", volume * 100.0);
-                    println!("muted     : {}", muted);
-                }
-                _ => {}
+            if let DaemonResponse::VolumeState { volume, muted, current_id } =
+                client.send(&ClientCommand::Status).await?
+            {
+                let playing = current_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                println!("wallpaper : {}", playing);
+                println!("volume    : {:.0}%", volume * 100.0);
+                println!("muted     : {}", muted);
             }
         }
 

@@ -17,20 +17,15 @@ impl fmt::Display for WallpaperType {
 }
 
 /// Where the wallpaper came from — Steam Workshop or a user-defined local folder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum WallpaperSource {
     /// Steam Workshop item (ID = numeric workshop folder name).
+    #[default]
     Workshop,
     /// File discovered in a user-defined extra directory.
     /// `label` is the basename of the configured directory.
     Local { label: String },
-}
-
-impl Default for WallpaperSource {
-    fn default() -> Self {
-        WallpaperSource::Workshop
-    }
 }
 
 impl fmt::Display for WallpaperSource {

@@ -171,7 +171,6 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
 
             if show_separators {
                 let mut current_source_label: Option<String> = None;
-                let mut flat_pos = 0usize; // position in the flat `filtered` slice
                 let mut list_pos = 0usize; // position in the `v` vec (includes separators)
                 let mut target_list_pos = 0usize;
 
@@ -182,13 +181,12 @@ fn render_list(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                     };
                     if current_source_label.as_deref() != Some(src_label.as_str()) {
                         v.push(separator(format!("  \u{2500}\u{2500} {} \u{2500}\u{2500}", src_label)));
-                        if flat_pos <= idx { target_list_pos = list_pos; }
+                        if i <= idx { target_list_pos = list_pos; }
                         list_pos += 1;
                         current_source_label = Some(src_label);
                     }
                     if i == idx { target_list_pos = list_pos; }
                     v.push(make_wallpaper_item(w, app.current_wallpaper_id));
-                    flat_pos += 1;
                     list_pos += 1;
                 }
                 list_idx = target_list_pos;
