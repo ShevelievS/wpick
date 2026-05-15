@@ -48,10 +48,8 @@ enum Commands {
     /// Kill daemon
     Kill,
     /// Print shell completion script to stdout
-    #[command(hide = true)]
     Completions { shell: clap_complete::Shell },
     /// Print man page to stdout
-    #[command(hide = true)]
     Man,
 }
 

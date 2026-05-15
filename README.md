@@ -61,7 +61,7 @@ Tested on:
 pacman -S ffmpeg libpulse wayland wayland-protocols
 
 # Fedora / RHEL
-dnf install ffmpeg-devel libpulse-devel wayland-devel
+dnf install ffmpeg-devel pulseaudio-libs-devel wayland-devel wayland-protocols-devel
 ```
 
 **Build & install:**
@@ -142,6 +142,34 @@ Protocol is auto-detected: Kitty graphics → Sixel → halfblocks fallback.
 
 Scans run in the background — the TUI stays responsive. Press `Esc` at any
 time to cancel a running scan.
+
+---
+
+## Shell completions
+
+wpick can generate completion scripts for bash, zsh, and fish:
+
+```bash
+# Bash
+wpick completions bash > ~/.local/share/bash-completion/completions/wpick
+
+# Zsh (add to a directory in your $fpath)
+wpick completions zsh > ~/.zfunc/_wpick
+# then in ~/.zshrc, before compinit:  fpath=(~/.zfunc $fpath)
+
+# Fish
+wpick completions fish > ~/.config/fish/completions/wpick.fish
+```
+
+Restart your shell or source the file for completions to take effect.
+
+---
+
+## Man page
+
+```bash
+wpick man > /tmp/wpick.1 && man /tmp/wpick.1
+```
 
 ---
 

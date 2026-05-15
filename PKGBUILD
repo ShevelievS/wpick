@@ -27,9 +27,36 @@ build() {
 
 package() {
     cd "$pkgname"
+
+    # Binaries
     install -Dm755 target/release/wpick        "$pkgdir/usr/bin/wpick"
     install -Dm755 target/release/wpick-daemon "$pkgdir/usr/bin/wpick-daemon"
-    install -Dm644 LICENSE                     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # License
+    install -Dm644 LICENSE \
+        "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # systemd user service
     install -Dm644 dist/systemd/wpick-daemon.service \
         "$pkgdir/usr/lib/systemd/user/wpick-daemon.service"
+
+    # Shell completions (generated from the built binary)
+    target/release/wpick completions bash \
+        > "$srcdir/wpick.bash"
+    target/release/wpick completions zsh \
+        > "$srcdir/_wpick"
+    target/release/wpick completions fish \
+        > "$srcdir/wpick.fish"
+
+    install -Dm644 "$srcdir/wpick.bash" \
+        "$pkgdir/usr/share/bash-completion/completions/wpick"
+    install -Dm644 "$srcdir/_wpick" \
+        "$pkgdir/usr/share/zsh/site-functions/_wpick"
+    install -Dm644 "$srcdir/wpick.fish" \
+        "$pkgdir/usr/share/fish/vendor_completions.d/wpick.fish"
+
+    # Man page
+    target/release/wpick man > "$srcdir/wpick.1"
+    install -Dm644 "$srcdir/wpick.1" \
+        "$pkgdir/usr/share/man/man1/wpick.1"
 }
