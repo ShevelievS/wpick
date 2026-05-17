@@ -9,7 +9,6 @@ use tokio::sync::Mutex;
 use wpick_core::cache::Cache;
 use wpick_core::config::{AppDirs, WpickConfig};
 use wpick_core::ipc::{recv_command, send_response};
-use wpick_core::config::FitMode;
 use wpick_core::model::WallpaperInfo;
 use wpick_core::{ClientCommand, DaemonResponse};
 
@@ -22,15 +21,19 @@ pub async fn run(
     state:    Arc<Mutex<DaemonState>>,
     cache:    Arc<Mutex<Cache>>,
     dirs:     AppDirs,
+    config:   Arc<tokio::sync::Mutex<WpickConfig>>,
+    dirty_tx: tokio::sync::watch::Sender<()>,
 ) -> anyhow::Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        let cache = Arc::clone(&cache);
-        let dirs  = dirs.clone();
+        let state    = Arc::clone(&state);
+        let cache    = Arc::clone(&cache);
+        let dirs     = dirs.clone();
+        let config   = Arc::clone(&config);
+        let dirty_tx = dirty_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, state, cache, dirs).await {
+            if let Err(e) = handle_connection(stream, state, cache, dirs, config, dirty_tx).await {
                 tracing::warn!("IPC connection closed: {}", e);
             }
         });
@@ -40,10 +43,12 @@ pub async fn run(
 // ─── Per-connection handler ───────────────────────────────────────────────────
 
 async fn handle_connection(
-    stream: tokio::net::UnixStream,
-    state:  Arc<Mutex<DaemonState>>,
-    cache:  Arc<Mutex<Cache>>,
-    dirs:   AppDirs,
+    stream:   tokio::net::UnixStream,
+    state:    Arc<Mutex<DaemonState>>,
+    cache:    Arc<Mutex<Cache>>,
+    dirs:     AppDirs,
+    config:   Arc<tokio::sync::Mutex<WpickConfig>>,
+    dirty_tx: tokio::sync::watch::Sender<()>,
 ) -> anyhow::Result<()> {
     use std::os::unix::io::AsRawFd;
     use tokio::io::BufWriter;
@@ -108,7 +113,7 @@ async fn handle_connection(
             continue;
         }
 
-        let response = dispatch(cmd, &state, &cache, &dirs).await;
+        let response = dispatch(cmd, &state, &cache, &config, &dirty_tx).await;
 
         if let Err(e) = send_response(&mut writer, &response).await {
             tracing::warn!("Send failed: {}", e);
@@ -121,10 +126,11 @@ async fn handle_connection(
 // ─── Command dispatcher ───────────────────────────────────────────────────────
 
 async fn dispatch(
-    cmd:   ClientCommand,
-    state: &Arc<Mutex<DaemonState>>,
-    cache: &Arc<Mutex<Cache>>,
-    _dirs: &AppDirs,
+    cmd:      ClientCommand,
+    state:    &Arc<Mutex<DaemonState>>,
+    cache:    &Arc<Mutex<Cache>>,
+    config:   &Arc<tokio::sync::Mutex<WpickConfig>>,
+    dirty_tx: &tokio::sync::watch::Sender<()>,
 ) -> DaemonResponse {
     match cmd {
         ClientCommand::List => {
@@ -153,13 +159,14 @@ async fn dispatch(
             match monitor {
                 Some(name) => {
                     state.lock().await.set_wallpaper_for_monitor(name.clone(), info);
-                    save_monitor_wallpaper_id(name, id);
+                    config.lock().await.monitors.entry(name).or_default().wallpaper_id = Some(id);
                 }
                 None => {
                     state.lock().await.set_wallpaper(info);
-                    save_last_wallpaper_id(id);
+                    config.lock().await.last_wallpaper_id = Some(id);
                 }
             }
+            let _ = dirty_tx.send(());
             DaemonResponse::Ok
         }
 
@@ -177,7 +184,12 @@ async fn dispatch(
                 s.set_volume(level);
                 (s.volume, s.muted, s.current.as_ref().map(|w| w.id))
             };
-            save_volume_config(vol, muted);
+            {
+                let mut cfg = config.lock().await;
+                cfg.general.volume = vol;
+                cfg.general.muted  = muted;
+            }
+            let _ = dirty_tx.send(());
             DaemonResponse::VolumeState { volume: vol, muted, current_id }
         }
 
@@ -187,7 +199,12 @@ async fn dispatch(
                 s.toggle_mute();
                 (s.volume, s.muted, s.current.as_ref().map(|w| w.id))
             };
-            save_volume_config(vol, muted);
+            {
+                let mut cfg = config.lock().await;
+                cfg.general.volume = vol;
+                cfg.general.muted  = muted;
+            }
+            let _ = dirty_tx.send(());
             DaemonResponse::VolumeState { volume: vol, muted, current_id }
         }
 
@@ -212,7 +229,14 @@ async fn dispatch(
 
         ClientCommand::SetFit { fit, monitor } => {
             state.lock().await.set_fit(monitor.clone(), fit);
-            save_fit_config(monitor, fit);
+            {
+                let mut cfg = config.lock().await;
+                match monitor {
+                    Some(name) => { cfg.monitors.entry(name).or_default().fit = fit; }
+                    None       => { for m in cfg.monitors.values_mut() { m.fit = fit; } }
+                }
+            }
+            let _ = dirty_tx.send(());
             DaemonResponse::Ok
         }
 
@@ -319,54 +343,46 @@ async fn dispatch(
     }
 }
 
-// ─── Config persistence helpers ───────────────────────────────────────────────
+// ─── Config persistence ────────────────────────────────────────────────────────
 
-/// Persist volume and muted state to config.
-fn save_volume_config(volume: f32, muted: bool) {
-    tokio::task::spawn_blocking(move || {
-        let mut cfg = WpickConfig::load().unwrap_or_default();
-        cfg.general.volume = volume;
-        cfg.general.muted  = muted;
-        if let Err(e) = cfg.save() {
-            tracing::warn!("Config save failed: {}", e);
+/// Debounced config writer — coalesces rapid mutations into a single disk write.
+///
+/// Wakes on `dirty_rx` signal, waits 500 ms for additional changes, then saves.
+/// On shutdown signal: flushes immediately without debounce.
+pub async fn run_config_writer(
+    config:       Arc<tokio::sync::Mutex<WpickConfig>>,
+    mut dirty_rx: tokio::sync::watch::Receiver<()>,
+    mut shutdown: tokio::sync::broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            result = dirty_rx.changed() => {
+                if result.is_err() { return; } // sender dropped — writer is done
+                // Debounce: coalesce all writes within a 500 ms window.
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        dirty_rx.changed(),
+                    ).await {
+                        Ok(Ok(_)) => {} // more changes — keep waiting
+                        _         => break,
+                    }
+                }
+                let cfg = config.lock().await.clone();
+                if let Err(e) = cfg.save() {
+                    tracing::warn!("Config debounced save failed: {}", e);
+                }
+            }
+            _ = shutdown.recv() => {
+                // Shutdown: flush immediately, no debounce.
+                let cfg = config.lock().await.clone();
+                if let Err(e) = cfg.save() {
+                    tracing::warn!("Config flush on shutdown failed: {}", e);
+                }
+                return;
+            }
         }
-    });
-}
-
-/// Persist the last-applied wallpaper id so the daemon can restore it on restart.
-fn save_last_wallpaper_id(id: u64) {
-    tokio::task::spawn_blocking(move || {
-        let mut cfg = WpickConfig::load().unwrap_or_default();
-        cfg.last_wallpaper_id = Some(id);
-        if let Err(e) = cfg.save() {
-            tracing::warn!("Config save (last_wallpaper_id) failed: {}", e);
-        }
-    });
-}
-
-/// Persist fit mode to config so the renderer uses it after restart.
-fn save_fit_config(monitor: Option<String>, fit: FitMode) {
-    tokio::task::spawn_blocking(move || {
-        let mut cfg = WpickConfig::load().unwrap_or_default();
-        match monitor {
-            Some(name) => { cfg.monitors.entry(name).or_default().fit = fit; }
-            None       => { for m in cfg.monitors.values_mut() { m.fit = fit; } }
-        }
-        if let Err(e) = cfg.save() {
-            tracing::warn!("Config save (fit) failed: {}", e);
-        }
-    });
-}
-
-/// Persist a per-monitor wallpaper assignment to config so the renderer reloads it after restart.
-fn save_monitor_wallpaper_id(monitor: String, id: u64) {
-    tokio::task::spawn_blocking(move || {
-        let mut cfg = WpickConfig::load().unwrap_or_default();
-        cfg.monitors.entry(monitor).or_default().wallpaper_id = Some(id);
-        if let Err(e) = cfg.save() {
-            tracing::warn!("Config save (monitor wallpaper_id) failed: {}", e);
-        }
-    });
+    }
 }
 
 // ─── Streaming scan ───────────────────────────────────────────────────────────

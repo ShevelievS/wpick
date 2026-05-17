@@ -166,6 +166,11 @@ async fn main() -> anyhow::Result<()> {
         Cache::open(&dirs.db_path).context("Failed to open cache DB")?,
     ));
 
+    // 3b. Shared config — single authoritative copy; mutations go through this Arc.
+    //     Replaces per-command load→save (race condition). Writes are debounced 500 ms.
+    let config_shared = Arc::new(sync::Mutex::new(config.clone()));
+    let (dirty_tx, dirty_rx) = sync::watch::channel(());
+
     // 4. Channels
     //    Single watch channel — renderer and audio both subscribe to the same
     //    Sender so they see a wallpaper change in the same Tokio tick (no A/V skew).
@@ -293,23 +298,27 @@ async fn main() -> anyhow::Result<()> {
 
     // 10. Signal handlers (SIGINT / SIGTERM) — graceful shutdown via broadcast.
     {
-        let sp   = socket_path.clone();
-        let sd   = shutdown_tx.clone();
-        let pids = Arc::clone(&paused_pids);
+        let sp      = socket_path.clone();
+        let sd      = shutdown_tx.clone();
+        let pids    = Arc::clone(&paused_pids);
+        let cfg_sig = Arc::clone(&config_shared);
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.ok();
             tracing::info!("SIGINT — shutting down");
             if let Ok(g) = pids.lock() { resume_paused_tools(&g); }
             let _ = sd.send(());
+            let cfg = cfg_sig.lock().await.clone();
+            if let Err(e) = cfg.save() { tracing::warn!("Config flush on SIGINT failed: {}", e); }
             let _ = std::fs::remove_file(&sp);
             std::process::exit(0);
         });
     }
     #[cfg(unix)]
     {
-        let sp   = socket_path.clone();
-        let sd   = shutdown_tx.clone();
-        let pids = Arc::clone(&paused_pids);
+        let sp      = socket_path.clone();
+        let sd      = shutdown_tx.clone();
+        let pids    = Arc::clone(&paused_pids);
+        let cfg_sig = Arc::clone(&config_shared);
         tokio::spawn(async move {
             use tokio::signal::unix::{signal, SignalKind};
             if let Ok(mut sig) = signal(SignalKind::terminate()) {
@@ -317,10 +326,19 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("SIGTERM — shutting down");
                 if let Ok(g) = pids.lock() { resume_paused_tools(&g); }
                 let _ = sd.send(());
+                let cfg = cfg_sig.lock().await.clone();
+                if let Err(e) = cfg.save() { tracing::warn!("Config flush on SIGTERM failed: {}", e); }
                 let _ = std::fs::remove_file(&sp);
                 std::process::exit(0);
             }
         });
+    }
+
+    // 11a. Config writer task — debounced disk writes from IPC mutations.
+    {
+        let cfg_w = Arc::clone(&config_shared);
+        let sd    = shutdown_tx.subscribe();
+        tokio::spawn(ipc_server::run_config_writer(cfg_w, dirty_rx, sd));
     }
 
     // 11. Global hotkey listener task
@@ -334,11 +352,12 @@ async fn main() -> anyhow::Result<()> {
 
     // 12. IPC server task
     {
-        let state = Arc::clone(&state);
-        let cache = Arc::clone(&cache);
-        let dirs  = dirs.clone();
+        let state    = Arc::clone(&state);
+        let cache    = Arc::clone(&cache);
+        let dirs     = dirs.clone();
+        let cfg_ipc  = Arc::clone(&config_shared);
         tokio::spawn(async move {
-            if let Err(e) = ipc_server::run(listener, state, cache, dirs).await {
+            if let Err(e) = ipc_server::run(listener, state, cache, dirs, cfg_ipc, dirty_tx).await {
                 tracing::error!("IPC server error: {}", e);
             }
         });
