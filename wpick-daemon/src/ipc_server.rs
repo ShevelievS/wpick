@@ -93,7 +93,7 @@ async fn handle_connection(
         // Only the daemon owner may issue Kill.
         // If SO_PEERCRED failed (peer_uid == None), we deny — fail-closed.
         if let ClientCommand::Kill = &cmd {
-            let allowed = peer_uid.map_or(false, |uid| uid == my_uid);
+            let allowed = peer_uid.is_some_and(|uid| uid == my_uid);
             if !allowed {
                 tracing::warn!("Kill rejected: peer uid={:?} != daemon uid={}", peer_uid, my_uid);
                 let _ = send_response(&mut writer, &DaemonResponse::Error {
@@ -173,8 +173,8 @@ async fn dispatch(
         ClientCommand::ListOutputs => {
             let outputs_arc = state.lock().await.outputs.clone();
             let outputs = outputs_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let names       = outputs.iter().map(|(n, _, _)| n.clone()).collect();
-            let resolutions = outputs.iter().map(|(_, w, h)| (*w, *h)).collect();
+            let names       = outputs.iter().map(|o| o.name.clone()).collect();
+            let resolutions = outputs.iter().map(|o| (o.width, o.height)).collect();
             DaemonResponse::OutputList { names, resolutions }
         }
 
@@ -266,6 +266,10 @@ async fn dispatch(
                 .map(|p| (p + 1) % wallpapers.len())
                 .unwrap_or(0);
 
+            // Abort the old timer BEFORE spawning the new one to prevent
+            // a brief window where two timers run concurrently.
+            state.lock().await.stop_timer();
+
             let task = tokio::spawn(async move {
                 let mut seq: Vec<WallpaperInfo> = wallpapers;
                 let mut idx = start_idx;
@@ -289,7 +293,6 @@ async fn dispatch(
             let stored_ids = ids.clone();
             {
                 let mut s = state.lock().await;
-                s.stop_timer();
                 s.timer_task     = Some(task);
                 s.timer_interval = interval_secs;
                 s.timer_started  = std::time::Instant::now();
@@ -331,6 +334,45 @@ async fn dispatch(
             DaemonResponse::Ok
         }
 
+        ClientCommand::GetFrequent { limit } => {
+            let guard = cache.lock().await;
+            match guard.get_frequent(limit) {
+                Ok(items) => DaemonResponse::FrequentList { items },
+                Err(e)    => DaemonResponse::Error { message: e.to_string() },
+            }
+        }
+
+        ClientCommand::SetWorkspaceWallpaper { workspace, id } => {
+            // Validate non-zero IDs against the cache (consistent with ClientCommand::Set).
+            if id != 0 {
+                let guard = cache.lock().await;
+                match guard.get_by_id(id) {
+                    Ok(Some(_)) => {}
+                    Ok(None)    => return DaemonResponse::Error {
+                        message: format!("Wallpaper {} not found", id),
+                    },
+                    Err(e)      => return DaemonResponse::Error { message: e.to_string() },
+                }
+            }
+            let new_map = {
+                let mut cfg = config.lock().await;
+                if id == 0 {
+                    cfg.workspace_wallpapers.remove(&workspace);
+                } else {
+                    cfg.workspace_wallpapers.insert(workspace.clone(), id);
+                }
+                cfg.workspace_wallpapers.clone()
+            };
+            let _ = state.lock().await.workspace_wallpaper_tx.send(new_map.clone());
+            let _ = dirty_tx.send(());
+            DaemonResponse::WorkspaceMap { map: new_map }
+        }
+
+        ClientCommand::GetWorkspaceMap => {
+            let map = config.lock().await.workspace_wallpapers.clone();
+            DaemonResponse::WorkspaceMap { map }
+        }
+
         ClientCommand::Kill => {
             tracing::info!("Kill received — initiating graceful shutdown");
             let sd = state.lock().await.shutdown_tx.clone();
@@ -359,15 +401,10 @@ pub async fn run_config_writer(
             result = dirty_rx.changed() => {
                 if result.is_err() { return; } // sender dropped — writer is done
                 // Debounce: coalesce all writes within a 500 ms window.
-                loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(500),
-                        dirty_rx.changed(),
-                    ).await {
-                        Ok(Ok(_)) => {} // more changes — keep waiting
-                        _         => break,
-                    }
-                }
+                while let Ok(Ok(_)) = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    dirty_rx.changed(),
+                ).await {}
                 let cfg = config.lock().await.clone();
                 if let Err(e) = cfg.save() {
                     tracing::warn!("Config debounced save failed: {}", e);
@@ -403,8 +440,13 @@ async fn handle_scan(
     ));
 
     // Stream progress messages until the sender is dropped (scan finishes).
+    // Abort the scan task if the client disconnects mid-stream to prevent
+    // cache-lock pile-up when many clients issue Scan and disconnect.
     while let Some(resp) = prog_rx.recv().await {
-        send_response(writer, &resp).await?;
+        if let Err(e) = send_response(writer, &resp).await {
+            scan.abort();
+            return Err(anyhow::Error::from(e));
+        }
     }
 
     // Send final result.
@@ -487,4 +529,128 @@ async fn scan_and_populate(
         Ok::<Vec<WallpaperInfo>, anyhow::Error>(all)
     })
     .await?
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{self, watch};
+    use wpick_core::config::{FitMode, WpickConfig};
+    use wpick_core::ipc::{ClientCommand, DaemonResponse};
+
+    use crate::state::{DaemonState, OutputInfo};
+
+    fn make_state() -> (Arc<sync::Mutex<DaemonState>>, Arc<sync::Mutex<WpickConfig>>, sync::watch::Sender<()>) {
+        let (wallpaper_tx, _)     = watch::channel(None);
+        let (volume_tx, _)        = watch::channel((0.8f32, false));
+        let (shutdown_tx, _)      = sync::broadcast::channel(1);
+        let (per_monitor_tx, _)   = watch::channel(HashMap::new());
+        let (fit_tx, _)           = watch::channel(("*".to_owned(), FitMode::Fill));
+        let (workspace_wp_tx, _)  = watch::channel(HashMap::new());
+        let (dirty_tx, _)         = watch::channel(());
+
+        let state = Arc::new(sync::Mutex::new(DaemonState {
+            current:              None,
+            volume:               0.8,
+            muted:                false,
+            wallpaper_tx,
+            volume_tx,
+            shutdown_tx:          shutdown_tx.clone(),
+            per_monitor_tx,
+            fit_tx,
+            outputs:              Arc::new(Mutex::new(vec![
+                OutputInfo { name: "DP-1".into(), width: 2560, height: 1440 },
+            ])),
+            timer_task:           None,
+            timer_interval:       0,
+            timer_started:        std::time::Instant::now(),
+            timer_ids:            Vec::new(),
+            workspace_wallpaper_tx: workspace_wp_tx,
+        }));
+        let config = Arc::new(sync::Mutex::new(WpickConfig::default()));
+        (state, config, dirty_tx)
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_status_returns_volume_state() {
+        let (state, config, dirty_tx) = make_state();
+        let cache = Arc::new(sync::Mutex::new(
+            wpick_core::cache::Cache::open_in_memory().expect("in-memory cache"),
+        ));
+        let resp = dispatch(ClientCommand::Status, &state, &cache, &config, &dirty_tx).await;
+        assert!(
+            matches!(resp, DaemonResponse::VolumeState { volume, muted, .. }
+                if (volume - 0.8).abs() < f32::EPSILON && !muted),
+            "expected VolumeState, got {:?}", resp
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_mute_toggles_state() {
+        let (state, config, dirty_tx) = make_state();
+        let cache = Arc::new(sync::Mutex::new(
+            wpick_core::cache::Cache::open_in_memory().expect("in-memory cache"),
+        ));
+        let resp = dispatch(ClientCommand::Mute, &state, &cache, &config, &dirty_tx).await;
+        assert!(matches!(resp, DaemonResponse::VolumeState { muted: true, .. }), "{:?}", resp);
+        // Second toggle restores
+        let resp2 = dispatch(ClientCommand::Mute, &state, &cache, &config, &dirty_tx).await;
+        assert!(matches!(resp2, DaemonResponse::VolumeState { muted: false, .. }), "{:?}", resp2);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_list_outputs() {
+        let (state, config, dirty_tx) = make_state();
+        let cache = Arc::new(sync::Mutex::new(
+            wpick_core::cache::Cache::open_in_memory().expect("in-memory cache"),
+        ));
+        let resp = dispatch(ClientCommand::ListOutputs, &state, &cache, &config, &dirty_tx).await;
+        match resp {
+            DaemonResponse::OutputList { names, resolutions } => {
+                assert_eq!(names, vec!["DP-1"]);
+                assert_eq!(resolutions, vec![(2560, 1440)]);
+            }
+            other => panic!("expected OutputList, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_get_workspace_map_empty() {
+        let (state, config, dirty_tx) = make_state();
+        let cache = Arc::new(sync::Mutex::new(
+            wpick_core::cache::Cache::open_in_memory().expect("in-memory cache"),
+        ));
+        let resp = dispatch(ClientCommand::GetWorkspaceMap, &state, &cache, &config, &dirty_tx).await;
+        assert!(matches!(resp, DaemonResponse::WorkspaceMap { ref map } if map.is_empty()), "{:?}", resp);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_set_workspace_wallpaper_clear() {
+        let (state, config, dirty_tx) = make_state();
+        let cache = Arc::new(sync::Mutex::new(
+            wpick_core::cache::Cache::open_in_memory().expect("in-memory cache"),
+        ));
+        // Set workspace "1" → id 0 means clear (no entry expected)
+        let resp = dispatch(
+            ClientCommand::SetWorkspaceWallpaper { workspace: "1".into(), id: 0 },
+            &state, &cache, &config, &dirty_tx,
+        ).await;
+        assert!(matches!(resp, DaemonResponse::WorkspaceMap { ref map } if map.is_empty()), "{:?}", resp);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_volume_clamps_to_range() {
+        let (state, config, dirty_tx) = make_state();
+        let cache = Arc::new(sync::Mutex::new(
+            wpick_core::cache::Cache::open_in_memory().expect("in-memory cache"),
+        ));
+        // Volume above 1.0 should be clamped to 1.0
+        let resp = dispatch(ClientCommand::Volume { level: 2.5 }, &state, &cache, &config, &dirty_tx).await;
+        assert!(matches!(resp, DaemonResponse::VolumeState { volume, .. } if (volume - 1.0).abs() < f32::EPSILON),
+            "{:?}", resp);
+    }
 }

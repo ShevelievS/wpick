@@ -6,6 +6,119 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.0] — 2026-05-18
+
+### Added
+
+- **Per-workspace wallpapers** — `[workspace_wallpapers]` config section maps
+  workspace name → wallpaper ID. When you switch workspaces the daemon applies
+  the assigned wallpaper on the focused monitor. Supports both Hyprland
+  (`workspace>>` and `workspacev2>>` events) and Sway (`focused_workspace`).
+  IPC: `SetWorkspaceWallpaper { workspace, id }` and `GetWorkspaceMap`.
+  (`wpick-core`, `wpick-daemon`)
+
+- **FPS cap** — `[general] max_fps = 30` (default) hard-caps the committed-frame
+  rate regardless of the source video's native FPS. Reducing this value lowers
+  compositor CPU load (wl_shm upload frequency) and eliminates cursor jitter on
+  high-refresh-rate displays. Set to `0` to use native video FPS.
+  (`wpick-core`, `wpick-daemon`)
+
+- **Hyprland v0.40+ workspace events** — `workspacev2>>id,name` event format is
+  now parsed in addition to the legacy `workspace>>name` format.
+  (`wpick-daemon`)
+
+### Fixed
+
+- **Cursor jitter after extended runtime** — render loop accumulated scheduling
+  drift over time, eventually placing `next_frame` permanently in the past and
+  causing back-to-back frame commits that spiked compositor CPU load. Fixed with
+  a wall-clock drift clamp: after each commit, if `next_frame` lies more than
+  two frame intervals in the past it is reset to `now + effective_dur`.
+  (`wpick-daemon`)
+
+- **`fade_old` memory not reclaimed** — the full-frame BGRA snapshot kept for
+  crossfade blending was not cleared when the crossfade completed, retaining
+  8–32 MB of heap allocation until the next wallpaper change. Replaced with
+  `Vec::new()` after `fade_frames_left` reaches zero. (`wpick-daemon`)
+
+- **`last_frame` Vec capacity retained after resolution decrease** — switching
+  from a higher-resolution wallpaper left the backing buffer over-allocated
+  indefinitely. Added `shrink_to_fit()` after resize. (`wpick-daemon`)
+
+- **ShmPool stuck on surface recreate** — after surface destroy/recreate (e.g.
+  fullscreen exit) the old pool's `in_use` flags were stuck `true` because the
+  compositor never sends `wl_buffer::Release` for destroyed surfaces. Fixed by
+  dropping the pool (`ctx.surfaces[i].pool = None`) before constructing the
+  new surface. (`wpick-daemon`)
+
+- **`INSERT OR REPLACE` wiping play statistics** — scan called `upsert_batch()`
+  which used `INSERT OR REPLACE`, a DELETE+INSERT that reset `play_count` and
+  `last_played_secs` to zero on every rescan. Changed to
+  `INSERT … ON CONFLICT(id) DO UPDATE SET` excluding those columns.
+  Favorites / Frequent now survive rescans correctly. (`wpick-core`)
+
+- **Cache transaction not used** — `upsert_batch()` and `prune()` opened a
+  transaction but then called `self.conn.execute()` instead of `tx.execute()`,
+  so all writes bypassed the transaction and could not be rolled back.
+  (`wpick-core`)
+
+- **IPC allocation DoS** — `recv_command` and `recv_response` read an unbounded
+  line into a `String` before checking its size, allowing a malicious client to
+  allocate arbitrary memory. Fixed with `AsyncReadExt::take(MAX_BYTES + 1)`
+  applied before `read_line`. (`wpick-core`)
+
+- **ShmCanvas integer overflow** — stride and pool size calculations used plain
+  multiplication on `u32` values, wrapping silently on 16 K+ outputs. Changed
+  to `checked_mul` with an `anyhow::ensure!(size <= i32::MAX)` guard.
+  (`wpick-daemon`)
+
+- **Audio decoder channel spin** — `StreamingSource::next()` returned
+  `Some(0.0)` immediately on channel disconnect, keeping a silent rodio sink
+  alive forever and spinning the mixer thread. Changed to `return None` so
+  rodio drops the sink. (`wpick-daemon`)
+
+- **VA-API surface leak on seek** — `seek_to_start` flushed the codec without
+  first unreffing in-flight frames, exhausting the VA driver surface pool after
+  enough loop cycles. Added `av_frame_unref` for both `vaapi_frame` and
+  `nv12_frame` before each seek. (`wpick-daemon`)
+
+- **VA-API hardcoded render node** — `HwDecoder::try_open` iterated a static
+  list `[renderD128, renderD129]`, silently failing on multi-GPU or PRIME
+  systems. Replaced with a `read_dir("/dev/dri")` glob filtered to `renderD*`
+  entries. (`wpick-daemon`)
+
+- **Hyprland reconnect storm** — `hyprland_fullscreen_loop` slept a flat 2 s
+  on disconnect with no upper bound. Replaced with exponential backoff:
+  2 s → 4 s → 8 s → 16 s, capped at 30 s; resets to 2 s on success.
+  (`wpick-daemon`)
+
+- **`unwrap()` on poisoned Mutex in ducking** — all `.unwrap()` calls on
+  `Mutex::lock()` in `DuckHandle` changed to `.unwrap_or_else(|e| e.into_inner())`
+  so a panicking audio thread cannot freeze the render loop. (`wpick-daemon`)
+
+- **Hotkey device flood** — on machines with many input nodes (KVM, uinput)
+  the daemon could spawn hundreds of blocking threads. Capped at 8 keyboard
+  watcher threads (`MAX_KEYBOARD_WATCHERS`). (`wpick-daemon`)
+
+- **Hotkey terminal injection** — terminal path from config was used directly
+  in a process spawn without sanitisation. Added validation that rejects paths
+  containing whitespace or shell metacharacters (`;`, `&`, `|`, `$`, `` ` ``,
+  `\`, `'`, `"`). (`wpick-daemon`)
+
+- **TUI reconnect socket leak** — `try_reconnect` would create a new socket
+  even when one was already connected. Added early-return guard.
+  (`wpick-tui`)
+
+- **`ellipsize(s, 0)` panic** — truncating to zero width subtracted 1 from
+  `usize(0)`, causing underflow. Added early return for `max_chars == 0`.
+  (`wpick-tui`)
+
+- **TUI path truncation byte-slice indexing** — path display sliced bytes
+  instead of char boundaries, causing a panic on multi-byte UTF-8 paths.
+  Fixed with `char_indices()`. (`wpick-tui`)
+
+---
+
 ## [0.4.2] — 2026-05-17
 
 ### Added

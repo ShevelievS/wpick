@@ -8,7 +8,7 @@
 > "Wallpaper Engine" and "Steam" are trademarks of Valve Corporation.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.2-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
 
 wpick plays video files directly on `wlr-layer-shell` background surfaces,
 with streaming audio, PulseAudio ducking, VA-API hardware decode,
@@ -43,6 +43,8 @@ Steam Workshop is auto-detected — no configuration needed if you have it.
 | Wallpaper timer with shuffle | ✅ |
 | Favorites & Most Played | ✅ |
 | Packs (named collections) | ✅ |
+| Per-workspace wallpapers (Hyprland / Sway) | ✅ |
+| FPS cap (`max_fps` — reduces cursor jitter) | ✅ |
 | Theme presets (nord, dracula, tokyo…) | ✅ |
 | Shell completions / man pages | ✅ |
 | Scene wallpapers | ❌ not planned |
@@ -263,6 +265,7 @@ Created automatically with defaults on first run.
 [general]
 volume             = 0.8
 muted              = false
+max_fps            = 30      # frame cap — lower values reduce compositor CPU and cursor jitter
 # pause_competitors = false  # true = SIGSTOP competing daemons; false (default) = SIGKILL
 
 [audio]
@@ -300,6 +303,13 @@ surface_reassert_secs = 0 # delay before Wayland surface reinit on startup
 wallpaper_id = 1234567890
 fit          = "fill"     # fit | fill | stretch | center
 mute         = false      # mute audio on this monitor
+
+# Per-workspace wallpapers — Hyprland workspace name → wallpaper ID.
+# When you switch workspace the assigned wallpaper is applied on the focused monitor.
+# Set id = 0 to clear a mapping. Works with both Hyprland and Sway.
+[workspace_wallpapers]
+"1" = 1234567890
+"2" = 9876543210
 ```
 
 ### Fit modes
@@ -372,15 +382,21 @@ A background thread connects to Hyprland's `socket2` event stream.
 On `fullscreen>>1` the compositor stops delivering frame callbacks; the
 daemon detects this via a 300 ms timeout and keeps the render loop alive.
 On `fullscreen>>0` the surface is recreated to restore correct z-order.
-Workspace switches query `j/activeworkspace` so moving to/from a fullscreen
-workspace also triggers the correct pause/resume.
+`workspace>>` and `workspacev2>>` (Hyprland v0.40+) events trigger
+per-workspace wallpaper switches and fullscreen state queries.
+
+**Frame pacing:**  
+`max_fps` (default 30) caps the committed-frame rate regardless of video FPS.
+A drift-clamp anchors `next_frame` to wall clock after each commit to prevent
+render-loop spin accumulation over long runtimes. Together these eliminate
+cursor jitter on high-refresh-rate displays after extended wallpaper playback.
 
 ---
 
 ## Development
 
 ```bash
-cargo test   --workspace          # ~70 tests, 0 failures expected
+cargo test   --workspace          # 78 tests, 0 failures expected
 cargo clippy --workspace -- -D warnings
 cargo build  --workspace --release
 ```
@@ -395,26 +411,20 @@ cargo build  --workspace --release
 
 ## Roadmap
 
-### v0.4.3 — Stability & performance (planned)
+### v0.5.1 — Polish (planned)
 
 | Item | Description |
 |------|-------------|
-| Config write safety | Replace per-command `load → save` pattern with a single `Arc<Mutex<WpickConfig>>` + debounced writer — eliminates silent data loss when two IPC commands fire concurrently |
-| IPC timeout resilience | Structured backoff on Hyprland socket reconnect (currently flat 2 s sleep) |
-| Batch SQLite scan | Wrap all `upsert` calls in a single transaction — 10-20× faster scan on large libraries |
-| `prune()` chunking | Split `WHERE id NOT IN (…)` into chunks of 999 to avoid SQLite variable limit |
-| VA-API device discovery | Glob `/dev/dri/renderD*` instead of hardcoding `renderD128`/`renderD129`; fixes AMD APU and multi-GPU setups |
-| `has_audio` probe | Detect audio tracks in local video files at scan time via ffmpeg stream inspection |
-| IPC server tests | Unit tests for each `dispatch()` arm with mocked state and cache |
+| PulseAudio reconnect | Exponential backoff reconnect loop after ducking socket disconnects |
+| Fill mode center-crop | True center-of-frame crop for Fill mode (currently crops from top-left) |
+| Workspace crossfade | Crossfade transition on workspace wallpaper switches (currently hard-cut) |
 
-### v0.5 — Architecture (planned)
+### v0.6 — GPU render path (planned)
 
 | Item | Description |
 |------|-------------|
-| Typed renderer errors | Replace `__reassert__`/`__fatal__` string matching with a proper `RendererSignal` enum |
-| Renderer trait abstraction | Extract `Decoder` trait + headless implementation for unit-testable renderer logic |
-| Rust 2024 Edition | MSRV bump, all three crates updated |
-| EGL/GPU render path | Optional wl_egl_surface path for hardware-accelerated frame delivery (prerequisite for GPU transitions) |
+| DMA-BUF / wl_drm | Zero-copy GPU frame delivery — eliminates wl_shm CPU upload entirely |
+| EGL surface | Optional `wl_egl_surface` path for hardware-accelerated frame delivery |
 
 ---
 

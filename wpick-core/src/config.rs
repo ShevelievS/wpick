@@ -25,6 +25,11 @@ pub struct WpickConfig {
     pub tui:              TuiConfig,
     /// Global hotkey that opens the wpick TUI popup window.
     pub hotkey:           HotkeyConfig,
+    /// Per-workspace wallpaper assignments: workspace name → wallpaper id.
+    /// When the user switches workspace the daemon applies the assigned wallpaper
+    /// on the focused monitor (Hyprland / Sway).  Use `id = 0` to clear a mapping.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub workspace_wallpapers: HashMap<String, u64>,
 }
 
 // ─── TUI config ───────────────────────────────────────────────────────────────
@@ -96,7 +101,7 @@ pub struct TuiConfig {
     /// Seconds after daemon start before reasserting Wayland surfaces.
     /// Fixes z-order when another layer-shell client (e.g. QuickShell) creates
     /// its background surface lazily and ends up on top of wpick.
-    /// Set to 0 to disable. Default: 8.
+    /// Set to 0 to disable. Default: 12.
     #[serde(default = "default_surface_reassert_secs")]
     pub surface_reassert_secs: u64,
 }
@@ -143,11 +148,19 @@ pub struct GeneralConfig {
     /// resume after wpick exits without needing to restart them manually.
     #[serde(default)]
     pub pause_competitors: bool,
+    /// Hard cap on committed frames per second regardless of video FPS.
+    /// Reducing this value lowers compositor CPU load (wl_shm upload frequency)
+    /// which prevents cursor jitter on high-resolution displays.
+    /// Set to 0 to disable (use native video FPS). Default: 30.
+    #[serde(default = "default_max_fps")]
+    pub max_fps: u32,
 }
+
+fn default_max_fps() -> u32 { 30 }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
-        Self { volume: 0.8, muted: false, pause_competitors: false }
+        Self { volume: 0.8, muted: false, pause_competitors: false, max_fps: default_max_fps() }
     }
 }
 

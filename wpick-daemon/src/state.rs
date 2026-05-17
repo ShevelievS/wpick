@@ -5,6 +5,13 @@ use tokio::sync::{broadcast, watch};
 use wpick_core::config::FitMode;
 use wpick_core::model::WallpaperInfo;
 
+#[derive(Clone, Debug)]
+pub struct OutputInfo {
+    pub name:   String,
+    pub width:  u32,
+    pub height: u32,
+}
+
 pub struct DaemonState {
     pub current:         Option<WallpaperInfo>,
     pub volume:          f32,
@@ -15,12 +22,14 @@ pub struct DaemonState {
     pub per_monitor_tx:  watch::Sender<HashMap<String, Option<WallpaperInfo>>>,
     /// (monitor_name_or_"*", fit) — "*" means all monitors.
     pub fit_tx:          watch::Sender<(String, FitMode)>,
-    pub outputs:         Arc<Mutex<Vec<(String, u32, u32)>>>,
+    pub outputs:         Arc<Mutex<Vec<OutputInfo>>>,
     // v0.5 — wallpaper timer
     pub timer_task:      Option<tokio::task::JoinHandle<()>>,
     pub timer_interval:  u64,        // seconds; 0 when inactive
     pub timer_started:   std::time::Instant,
     pub timer_ids:       Vec<u64>,   // wallpaper IDs in current rotation
+    // v0.5 — per-workspace wallpaper assignments
+    pub workspace_wallpaper_tx: watch::Sender<HashMap<String, u64>>,
 }
 
 impl DaemonState {

@@ -50,7 +50,7 @@ impl Shared {
 
     // H-3: muted is now passed so set_sink never overrides a muted state.
     fn set_sink(&self, sink: Arc<rodio::Sink>, volume: f32, muted: bool) {
-        let mut d = self.0.lock().unwrap();
+        let mut d = self.0.lock().unwrap_or_else(|e| e.into_inner());
         d.target_volume = volume;
         d.muted         = muted;
         let effective = if d.ducked || muted { 0.0 } else { volume };
@@ -60,7 +60,7 @@ impl Shared {
 
     // H-3: volume and muted updated together so they stay in sync.
     fn update_volume(&self, vol: f32, muted: bool) {
-        let mut d = self.0.lock().unwrap();
+        let mut d = self.0.lock().unwrap_or_else(|e| e.into_inner());
         d.target_volume = vol;
         d.muted         = muted;
         if let Some(ref s) = d.sink {
@@ -71,7 +71,7 @@ impl Shared {
 
     /// Returns (should_fade_out, should_fade_in).
     fn update(&self, new_foreign: u32) -> (bool, bool) {
-        let mut d      = self.0.lock().unwrap();
+        let mut d      = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let was_ducked = d.ducked;
         d.foreign_count = new_foreign;
         d.ducked        = new_foreign > 0;
@@ -82,7 +82,7 @@ impl Shared {
         let shared = self.clone();
         // C-1: bump generation; old fade threads exit when they see a different gen.
         let gen = {
-            let mut d = shared.0.lock().unwrap();
+            let mut d = shared.0.lock().unwrap_or_else(|e| e.into_inner());
             d.fade_gen += 1;
             d.fade_gen
         };
@@ -92,7 +92,7 @@ impl Shared {
                 let step_ms = (FADE_SECS * 1000.0 / FADE_STEPS as f32) as u64;
                 for i in 0..=FADE_STEPS {
                     std::thread::sleep(Duration::from_millis(step_ms));
-                    let d = shared.0.lock().unwrap();
+                    let d = shared.0.lock().unwrap_or_else(|e| e.into_inner());
                     // C-1: a newer fade started — stop immediately.
                     if d.fade_gen != gen { break; }
                     // H-3: if muted, keep volume at 0 regardless of duck direction.
@@ -163,7 +163,8 @@ pub fn start() -> DuckHandle {
             }
             tracing::info!("Ducking thread exited");
         })
-        .expect("ducking thread");
+        .map_err(|e| tracing::warn!("Failed to spawn ducking thread: {}", e))
+        .ok();
 
     match rx.recv_timeout(Duration::from_secs(1)) {
         Ok(_) => DuckHandle { shared: Some(shared), stop },
@@ -185,7 +186,8 @@ fn pa_loop(
         .ok_or_else(|| anyhow::anyhow!("PA mainloop init failed"))?;
 
     let mut ctx = {
-        let mut pl = Proplist::new().unwrap();
+        let mut pl = Proplist::new()
+            .ok_or_else(|| anyhow::anyhow!("PA proplist init failed"))?;
         pl.set_str(pulse::proplist::properties::APPLICATION_NAME, "wpick").ok();
         Context::new_with_proplist(&ml, "wpick", &pl)
             .ok_or_else(|| anyhow::anyhow!("PA context init failed"))?

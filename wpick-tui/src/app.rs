@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::ListState;
@@ -533,8 +533,35 @@ impl App {
             terminal.draw(|f| ui::render(f, self))?;
 
             if crossterm::event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = crossterm::event::read()? {
-                    self.handle_key(key, terminal).await;
+                match crossterm::event::read()? {
+                    Event::Key(key) => {
+                        self.handle_key(key, terminal).await;
+                    }
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollDown => {
+                                if self.active_panel == Panel::List {
+                                    self.select_next();
+                                } else {
+                                    let nav_len = self.nav_items().len();
+                                    if self.nav_selected + 1 < nav_len {
+                                        self.nav_selected += 1;
+                                        self.reset_list_selection();
+                                    }
+                                }
+                            }
+                            MouseEventKind::ScrollUp => {
+                                if self.active_panel == Panel::List {
+                                    self.select_prev();
+                                } else if self.nav_selected > 0 {
+                                    self.nav_selected -= 1;
+                                    self.reset_list_selection();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
                 }
             }
 
@@ -1283,9 +1310,17 @@ impl App {
         self.loading = false;
     }
 
-    // WallpaperInfo doesn't carry play_count yet; use first 10 as placeholder.
     async fn refresh_frequent(&mut self) {
-        self.frequent = self.wallpapers.iter().take(10).cloned().collect();
+        // Ask the daemon to query play counts from the DB.
+        if let Ok(DaemonResponse::FrequentList { items }) =
+            self.send(ClientCommand::GetFrequent { limit: 10 }).await
+        {
+            self.frequent = items;
+            return;
+        }
+        // Fallback: sort wallpapers by insertion order (most-recently-added first)
+        // when the daemon doesn't support GetFrequent yet.
+        self.frequent = self.wallpapers.iter().rev().take(10).cloned().collect();
     }
 
     async fn send(&mut self, cmd: ClientCommand) -> anyhow::Result<DaemonResponse> {
@@ -1301,6 +1336,7 @@ impl App {
     }
 
     pub async fn try_reconnect(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+        if self.client.is_some() { return; } // already connected — don't leak or replace the socket
         if let Some(last) = self.last_reconnect {
             if last.elapsed() < Duration::from_secs(2) { return; }
         }

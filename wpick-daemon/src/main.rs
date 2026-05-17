@@ -89,12 +89,10 @@ fn handle_competing_tools(pause_mode: bool) -> Vec<u32> {
     for (name, pid) in &found {
         if pause_mode {
             tracing::info!("pausing competing tool: {} (pid {})", name, pid);
-            eprintln!("wpick: приостанавливаю {} (pid {})...", name, pid);
             unsafe { libc::kill(*pid as libc::pid_t, libc::SIGSTOP); }
             paused_pids.push(*pid);
         } else {
             tracing::info!("stopping competing tool: {} (pid {})", name, pid);
-            eprintln!("wpick: останавливаю {} (pid {})...", name, pid);
             unsafe { libc::kill(*pid as libc::pid_t, libc::SIGTERM); }
         }
     }
@@ -189,9 +187,12 @@ async fn main() -> anyhow::Result<()> {
     // FitMode updates: (monitor_name or "*", fit) — renderer subscribes.
     let (fit_tx, fit_rx) =
         sync::watch::channel(("*".to_owned(), wpick_core::config::FitMode::default()));
+    // Workspace wallpaper map channel — renderer subscribes to apply workspace-based wallpapers.
+    let (workspace_wallpaper_tx, workspace_wallpaper_rx) =
+        sync::watch::channel(config.workspace_wallpapers.clone());
     // Shared output list published by the renderer and read by the IPC server.
-    let outputs: Arc<std::sync::Mutex<Vec<(String, u32, u32)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::<(String, u32, u32)>::new()));
+    let outputs: Arc<std::sync::Mutex<Vec<crate::state::OutputInfo>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let outputs_renderer = Arc::clone(&outputs);
 
     // 5. DaemonState
@@ -209,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         timer_interval: 0,
         timer_started:  std::time::Instant::now(),
         timer_ids:      Vec::new(),
+        workspace_wallpaper_tx,
     }));
 
     // 5b. Restore last wallpaper from config (persist-on-restart).
@@ -310,7 +312,6 @@ async fn main() -> anyhow::Result<()> {
             let cfg = cfg_sig.lock().await.clone();
             if let Err(e) = cfg.save() { tracing::warn!("Config flush on SIGINT failed: {}", e); }
             let _ = std::fs::remove_file(&sp);
-            std::process::exit(0);
         });
     }
     #[cfg(unix)]
@@ -329,7 +330,6 @@ async fn main() -> anyhow::Result<()> {
                 let cfg = cfg_sig.lock().await.clone();
                 if let Err(e) = cfg.save() { tracing::warn!("Config flush on SIGTERM failed: {}", e); }
                 let _ = std::fs::remove_file(&sp);
-                std::process::exit(0);
             }
         });
     }
@@ -435,7 +435,7 @@ async fn main() -> anyhow::Result<()> {
 
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit, per_monitor_rx, fit_rx, outputs_renderer, reassert_flag))
+        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit, per_monitor_rx, fit_rx, outputs_renderer, reassert_flag, workspace_wallpaper_rx, config.general.max_fps))
         .await
         .context("Renderer error")?;
 

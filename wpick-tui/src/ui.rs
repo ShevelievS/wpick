@@ -9,6 +9,19 @@ use wpick_core::model::{WallpaperSource};
 
 use crate::app::{App, AppMode, COLOR_PRESETS, FpHint, NavItem, Panel, PALETTE, SORT_OPTIONS, SortMode, TIMER_OPTIONS, fit_label, fp_is_system};
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values, appending `…` if truncated.
+fn ellipsize(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 { return String::new(); }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        s.to_owned()
+    } else {
+        chars[..max_chars - 1].iter().collect::<String>() + "…"
+    }
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -341,15 +354,34 @@ fn render_nav_stats(frame: &mut Frame, app: &App, area: Rect) {
     let vol_line = if app.config.general.muted {
         Line::from(Span::styled(" \u{25a0} MUTED", Style::default().fg(t.color_fav)))
     } else {
-        let pct    = (app.config.general.volume * 100.0) as u32;
-        let filled = (app.config.general.volume * 6.0).round() as usize;
-        let empty  = 6usize.saturating_sub(filled);
-        Line::from(vec![
-            Span::styled(" \u{266a} ", dim),
-            Span::styled("\u{25b0}".repeat(filled), Style::default().fg(t.vol_bar)),
-            Span::styled("\u{25b1}".repeat(empty),  dim),
-            Span::styled(format!(" {pct}%"), dim),
-        ])
+        let pct = (app.config.general.volume * 100.0) as u32;
+        match app.config.tui.vol_style.as_str() {
+            "number" => Line::from(vec![
+                Span::styled(" \u{266a} ", dim),
+                Span::styled(format!("{pct}%"), Style::default().fg(t.vol_bar)),
+            ]),
+            "bar" => {
+                // Wider bar (10 segments)
+                let filled = (app.config.general.volume * 10.0).round() as usize;
+                let empty  = 10usize.saturating_sub(filled);
+                Line::from(vec![
+                    Span::styled(" \u{266a} ", dim),
+                    Span::styled("\u{25b0}".repeat(filled), Style::default().fg(t.vol_bar)),
+                    Span::styled("\u{25b1}".repeat(empty),  dim),
+                ])
+            }
+            _ => {
+                // "slim" (default): 6 segments + percentage
+                let filled = (app.config.general.volume * 6.0).round() as usize;
+                let empty  = 6usize.saturating_sub(filled);
+                Line::from(vec![
+                    Span::styled(" \u{266a} ", dim),
+                    Span::styled("\u{25b0}".repeat(filled), Style::default().fg(t.vol_bar)),
+                    Span::styled("\u{25b1}".repeat(empty),  dim),
+                    Span::styled(format!(" {pct}%"), dim),
+                ])
+            }
+        }
     };
 
     // Clock
@@ -466,8 +498,24 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     if view.is_empty() {
-        let msg = if app.wallpapers.is_empty() { "No wallpapers. Press 'r' to scan." }
-                  else { "No matches." };
+        let t = app.theme();
+        let dim = Style::default().fg(t.text_dim);
+        let msg: ratatui::text::Text = match app.current_nav() {
+            NavItem::Favorites => ratatui::text::Text::from(vec![
+                Line::from(Span::styled("No favorites yet", dim)),
+                Line::from(Span::styled("Press [p] on a wallpaper to add it", dim)),
+            ]),
+            NavItem::Frequent => ratatui::text::Text::from(
+                Line::from(Span::styled("No wallpapers played yet", dim))
+            ),
+            _ => {
+                if app.wallpapers.is_empty() {
+                    ratatui::text::Text::raw("No wallpapers. Press 'r' to scan.")
+                } else {
+                    ratatui::text::Text::raw("No matches.")
+                }
+            }
+        };
         frame.render_widget(Paragraph::new(msg), inner);
         return;
     }
@@ -495,7 +543,11 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             Style::default()
         };
 
-        let label = format!("{fav_icon} {play_icon} {}{audio_ico}", w.title);
+        // Reserve: 1 fav + 1 space + 1 play + 1 space + audio_ico (0 or 2) + some padding.
+        let prefix_len = 4 + audio_ico.chars().count();
+        let avail = (inner.width as usize).saturating_sub(prefix_len);
+        let title = ellipsize(&w.title, avail);
+        let label = format!("{fav_icon} {play_icon} {title}{audio_ico}");
         ListItem::new(Span::styled(label, style))
     }).collect();
 
@@ -611,7 +663,15 @@ fn build_detail_lines(app: &App) -> Vec<Line<'static>> {
         if parent.is_empty() { file.to_owned() } else { format!("\u{2026}/{parent}/{file}") }
     };
     let path_str = if path_str.chars().count() > 30 {
-        format!("\u{2026}{}", &path_str[path_str.len().saturating_sub(30)..])
+        let suffix: String = path_str.char_indices()
+            .rev()
+            .take(30)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|(_, c)| c)
+            .collect();
+        format!("\u{2026}{}", suffix)
     } else { path_str };
     lines.push(Line::from(Span::styled(format!(" {path_str}"), dim)));
 
@@ -745,8 +805,8 @@ fn render_detail_fullscreen(frame: &mut Frame, app: &mut App, area: Rect) {
     // Centered card: 82% width, 88% height
     let card_w = (area.width as f32 * 0.82) as u16;
     let card_h = (area.height as f32 * 0.88) as u16;
-    let card_x = area.x + (area.width - card_w) / 2;
-    let card_y = area.y + (area.height - card_h) / 2;
+    let card_x = area.x + (area.width.saturating_sub(card_w)) / 2;
+    let card_y = area.y + (area.height.saturating_sub(card_h)) / 2;
     let card   = Rect::new(card_x, card_y, card_w, card_h);
 
     frame.render_widget(Clear, card);
@@ -789,8 +849,8 @@ fn render_detail_fullscreen(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(card);
     frame.render_widget(block, card);
 
-    // Preview takes top 62%, info bottom 38%
-    let preview_h = ((inner.height as f32) * 0.62) as u16;
+    // Preview takes top 62%, info bottom 38%; floor at 4 to avoid StatefulImage panic.
+    let preview_h = (((inner.height as f32) * 0.62) as u16).max(4);
     let [preview_area, sep_area, info_area] = Layout::vertical([
         Constraint::Length(preview_h),
         Constraint::Length(1),
@@ -1247,8 +1307,8 @@ fn render_sort_dialog(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(dialog);
     frame.render_widget(block, dialog);
 
-    let dim  = Style::default().fg(Color::Rgb(80, 80, 95));
-    let hint = Style::default().fg(Color::Rgb(60, 60, 72));
+    let dim  = Style::default().fg(t.text_dim);
+    let hint = Style::default().fg(t.color_hint);
 
     let mut lines = vec![
         Line::from(Span::styled(" Sort by:", dim)),

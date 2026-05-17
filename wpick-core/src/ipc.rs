@@ -53,7 +53,14 @@ pub enum ClientCommand {
     GetTimerState,
     /// Record that wallpaper `id` was played (for Frequent tracking).
     RecordPlay { id: u64 },
+    /// Return up to `limit` wallpapers ordered by play count descending.
+    GetFrequent { limit: usize },
     Kill,
+    /// Assign wallpaper `id` to workspace `workspace` (Hyprland name like "1", "2",
+    /// "special:magic").  Pass `id = 0` to clear the mapping for that workspace.
+    SetWorkspaceWallpaper { workspace: String, id: u64 },
+    /// Return the current workspace → wallpaper id mapping.
+    GetWorkspaceMap,
 }
 
 /// Responses sent from wpick-daemon back to wpick-tui.
@@ -93,6 +100,13 @@ pub enum DaemonResponse {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ids: Vec<u64>,
     },
+    /// Response to `GetFrequent` — most-played wallpapers in descending play-count order.
+    FrequentList { items: Vec<WallpaperInfo> },
+    /// Returned by `GetWorkspaceMap` and `SetWorkspaceWallpaper`.
+    WorkspaceMap {
+        #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+        map: std::collections::HashMap<String, u64>,
+    },
 }
 
 // ─── Send / Receive helpers ───────────────────────────────────────────────────
@@ -113,13 +127,19 @@ where
 
 /// Read one newline-terminated JSON line and deserialize it as `ClientCommand`.
 /// Returns `WpickError::IpcClosed` on EOF (see ERRORS_TO_AVOID E-20).
+///
+/// Uses `take(MAX_CMD_BYTES + 1)` so the internal buffer never grows beyond
+/// the limit regardless of what the peer sends — prevents memory exhaustion DoS.
 pub async fn recv_command<R>(reader: &mut R) -> Result<ClientCommand>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
+    let n = {
+        let mut limited = (&mut *reader).take((MAX_CMD_BYTES as u64) + 1);
+        limited.read_line(&mut line).await?
+    };
     if n == 0 {
         return Err(WpickError::IpcClosed);
     }
@@ -147,13 +167,18 @@ where
 
 /// Read one newline-terminated JSON line and deserialize it as `DaemonResponse`.
 /// Returns `WpickError::IpcClosed` on EOF.
+///
+/// Uses `take(MAX_RESP_BYTES + 1)` to cap allocation before the size check.
 pub async fn recv_response<R>(reader: &mut R) -> Result<DaemonResponse>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
+    let n = {
+        let mut limited = (&mut *reader).take((MAX_RESP_BYTES as u64) + 1);
+        limited.read_line(&mut line).await?
+    };
     if n == 0 {
         return Err(WpickError::IpcClosed);
     }
@@ -186,6 +211,9 @@ mod tests {
             ClientCommand::Info   { id: 99 },
             ClientCommand::ListOutputs,
             ClientCommand::Kill,
+            ClientCommand::SetWorkspaceWallpaper { workspace: "1".into(), id: 42 },
+            ClientCommand::SetWorkspaceWallpaper { workspace: "special:magic".into(), id: 0 },
+            ClientCommand::GetWorkspaceMap,
         ];
 
         for cmd in &commands {
@@ -238,6 +266,8 @@ mod tests {
             DaemonResponse::VolumeState { volume: 0.5,  muted: true,  current_id: Some(99) },
             DaemonResponse::ScanProgress { done: 5, total: 100 },
             DaemonResponse::OutputList { names: vec!["DP-1".into(), "HDMI-A-1".into()], resolutions: vec![(1920, 1080), (2560, 1440)] },
+            DaemonResponse::WorkspaceMap { map: std::collections::HashMap::new() },
+            DaemonResponse::WorkspaceMap { map: [("1".to_owned(), 42u64), ("2".to_owned(), 99u64)].into() },
         ];
 
         for resp in &responses {

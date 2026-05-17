@@ -86,6 +86,36 @@ impl Cache {
         Ok(Self { conn })
     }
 
+    /// Open an in-memory SQLite database for testing.
+    /// Does NOT apply WAL/synchronous pragmas — they are meaningless or may error
+    /// on in-memory databases depending on the SQLite build.
+    pub fn open_in_memory() -> Result<Self> {
+        const IN_MEMORY_SCHEMA: &str = "
+            CREATE TABLE IF NOT EXISTS wallpapers (
+                id               INTEGER PRIMARY KEY,
+                title            TEXT NOT NULL,
+                wallpaper_type   TEXT NOT NULL,
+                file_path        TEXT NOT NULL,
+                preview_path     TEXT,
+                has_audio        INTEGER NOT NULL DEFAULT 0,
+                file_size_bytes  INTEGER NOT NULL DEFAULT 0,
+                pkg_mtime_secs   INTEGER NOT NULL DEFAULT 0,
+                width            INTEGER NOT NULL DEFAULT 0,
+                height           INTEGER NOT NULL DEFAULT 0,
+                source           TEXT NOT NULL DEFAULT 'workshop',
+                play_count       INTEGER NOT NULL DEFAULT 0,
+                last_played_secs INTEGER NOT NULL DEFAULT 0
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) STRICT;
+        ";
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(IN_MEMORY_SCHEMA)?;
+        Ok(Self { conn })
+    }
+
     /// Retrieve all wallpapers sorted by source then title ascending.
     pub fn get_all(&self) -> Result<Vec<WallpaperInfo>> {
         let mut stmt = self.conn.prepare(
@@ -111,13 +141,19 @@ impl Cache {
         }
     }
 
-    /// Insert or replace a wallpaper record.
+    /// Insert or update a wallpaper record, preserving play_count and last_played_secs.
     pub fn upsert(&self, info: &WallpaperInfo, pkg_mtime_secs: u64) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO wallpapers \
+            "INSERT INTO wallpapers \
              (id, title, wallpaper_type, file_path, preview_path, \
               has_audio, file_size_bytes, pkg_mtime_secs, width, height, source) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(id) DO UPDATE SET \
+               title=excluded.title, wallpaper_type=excluded.wallpaper_type, \
+               file_path=excluded.file_path, preview_path=excluded.preview_path, \
+               has_audio=excluded.has_audio, file_size_bytes=excluded.file_size_bytes, \
+               pkg_mtime_secs=excluded.pkg_mtime_secs, width=excluded.width, \
+               height=excluded.height, source=excluded.source",
             params![
                 info.id as i64,
                 info.title,
@@ -219,25 +255,31 @@ impl Cache {
                 .iter()
                 .map(|&id| rusqlite::types::Value::Integer(id as i64))
                 .collect();
-            self.conn.execute(&sql, rusqlite::params_from_iter(params))?;
+            tx.execute(&sql, rusqlite::params_from_iter(params))?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Insert or replace a batch of wallpaper records in a single transaction.
-    /// Dramatically faster than individual `upsert` calls on large scans.
+    /// Insert or update a batch of wallpaper records in a single transaction.
+    /// Preserves play_count and last_played_secs — a scan never resets statistics.
     pub fn upsert_batch(&self, items: &[(WallpaperInfo, u64)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
         let tx = self.conn.unchecked_transaction()?;
         for (info, mtime) in items {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO wallpapers \
+            tx.execute(
+                "INSERT INTO wallpapers \
                  (id, title, wallpaper_type, file_path, preview_path, \
                   has_audio, file_size_bytes, pkg_mtime_secs, width, height, source) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   title=excluded.title, wallpaper_type=excluded.wallpaper_type, \
+                   file_path=excluded.file_path, preview_path=excluded.preview_path, \
+                   has_audio=excluded.has_audio, file_size_bytes=excluded.file_size_bytes, \
+                   pkg_mtime_secs=excluded.pkg_mtime_secs, width=excluded.width, \
+                   height=excluded.height, source=excluded.source",
                 params![
                     info.id as i64,
                     info.title,

@@ -32,7 +32,14 @@ pub async fn run(config: HotkeyConfig, mut shutdown: broadcast::Receiver<()>) {
 
     let (tx, mut rx) = mpsc::channel::<()>(4);
 
-    for path in keyboards {
+    // Cap at 8 devices: prevents 100+ threads on machines with many input nodes
+    // (KVM switches, uinput virtual devices, etc.), each of which would cost ~8 MB stack.
+    const MAX_KEYBOARD_WATCHERS: usize = 8;
+    if keyboards.len() > MAX_KEYBOARD_WATCHERS {
+        tracing::warn!("hotkey: {} keyboard devices found, watching only first {}",
+            keyboards.len(), MAX_KEYBOARD_WATCHERS);
+    }
+    for path in keyboards.into_iter().take(MAX_KEYBOARD_WATCHERS) {
         let tx    = tx.clone();
         let mods  = mods.clone();
         std::thread::Builder::new()
@@ -104,7 +111,15 @@ fn watch_device(
 // ─── Popup spawner ────────────────────────────────────────────────────────────
 
 fn spawn_popup(config: &HotkeyConfig) {
-    let terminal = if config.terminal.is_empty() {
+    // Reject terminal paths containing whitespace or shell metacharacters to
+    // prevent accidental command injection via the config file.
+    let terminal = if config.terminal.is_empty()
+        || config.terminal.chars().any(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '$' | '`' | '\\' | '\'' | '"'))
+    {
+        if !config.terminal.is_empty() {
+            tracing::warn!("hotkey: terminal '{}' contains unsafe characters — using auto-detection",
+                config.terminal);
+        }
         detect_terminal()
     } else {
         config.terminal.clone()

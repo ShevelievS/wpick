@@ -34,22 +34,30 @@ use crate::video::VideoDecoder;
 
 // ─── Fullscreen monitors (Hyprland + Sway) ───────────────────────────────────
 
+/// Shared workspace-change sender: the fs-mon thread holds an `Arc` to this and
+/// always sends to whatever `SyncSender` is currently installed.  The render loop
+/// swaps in a fresh sender (and keeps the matching receiver) on each reinit.
+type WorkspaceSenderSlot = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<String>>>>;
+
 fn start_fullscreen_monitor(
-    on_exit:       Option<Arc<dyn Fn() + Send + Sync>>,
-    reassert_flag: Arc<AtomicBool>,
+    on_exit:             Option<Arc<dyn Fn() + Send + Sync>>,
+    reassert_flag:       Arc<AtomicBool>,
+    workspace_sender_slot: WorkspaceSenderSlot,
 ) -> Arc<AtomicBool> {
     let flag  = Arc::new(AtomicBool::new(false));
     let flag2 = Arc::clone(&flag);
 
     if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
-        let cb = on_exit.clone();
-        let rf = Arc::clone(&reassert_flag);
+        let cb   = on_exit.clone();
+        let rf   = Arc::clone(&reassert_flag);
+        let slot = Arc::clone(&workspace_sender_slot);
         std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
-            hyprland_fullscreen_loop(flag2, sig, cb, rf);
+            hyprland_fullscreen_loop(flag2, sig, cb, rf, slot);
         }).ok();
     } else if std::env::var("SWAYSOCK").is_ok() {
+        let slot = Arc::clone(&workspace_sender_slot);
         std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
-            sway_fullscreen_loop(flag2, on_exit);
+            sway_fullscreen_loop(flag2, on_exit, slot);
         }).ok();
     } else {
         tracing::info!("unknown compositor — fullscreen detection off");
@@ -71,10 +79,11 @@ fn hyprland_query_fullscreen(sock1: &str) -> bool {
 }
 
 fn hyprland_fullscreen_loop(
-    flag:          Arc<AtomicBool>,
-    sig:           String,
-    on_exit:       Option<Arc<dyn Fn() + Send + Sync>>,
-    reassert_flag: Arc<AtomicBool>,
+    flag:                  Arc<AtomicBool>,
+    sig:                   String,
+    on_exit:               Option<Arc<dyn Fn() + Send + Sync>>,
+    reassert_flag:         Arc<AtomicBool>,
+    workspace_sender_slot: WorkspaceSenderSlot,
 ) {
     // Hyprland >= 0.30 moved the socket from /tmp/hypr/ to $XDG_RUNTIME_DIR/hypr/.
     let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
@@ -120,10 +129,39 @@ fn hyprland_fullscreen_loop(
                     // update prev_active or fire the callback here.  prev_active must only
                     // track real fullscreen>> transitions so that the callback fires correctly
                     // when the user actually exits fullscreen (fullscreen>>0).
-                    Ok(l) if l.starts_with("workspace>>") || l.starts_with("focusedmon>>") => {
+                    Ok(ref l) if l.starts_with("workspacev2>>") => {
+                        // Hyprland v0.40+: "workspacev2>>id,name"
                         let active = hyprland_query_fullscreen(&sock1);
                         flag.store(active, Ordering::Relaxed);
-                        tracing::info!("workspace change → fullscreen={}", active);
+                        let rest = l.trim_start_matches("workspacev2>>");
+                        if let Some((_, ws_name)) = rest.split_once(',') {
+                            let ws_name = ws_name.to_owned();
+                            tracing::info!("workspacev2 '{}' → fullscreen={}", ws_name, active);
+                            if let Ok(guard) = workspace_sender_slot.lock() {
+                                if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
+                            }
+                        }
+                    }
+                    Ok(ref l) if l.starts_with("workspace>>") => {
+                        let active = hyprland_query_fullscreen(&sock1);
+                        flag.store(active, Ordering::Relaxed);
+                        let ws_name = l.trim_start_matches("workspace>>").to_owned();
+                        tracing::info!("workspace change '{}' → fullscreen={}", ws_name, active);
+                        if let Ok(guard) = workspace_sender_slot.lock() {
+                            if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
+                        }
+                    }
+                    Ok(ref l) if l.starts_with("focusedmon>>") => {
+                        let active = hyprland_query_fullscreen(&sock1);
+                        flag.store(active, Ordering::Relaxed);
+                        let rest = l.trim_start_matches("focusedmon>>");
+                        if let Some((_, ws_name)) = rest.split_once(',') {
+                            let ws_name = ws_name.to_owned();
+                            tracing::info!("focusedmon: workspace '{}' → fullscreen={}", ws_name, active);
+                            if let Ok(guard) = workspace_sender_slot.lock() {
+                                if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
+                            }
+                        }
                     }
                     Ok(_)  => {}
                     Err(e) => { tracing::debug!("hyprland ipc: {}", e); break; }
@@ -136,15 +174,20 @@ fn hyprland_fullscreen_loop(
     }
 }
 
-/// Sway native IPC — subscribe to window events, track fullscreen_mode changes.
+/// Sway native IPC — subscribe to window and workspace events.
 ///
 /// Protocol: 6-byte magic "i3-ipc" + u32 LE payload_len + u32 LE msg_type.
-/// SUBSCRIBE = type 2; window events = type 0x80000003.
-fn sway_fullscreen_loop(flag: Arc<AtomicBool>, on_exit: Option<Arc<dyn Fn() + Send + Sync>>) {
+/// SUBSCRIBE = type 2; window events = type 0x80000003; workspace events = type 0x80000000.
+fn sway_fullscreen_loop(
+    flag:                  Arc<AtomicBool>,
+    on_exit:               Option<Arc<dyn Fn() + Send + Sync>>,
+    workspace_sender_slot: WorkspaceSenderSlot,
+) {
     use std::io::{Read, Write};
     const MAGIC: &[u8] = b"i3-ipc";
     const SUBSCRIBE: u32 = 2;
-    const EV_WINDOW: u32 = 0x8000_0003;
+    const EV_WINDOW: u32    = 0x8000_0003;
+    const EV_WORKSPACE: u32 = 0x8000_0000;
 
     let sock = match std::env::var("SWAYSOCK") {
         Ok(s) => s,
@@ -156,7 +199,7 @@ fn sway_fullscreen_loop(flag: Arc<AtomicBool>, on_exit: Option<Arc<dyn Fn() + Se
         match std::os::unix::net::UnixStream::connect(&sock) {
             Ok(mut stream) => {
                 backoff_secs = 2; // reset on successful connect
-                let payload = b"[\"window\"]";
+                let payload = b"[\"window\",\"workspace\"]";
                 let mut msg = Vec::with_capacity(14 + payload.len());
                 msg.extend_from_slice(MAGIC);
                 msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -206,6 +249,27 @@ fn sway_fullscreen_loop(flag: Arc<AtomicBool>, on_exit: Option<Arc<dyn Fn() + Se
                             }
                             flag.store(active, Ordering::Relaxed);
                             tracing::debug!("sway fullscreen → {}", active);
+                        }
+                    } else if msg_type == EV_WORKSPACE {
+                        // Workspace focus event — extract workspace name for per-workspace wallpaper.
+                        // Sway workspace event JSON: {"change":"focus","current":{"name":"1",...},...}
+                        let s = std::str::from_utf8(&body).unwrap_or("");
+                        if s.contains("\"change\":\"focus\"") {
+                            // Simple extraction: find "name":"<value>" inside "current" object.
+                            if let Some(cur_pos) = s.find("\"current\"") {
+                                let after = &s[cur_pos..];
+                                if let Some(name_pos) = after.find("\"name\":\"") {
+                                    let start = name_pos + 8;
+                                    let slice  = &after[start..];
+                                    if let Some(end) = slice.find('"') {
+                                        let ws_name = slice[..end].to_owned();
+                                        tracing::debug!("sway workspace focus → '{}'", ws_name);
+                                        if let Ok(guard) = workspace_sender_slot.lock() {
+                                            if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -389,6 +453,8 @@ impl Dispatch<wl_callback::WlCallback, usize> for WaylandState {
             if let Some(ev) = state.surf_ev.get_mut(*idx) {
                 ev.frame_ready = true;
             }
+            // wayland-client 0.31 automatically destroys the wl_callback proxy
+            // when the Done event fires — no manual cleanup needed.
         }
     }
 }
@@ -465,8 +531,8 @@ impl ShmCanvas {
         h:      u32,
         in_use: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
-        let stride = w * 4;
-        let size   = (stride * h) as usize;
+        let stride = w.checked_mul(4).context("shm stride overflow")?;
+        let size   = stride.checked_mul(h).context("shm size overflow")? as usize;
 
         // memfd_create: anonymous file, no path on disk, no TOCTOU.
         let name_c = std::ffi::CString::new("wpick-shm").unwrap();
@@ -484,7 +550,8 @@ impl ShmCanvas {
             )
         };
         anyhow::ensure!(ptr != libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-
+        // wl_shm_pool takes pool size as i32; guard against >2 GB surfaces.
+        anyhow::ensure!(size <= i32::MAX as usize, "shm pool too large ({size} bytes)");
         let pool   = shm.create_pool(file.as_fd(), size as i32, qh, ());
         // in_use is passed as wl_buffer user-data — Release event clears it.
         let buffer = pool.create_buffer(
@@ -866,20 +933,33 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    mut wallpaper_rx:    watch::Receiver<Option<WallpaperInfo>>,
-    shutdown_rx:         broadcast::Receiver<()>,
-    pause_cfg:           PauseConfig,
-    monitors:            HashMap<String, MonitorConfig>,
-    cache:               Arc<tokio::sync::Mutex<Cache>>,
-    on_fullscreen_exit:  Option<Arc<dyn Fn() + Send + Sync>>,
-    mut per_monitor_rx:  watch::Receiver<HashMap<String, Option<WallpaperInfo>>>,
-    fit_rx:              watch::Receiver<(String, FitMode)>,
-    outputs_out:         Arc<std::sync::Mutex<Vec<(String, u32, u32)>>>,
-    reassert_flag:       Arc<std::sync::atomic::AtomicBool>,
+    mut wallpaper_rx:        watch::Receiver<Option<WallpaperInfo>>,
+    shutdown_rx:             broadcast::Receiver<()>,
+    pause_cfg:               PauseConfig,
+    monitors:                HashMap<String, MonitorConfig>,
+    cache:                   Arc<tokio::sync::Mutex<Cache>>,
+    on_fullscreen_exit:      Option<Arc<dyn Fn() + Send + Sync>>,
+    mut per_monitor_rx:      watch::Receiver<HashMap<String, Option<WallpaperInfo>>>,
+    fit_rx:                  watch::Receiver<(String, FitMode)>,
+    outputs_out:             Arc<std::sync::Mutex<Vec<crate::state::OutputInfo>>>,
+    reassert_flag:           Arc<std::sync::atomic::AtomicBool>,
+    mut workspace_wallpaper_rx: watch::Receiver<HashMap<String, u64>>,
+    max_fps:                 u32,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
     let mut init_failures = 0u32;
-    let fullscreen        = start_fullscreen_monitor(on_fullscreen_exit, Arc::clone(&reassert_flag));
+
+    // Shared sender slot: the fs-mon thread always sends to the current per-iteration
+    // SyncSender.  On each reinit we swap in a fresh sender and pass the matching
+    // receiver to render_loop.  The slot starts empty (None) — populated below.
+    let workspace_sender_slot: WorkspaceSenderSlot =
+        Arc::new(std::sync::Mutex::new(None));
+
+    let fullscreen = start_fullscreen_monitor(
+        on_fullscreen_exit,
+        Arc::clone(&reassert_flag),
+        Arc::clone(&workspace_sender_slot),
+    );
 
     // Start pause monitors — only for sources enabled in config.
     let battery = if pause_cfg.on_battery   { start_battery_monitor() } else { Arc::new(AtomicBool::new(false)) };
@@ -908,7 +988,11 @@ pub async fn run(
         // Publish connected output names and resolutions so IPC can serve ListOutputs.
         if let Ok(mut g) = outputs_out.lock() {
             *g = ctx.surfaces.iter()
-                .map(|s| (s.output_name.clone(), s.surf_w, s.surf_h))
+                .map(|s| crate::state::OutputInfo {
+                    name:   s.output_name.clone(),
+                    width:  s.surf_w,
+                    height: s.surf_h,
+                })
                 .collect();
         }
 
@@ -916,8 +1000,17 @@ pub async fn run(
         let (sd_tx, sd_rx)   = std::sync::mpsc::channel::<()>();
         let (pin_tx, pin_rx) = std::sync::mpsc::channel::<HashMap<String, Option<WallpaperInfo>>>();
         let (fit_fwd_tx, fit_fwd_rx) = std::sync::mpsc::channel::<(String, FitMode)>();
+        let (wwmap_tx, wwmap_rx)     = std::sync::mpsc::channel::<HashMap<String, u64>>();
         let _ = wp_tx.send(wallpaper_rx.borrow_and_update().clone());
         let _ = pin_tx.send(per_monitor_rx.borrow_and_update().clone());
+        let _ = wwmap_tx.send(workspace_wallpaper_rx.borrow_and_update().clone());
+
+        // Per-reinit workspace change channel.  We install the fresh sender into the
+        // shared slot so the fs-mon thread routes events to this iteration's receiver.
+        let (ws_change_tx, ws_change_rx) = std::sync::mpsc::sync_channel::<String>(64);
+        if let Ok(mut slot) = workspace_sender_slot.lock() {
+            *slot = Some(ws_change_tx);
+        }
 
         let mut rx2 = wallpaper_rx.clone();
         let wp_fwd = tokio::spawn(async move {
@@ -945,10 +1038,23 @@ pub async fn run(
                 if fit_fwd_tx.send(fit_rx2.borrow_and_update().clone()).is_err() { break; }
             }
         });
+        let mut wwmap_rx2 = workspace_wallpaper_rx.clone();
+        let wwmap_fwd = tokio::spawn(async move {
+            loop {
+                if wwmap_rx2.changed().await.is_err() { break; }
+                if wwmap_tx.send(wwmap_rx2.borrow_and_update().clone()).is_err() { break; }
+            }
+        });
 
         // Resolve per-monitor wallpapers from cache (async, before entering blocking task).
         // Re-resolved each reinit so a re-scan between reinits picks up new entries.
         let monitor_wallpapers = resolve_monitor_wallpapers(&monitors, &cache).await;
+
+        // Resolve workspace wallpapers from the current id-map into WallpaperInfo objects.
+        let initial_ws_map = workspace_wallpaper_rx.borrow().clone();
+        let workspace_wallpaper_map = resolve_workspace_wallpapers(&initial_ws_map, &cache).await;
+        let workspace_wallpaper_map = Arc::new(std::sync::RwLock::new(workspace_wallpaper_map));
+        let ww_map_arc = Arc::clone(&workspace_wallpaper_map);
 
         let fs = Arc::clone(&fullscreen);
         let pm = PauseMonitors {
@@ -959,14 +1065,23 @@ pub async fn run(
         };
         let monitors_cfg = monitors.clone();
         let reassert     = Arc::clone(&reassert_flag);
+        let cache_arc    = Arc::clone(&cache);
+
         let result = tokio::task::spawn_blocking(move || {
-            render_loop(ctx, wp_rx, pin_rx, sd_rx, fit_fwd_rx, fs, pm, monitors_cfg, monitor_wallpapers, reassert)
+            render_loop(ctx, wp_rx, pin_rx, sd_rx, fit_fwd_rx, fs, pm, monitors_cfg,
+                        monitor_wallpapers, reassert, ws_change_rx, ww_map_arc, wwmap_rx,
+                        cache_arc, max_fps)
         }).await.context("render loop panic")?;
+
+        // Clear the workspace sender slot so the fs-mon thread's sends fail cleanly
+        // during the reinit gap (receiver dropped, new sender not installed yet).
+        if let Ok(mut slot) = workspace_sender_slot.lock() { *slot = None; }
 
         wp_fwd.abort();
         sd_fwd.abort();
         pin_fwd.abort();
         fit_fwd.abort();
+        wwmap_fwd.abort();
 
         match result {
             Ok(()) => break,
@@ -1006,6 +1121,24 @@ async fn resolve_monitor_wallpapers(
     out
 }
 
+/// Resolve a workspace-name→wallpaper-id map into workspace-name→WallpaperInfo.
+/// Missing / invalid IDs are silently skipped.
+async fn resolve_workspace_wallpapers(
+    ws_map: &HashMap<String, u64>,
+    cache:  &Arc<tokio::sync::Mutex<Cache>>,
+) -> HashMap<String, WallpaperInfo> {
+    let mut out = HashMap::new();
+    for (ws, &id) in ws_map {
+        let guard = cache.lock().await;
+        match guard.get_by_id(id) {
+            Ok(Some(info)) => { out.insert(ws.clone(), info); }
+            Ok(None)       => tracing::warn!("workspace '{}': wallpaper_id {} not in cache", ws, id),
+            Err(e)         => tracing::warn!("workspace '{}': cache lookup failed: {}", ws, e),
+        }
+    }
+    out
+}
+
 // ─── Render loop ──────────────────────────────────────────────────────────────
 
 const NUDGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1016,17 +1149,29 @@ const LAST_FRAME_UPDATE_INTERVAL: u32 = 10;
 
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
-    mut ctx:            RendererCtx,
-    wp_rx:              std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
-    pin_rx:             std::sync::mpsc::Receiver<HashMap<String, Option<WallpaperInfo>>>,
-    sd_rx:              std::sync::mpsc::Receiver<()>,
-    fit_rx:             std::sync::mpsc::Receiver<(String, FitMode)>,
-    fullscreen:         Arc<AtomicBool>,
-    pause:              PauseMonitors,
-    monitors_cfg:       HashMap<String, MonitorConfig>,
-    monitor_wallpapers: HashMap<String, WallpaperInfo>,
-    reassert_flag:      Arc<AtomicBool>,
+    mut ctx:                RendererCtx,
+    wp_rx:                  std::sync::mpsc::Receiver<Option<WallpaperInfo>>,
+    pin_rx:                 std::sync::mpsc::Receiver<HashMap<String, Option<WallpaperInfo>>>,
+    sd_rx:                  std::sync::mpsc::Receiver<()>,
+    fit_rx:                 std::sync::mpsc::Receiver<(String, FitMode)>,
+    fullscreen:             Arc<AtomicBool>,
+    pause:                  PauseMonitors,
+    monitors_cfg:           HashMap<String, MonitorConfig>,
+    monitor_wallpapers:     HashMap<String, WallpaperInfo>,
+    reassert_flag:          Arc<AtomicBool>,
+    workspace_change_rx:    std::sync::mpsc::Receiver<String>,
+    workspace_wallpaper_map: Arc<std::sync::RwLock<HashMap<String, WallpaperInfo>>>,
+    workspace_map_update_rx: std::sync::mpsc::Receiver<HashMap<String, u64>>,
+    cache:                  Arc<tokio::sync::Mutex<Cache>>,
+    max_fps:                u32,
 ) -> anyhow::Result<()> {
+    // Minimum interval between committed frames (1 / max_fps).
+    // Caps wl_shm upload frequency, reducing compositor CPU load and cursor jitter.
+    let fps_cap_dur: Option<Duration> = if max_fps > 0 {
+        Some(Duration::from_micros(1_000_000 / max_fps.max(1) as u64))
+    } else {
+        None
+    };
     let mut current_wp: Option<WallpaperInfo> = None;
 
     // Apply per-monitor fit modes from config.
@@ -1141,6 +1286,9 @@ fn render_loop(
                     tracing::info!("crossfade: skipped (canvas_ready={} last_frame_empty={})",
                         surf.canvas_ready, surf.last_frame.is_empty());
                     surf.fade_frames_left = 0;
+                    // Free any in-progress fade buffer from a previous wallpaper change
+                    // that hasn't finished yet; prevents 8–32 MB leak on rapid changes.
+                    surf.fade_old = Vec::new();
                 }
                 surf.decoder      = None;
                 surf.canvas_ready = false;
@@ -1166,12 +1314,49 @@ fn render_loop(
             }
         }
 
+        // ── workspace wallpaper map updates (IPC SetWorkspaceWallpaper) ──────────
+        // Re-resolve IDs to WallpaperInfo when the map changes via IPC.
+        while let Ok(new_id_map) = workspace_map_update_rx.try_recv() {
+            // Resolve synchronously using blocking_lock — we are in a blocking thread.
+            let mut resolved: HashMap<String, WallpaperInfo> = HashMap::new();
+            for (ws, id) in &new_id_map {
+                match cache.blocking_lock().get_by_id(*id) {
+                    Ok(Some(info)) => { resolved.insert(ws.clone(), info); }
+                    Ok(None)       => tracing::warn!("workspace '{}': id {} not in cache", ws, id),
+                    Err(e)         => tracing::warn!("workspace '{}': lookup failed: {}", ws, e),
+                }
+            }
+            if let Ok(mut map) = workspace_wallpaper_map.write() {
+                *map = resolved;
+            }
+        }
+
+        // ── workspace change → apply per-workspace wallpaper ──────────────────
+        while let Ok(workspace_name) = workspace_change_rx.try_recv() {
+            let map = workspace_wallpaper_map.read()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(info) = map.get(&workspace_name) {
+                tracing::info!("workspace '{}' → wallpaper '{}'", workspace_name, info.title);
+                let info = info.clone();
+                drop(map); // release the read lock before mutating surfaces
+                for surf in &mut ctx.surfaces {
+                    // Don't override per-monitor pins.
+                    if surf.pinned_wp.is_none() {
+                        surf.decoder      = open_decoder(&info, surf.surf_w, surf.surf_h, surf.fit, surf.hw_ok);
+                        surf.next_frame   = Instant::now();
+                        surf.canvas_ready = false;
+                    }
+                }
+                current_wp = Some(info);
+            }
+        }
+
         // ── per-surface processing ────────────────────────────────────────────
         let is_fs    = fullscreen.load(Ordering::Relaxed);
         let is_paused = pause.is_paused();
         let mut any_work = false;
         for i in 0..ctx.surfaces.len() {
-            if process_surface(&mut ctx, i, is_fs, is_paused, &current_wp) {
+            if process_surface(&mut ctx, i, is_fs, is_paused, &current_wp, fps_cap_dur) {
                 any_work = true;
             }
         }
@@ -1197,9 +1382,10 @@ fn render_loop(
                 let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
                 if ret > 0 { let _ = guard.read(); } else { drop(guard); }
             } else {
-                // Events already buffered in the display queue; yield so the OS can
-                // schedule the compositor before we loop back to dispatch them.
-                std::thread::yield_now();
+                // Events already buffered in the display queue.  yield_now() is a
+                // spin on spawn_blocking threads; sleep 1ms instead to give the
+                // compositor CPU time without burning a full core.
+                std::thread::sleep(Duration::from_millis(1));
             }
         }
     }
@@ -1217,11 +1403,12 @@ fn render_loop(
 /// Process one output surface for the current loop iteration.
 /// Returns `true` if a video frame was decoded and committed (work was done).
 fn process_surface(
-    ctx:        &mut RendererCtx,
-    i:          usize,
-    is_fs:      bool,
-    is_paused:  bool,
-    current_wp: &Option<WallpaperInfo>,
+    ctx:         &mut RendererCtx,
+    i:           usize,
+    is_fs:       bool,
+    is_paused:   bool,
+    current_wp:  &Option<WallpaperInfo>,
+    fps_cap_dur: Option<Duration>,
 ) -> bool {
     let ev_idx = ctx.surfaces[i].ev_idx;
 
@@ -1300,6 +1487,10 @@ fn process_surface(
                     ctx.surfaces[i].surf_w        = new_w;
                     ctx.surfaces[i].surf_h        = new_h;
                     ctx.surfaces[i].canvas_ready  = false;
+                    // Discard stale last_frame: old resolution would corrupt crossfade
+                    // alpha blending if a wallpaper change arrives right after resize.
+                    ctx.surfaces[i].last_frame.clear();
+                    ctx.surfaces[i].last_frame.shrink_to_fit();
                     let active_wp = ctx.surfaces[i].pinned_wp.clone().or_else(|| current_wp.clone());
                     if let Some(ref info) = active_wp {
                         ctx.surfaces[i].decoder = open_decoder(info, new_w, new_h, ctx.surfaces[i].fit, ctx.surfaces[i].hw_ok);
@@ -1330,7 +1521,9 @@ fn process_surface(
     // Fallback: if no frame callback arrives within 300 ms (e.g. compositor
     // stopped sending them while surface was hidden by a fullscreen window),
     // force frame_ready so rendering resumes when the surface becomes visible.
-    if !ctx.wls.surf_ev[ev_idx].frame_ready {
+    // Guard with !is_paused: when paused the surface is intentionally idle;
+    // without this guard the 300ms timer fires 3x/second creating useless commits.
+    if !ctx.wls.surf_ev[ev_idx].frame_ready && !is_paused {
         let timed_out = ctx.surfaces[i].last_commit_at
             .map(|t| t.elapsed() > Duration::from_millis(300))
             .unwrap_or(false);
@@ -1340,6 +1533,20 @@ fn process_surface(
     }
     if !ctx.wls.surf_ev[ev_idx].frame_ready || now < ctx.surfaces[i].next_frame {
         return false;
+    }
+
+    // Adaptive frame skip: if we are more than 2 frame-intervals behind wall clock
+    // (e.g. system woke from suspend, decoder stalled, or compositor was very slow),
+    // skip to now instead of trying to catch up frame-by-frame.  This prevents the
+    // "decode storm" where the render loop decodes back-to-back until caught up,
+    // starving the compositor and producing visible jitter.
+    if ctx.surfaces[i].decoder.is_some() {
+        let dur = ctx.surfaces[i].decoder.as_ref().unwrap().frame_duration();
+        let two_intervals = dur * 2;
+        if ctx.surfaces[i].next_frame + two_intervals < now {
+            ctx.surfaces[i].next_frame = now;
+            return false; // skip this decode cycle, pick up on the next callback
+        }
     }
 
     // ── pause (fullscreen / battery / lid) ───────────────────────────────────
@@ -1385,7 +1592,7 @@ fn process_surface(
                 let fade_total = ctx.surfaces[i].fade_frames_total;
                 ctx.surfaces[i].fade_frames_left -= 1;
                 // Integer blend: alpha = fade_left/fade_total in 0..=255 range.
-                let alpha = ((fade_left as u32 * 255) / fade_total as u32) as u16; // old weight
+                let alpha = ((fade_left * 255) / fade_total.max(1)) as u16; // old weight
                 let ialpha = 255u16 - alpha;                                         // new weight
                 let old = &ctx.surfaces[i].fade_old;
                 let blend_len = frame_size.min(old.len());
@@ -1420,23 +1627,33 @@ fn process_surface(
             }
             commit_slot(ctx, i, slot_i);
             let _ = ctx.evq.flush();
-            ctx.surfaces[i].next_frame += dur;
-            // Clamp drift: if scheduling jitter pushed next_frame into the past,
-            // re-anchor to wall clock. Without this the render loop decodes back-
-            // to-back forever (no poll sleep), starving the compositor and causing
-            // cursor jitter that worsens over hours of runtime.
+            // Advance by the larger of video frame duration and FPS cap interval.
+            // fps_cap_dur reduces wl_shm upload frequency → less compositor CPU
+            // load → lower cursor jitter on high-resolution displays.
+            let effective_dur = match fps_cap_dur {
+                Some(cap) => dur.max(cap),
+                None      => dur,
+            };
+            ctx.surfaces[i].next_frame += effective_dur;
+            // Drift clamp: if scheduling jitter pushed next_frame into the past,
+            // re-anchor to wall + effective_dur (NOT just wall) so the next frame
+            // is always at least one interval away.  Without the +effective_dur
+            // the render loop immediately passes the next_frame check on the very
+            // next iteration (now ≈ wall), causing paired back-to-back commits
+            // that spike compositor load and produce short cursor-jitter bursts.
             let wall = Instant::now();
             if ctx.surfaces[i].next_frame < wall {
-                ctx.surfaces[i].next_frame = wall;
+                ctx.surfaces[i].next_frame = wall + effective_dur;
             }
             true
         }
         Ok(false) => {
             ctx.wls.surf_ev[ev_idx].frame_ready = true;
-            let dec = ctx.surfaces[i].decoder.as_mut().unwrap();
-            if let Err(e) = dec.seek_to_start() {
-                tracing::warn!("seek surface[{}]: {}", i, e);
-                ctx.surfaces[i].decoder = None;
+            if let Some(dec) = ctx.surfaces[i].decoder.as_mut() {
+                if let Err(e) = dec.seek_to_start() {
+                    tracing::warn!("seek surface[{}]: {}", i, e);
+                    ctx.surfaces[i].decoder = None;
+                }
             }
             false
         }

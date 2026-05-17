@@ -109,7 +109,7 @@ impl VideoDecoder {
             Pixel::BGRA,
             blit_w,
             blit_h,
-            Flags::LANCZOS,
+            Flags::BILINEAR,
         )
         .context("Failed to create scaler context")?;
 
@@ -178,22 +178,28 @@ impl VideoDecoder {
             return Ok(true); // skip but don't error
         }
 
-        let full = (self.target_w * self.target_h * 4) as usize;
+        let full = self.target_w as usize * self.target_h as usize * 4;
         if dst.len() < full {
             tracing::warn!("dst too small: {} < {}", dst.len(), full);
             return Ok(true);
         }
 
-        // Clear to black, then blit scaled frame at offset.
-        dst[..full].fill(0);
+        // Clear to black only when there is letterbox/pillarbox padding (Fit/Center modes).
+        // For Fill/Stretch the decoder writes every pixel, so the fill is wasted bandwidth.
+        let has_padding = self.offset_x > 0 || self.offset_y > 0;
+        if has_padding {
+            dst[..full].fill(0);
+        }
         let dst_stride = self.target_w as usize * 4;
         for row in 0..height {
             let src_start = row * stride;
             let src_end   = src_start + row_bytes;
             if src_end > src.len() { break; }
-            let dst_row   = self.offset_y as usize + row;
+            let dst_row = self.offset_y as usize + row;
+            if dst_row >= self.target_h as usize { break; }
             let dst_col   = self.offset_x as usize;
             let dst_start = dst_row * dst_stride + dst_col * 4;
+            if dst_start + row_bytes > dst.len() { break; }
             dst[dst_start..dst_start + row_bytes]
                 .copy_from_slice(&src[src_start..src_end]);
         }

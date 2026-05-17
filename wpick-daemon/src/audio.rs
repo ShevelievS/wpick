@@ -50,12 +50,21 @@ impl Iterator for StreamingSource {
                 // so we only block during a genuine underrun.
                 // E-28: on Disconnected we still return Some(0.0) — never None.
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    match self.rx.recv() {
-                        Ok(chunk) => { self.buf = chunk; self.pos = 0; }
-                        Err(_)    => return Some(0.0),
+                    // Use recv_timeout instead of blocking recv so the rodio mixer thread
+                    // is never stalled longer than one audio device buffer period (~20 ms).
+                    match self.rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        Ok(chunk)                                            => { self.buf = chunk; self.pos = 0; }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)     => return Some(0.0), // brief underrun → silence
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            tracing::warn!("audio decoder thread disconnected — dropping sink");
+                            return None;
+                        }
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Some(0.0),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tracing::warn!("audio decoder channel disconnected — dropping sink");
+                    return None;
+                }
             }
         }
     }
@@ -269,27 +278,20 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    /// StreamingSource returns silence (Some(0.0)) when the channel is empty — never None.
-    /// Returning None would cause rodio to drop the sink (E-28).
+    /// StreamingSource returns None (end-of-stream) when the sender is disconnected.
+    /// None causes rodio to drop the sink, which is correct — a dead decoder should
+    /// not keep a silent sink alive forever.
     #[test]
-    fn test_streaming_source_silence_on_empty_channel() {
-        let (_tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
-        let mut src = StreamingSource { rx, buf: Vec::new(), pos: 0, sample_rate: 48_000, channels: 2 };
-        assert_eq!(src.next(), Some(0.0), "must return silence, not None");
-    }
-
-    /// StreamingSource returns silence when the sender is disconnected.
-    #[test]
-    fn test_streaming_source_silence_on_disconnect() {
+    fn test_streaming_source_ends_on_disconnect() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
         drop(tx);
         let mut src = StreamingSource { rx, buf: Vec::new(), pos: 0, sample_rate: 48_000, channels: 2 };
-        assert_eq!(src.next(), Some(0.0), "disconnected sender must yield silence");
+        assert_eq!(src.next(), None, "disconnected sender must yield None to end the sink");
     }
 
-    /// StreamingSource drains a pre-loaded chunk then returns silence on underrun.
+    /// StreamingSource drains a pre-loaded chunk then returns None on decoder death.
     #[test]
-    fn test_streaming_source_drains_chunk_then_silence() {
+    fn test_streaming_source_drains_chunk_then_ends() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
         tx.send(vec![1.0_f32, 2.0, 3.0]).unwrap();
         drop(tx); // disconnect after first chunk
@@ -297,7 +299,7 @@ mod tests {
         assert_eq!(src.next(), Some(1.0));
         assert_eq!(src.next(), Some(2.0));
         assert_eq!(src.next(), Some(3.0));
-        assert_eq!(src.next(), Some(0.0), "after chunk exhausted: silence");
+        assert_eq!(src.next(), None, "after chunk exhausted and sender dropped: end-of-stream");
     }
 
     /// StreamingSource transitions across chunk boundaries correctly.
