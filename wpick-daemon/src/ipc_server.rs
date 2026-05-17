@@ -427,10 +427,10 @@ async fn scan_and_populate(
             "Scanning wallpapers"
         );
 
-        let mut results   = Vec::new();
+        // Parse workshop items — collect (info, mtime) pairs, emit progress per item.
+        let mut batch: Vec<(WallpaperInfo, u64)> = Vec::with_capacity(total);
         let mut done: usize = 0;
 
-        // Workshop items
         for wd in wallpaper_dirs {
             match wpick_core::pkg::extract_and_parse(&wd, &dirs.wallpapers_dir) {
                 Ok(Some(info)) => {
@@ -438,13 +438,7 @@ async fn scan_and_populate(
                         .and_then(|m| m.modified())
                         .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
                         .unwrap_or(0);
-                    {
-                        let guard = cache.blocking_lock();
-                        if let Err(e) = guard.upsert(&info, mtime) {
-                            tracing::warn!("Cache upsert failed for {}: {}", wd.id, e);
-                        }
-                    }
-                    results.push(info);
+                    batch.push((info, mtime));
                 }
                 Ok(None) => tracing::debug!("Skipping non-video wallpaper {}", wd.id),
                 Err(e)   => tracing::warn!("Failed to process wallpaper {}: {}", wd.id, e),
@@ -453,26 +447,23 @@ async fn scan_and_populate(
             let _ = progress.blocking_send(DaemonResponse::ScanProgress { done, total });
         }
 
-        // Local files — file mtime used as cache key (same role as pkg_mtime_secs)
+        // Parse local files — same pattern.
         for info in local_infos {
             let mtime = std::fs::metadata(&info.file_path)
                 .and_then(|m| m.modified())
                 .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
                 .unwrap_or(0);
-            {
-                let guard = cache.blocking_lock();
-                if let Err(e) = guard.upsert(&info, mtime) {
-                    tracing::warn!("Cache upsert failed for local '{}': {}", info.file_path, e);
-                }
-            }
-            results.push(info);
+            batch.push((info, mtime));
             done += 1;
             let _ = progress.blocking_send(DaemonResponse::ScanProgress { done, total });
         }
 
-        // Prune entries that no longer exist on disk, then return full list.
-        let guard      = cache.blocking_lock();
-        let active_ids: Vec<u64> = results.iter().map(|w| w.id).collect();
+        // Single lock acquisition: batch upsert + prune + get_all in one transaction.
+        let guard = cache.blocking_lock();
+        if let Err(e) = guard.upsert_batch(&batch) {
+            tracing::warn!("Batch upsert failed: {}", e);
+        }
+        let active_ids: Vec<u64> = batch.iter().map(|(w, _)| w.id).collect();
         if let Err(e) = guard.prune(&active_ids) {
             tracing::warn!("Cache prune failed: {}", e);
         }

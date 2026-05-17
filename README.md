@@ -1,7 +1,7 @@
 # wpick
 
-> Native Wayland live wallpaper daemon for Wallpaper Engine (Steam) content.  
-> No Wine, no `linux-wallpaperengine`, no DRM hacks — pure Rust.
+> Native Wayland video wallpaper daemon — plays any video file.  
+> Steam Workshop library auto-detected when available. No Wine, no DRM hacks — pure Rust.
 
 > **Disclaimer:** wpick is an independent open-source project and is not affiliated with,
 > endorsed by, or sponsored by Valve Corporation or the Wallpaper Engine developers.
@@ -10,10 +10,10 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.4.2-blue)](CHANGELOG.md)
 
-wpick plays Wallpaper Engine video wallpapers directly on `wlr-layer-shell`
-background surfaces, with streaming audio, PulseAudio ducking,
-VA-API hardware decode, and a ratatui TUI with image preview for browsing
-your Steam Workshop library.
+wpick plays video files directly on `wlr-layer-shell` background surfaces,
+with streaming audio, PulseAudio ducking, VA-API hardware decode,
+and a ratatui TUI with image preview for browsing your library.
+Steam Workshop is auto-detected — no configuration needed if you have it.
 
 ---
 

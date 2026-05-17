@@ -187,20 +187,73 @@ impl Cache {
 
     /// Remove all wallpapers whose IDs are NOT in `active_ids`.
     /// If `active_ids` is empty, does nothing (safety guard against deleting everything).
+    ///
+    /// Uses DELETE WHERE id IN (to_delete) chunked at 999 to stay within
+    /// SQLite's SQLITE_MAX_VARIABLE_NUMBER limit (safe even on large libraries).
     pub fn prune(&self, active_ids: &[u64]) -> Result<()> {
         if active_ids.is_empty() {
             return Ok(());
         }
 
-        let placeholders = active_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("DELETE FROM wallpapers WHERE id NOT IN ({placeholders})");
-
-        let params: Vec<rusqlite::types::Value> = active_ids
-            .iter()
-            .map(|&id| rusqlite::types::Value::Integer(id as i64))
+        let mut stmt = self.conn.prepare("SELECT id FROM wallpapers")?;
+        let db_ids: Vec<u64> = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|id| id as u64)
             .collect();
 
-        self.conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        let active_set: std::collections::HashSet<u64> = active_ids.iter().copied().collect();
+        let to_delete: Vec<u64> = db_ids.into_iter()
+            .filter(|id| !active_set.contains(id))
+            .collect();
+
+        if to_delete.is_empty() {
+            return Ok(());
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for chunk in to_delete.chunks(999) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("DELETE FROM wallpapers WHERE id IN ({placeholders})");
+            let params: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|&id| rusqlite::types::Value::Integer(id as i64))
+                .collect();
+            self.conn.execute(&sql, rusqlite::params_from_iter(params))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Insert or replace a batch of wallpaper records in a single transaction.
+    /// Dramatically faster than individual `upsert` calls on large scans.
+    pub fn upsert_batch(&self, items: &[(WallpaperInfo, u64)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (info, mtime) in items {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO wallpapers \
+                 (id, title, wallpaper_type, file_path, preview_path, \
+                  has_audio, file_size_bytes, pkg_mtime_secs, width, height, source) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    info.id as i64,
+                    info.title,
+                    info.wallpaper_type.to_string(),
+                    info.file_path,
+                    info.preview_path,
+                    info.has_audio,
+                    info.file_size_bytes as i64,
+                    *mtime as i64,
+                    info.width as i64,
+                    info.height as i64,
+                    source_to_str(&info.source),
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -403,6 +456,46 @@ mod tests {
 
         cache.remove(9999)?;
         assert_eq!(cache.count()?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_prune_over_999_ids() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache = Cache::open(&tmp.path().join("test.db"))?;
+
+        // Insert 1001 records.
+        for i in 0u64..1001 {
+            cache.upsert(&make_info(i, &format!("Wall {i}")), i)?;
+        }
+        assert_eq!(cache.count()?, 1001);
+
+        // Keep only 0..999 active — record 999 and 1000 should be deleted.
+        let active: Vec<u64> = (0u64..999).collect();
+        cache.prune(&active)?;
+
+        assert_eq!(cache.count()?, 999);
+        assert!(cache.get_by_id(999)?.is_none(), "id 999 must be pruned");
+        assert!(cache.get_by_id(1000)?.is_none(), "id 1000 must be pruned");
+        assert!(cache.get_by_id(0)?.is_some(), "id 0 must survive");
+        Ok(())
+    }
+
+    #[test]
+    fn test_upsert_batch() -> crate::error::Result<()> {
+        let tmp = TempDir::new()?;
+        let cache = Cache::open(&tmp.path().join("test.db"))?;
+
+        let items: Vec<(WallpaperInfo, u64)> = (0u64..50)
+            .map(|i| (make_info(i, &format!("Batch {i}")), i))
+            .collect();
+
+        cache.upsert_batch(&items)?;
+        assert_eq!(cache.count()?, 50);
+
+        // Idempotent: re-inserting same items should not duplicate.
+        cache.upsert_batch(&items)?;
+        assert_eq!(cache.count()?, 50);
         Ok(())
     }
 
