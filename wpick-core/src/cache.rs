@@ -21,7 +21,9 @@ const SCHEMA_SQL: &str = "
         pkg_mtime_secs   INTEGER NOT NULL,
         width            INTEGER NOT NULL DEFAULT 0,
         height           INTEGER NOT NULL DEFAULT 0,
-        source           TEXT NOT NULL DEFAULT 'workshop'
+        source           TEXT NOT NULL DEFAULT 'workshop',
+        play_count       INTEGER NOT NULL DEFAULT 0,
+        last_played_secs INTEGER NOT NULL DEFAULT 0
     ) STRICT;
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
@@ -71,6 +73,14 @@ impl Cache {
         ).ok();
         conn.execute(
             "ALTER TABLE wallpapers ADD COLUMN source TEXT NOT NULL DEFAULT 'workshop'",
+            [],
+        ).ok();
+        conn.execute(
+            "ALTER TABLE wallpapers ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        ).ok();
+        conn.execute(
+            "ALTER TABLE wallpapers ADD COLUMN last_played_secs INTEGER NOT NULL DEFAULT 0",
             [],
         ).ok();
         Ok(Self { conn })
@@ -123,6 +133,37 @@ impl Cache {
             ],
         )?;
         Ok(())
+    }
+
+    /// Record a play event: increment play_count and update last_played_secs.
+    pub fn record_play(&self, id: u64) -> Result<()> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            "UPDATE wallpapers \
+             SET play_count = play_count + 1, last_played_secs = ?1 \
+             WHERE id = ?2",
+            params![now, id as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Return up to `limit` wallpapers ordered by play_count DESC, last_played DESC.
+    /// Only includes wallpapers that have been played at least once.
+    pub fn get_frequent(&self, limit: usize) -> Result<Vec<WallpaperInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, wallpaper_type, file_path, preview_path, \
+             has_audio, file_size_bytes, width, height, source \
+             FROM wallpapers \
+             WHERE play_count > 0 \
+             ORDER BY play_count DESC, last_played_secs DESC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_info)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     /// Get the stored PKG mtime for a wallpaper, or None if not found.

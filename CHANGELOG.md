@@ -6,6 +6,94 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.2] — 2026-05-17
+
+### Added
+
+- **Global hotkey** — `[hotkey]` config block lets you bind a key combination
+  (e.g. `super+w`) to open the wpick TUI in a floating popup terminal.
+  Supported modifiers: `super`, `ctrl`, `shift`, `alt`. Terminal auto-detected
+  (foot → kitty → alacritty → wezterm → xterm). Hyprland: popup spawned with
+  `[float;center;size W H]` rules; refocuses if already open.
+  Requires the daemon user to be in the `input` group.
+  (`wpick-core`, `wpick-daemon`)
+
+- **Wallpaper timer** — `SetTimer { ids, interval_secs, shuffle }` IPC command
+  rotates a playlist of wallpapers on a fixed interval. `StopTimer` halts it;
+  `GetTimerState` queries remaining seconds and active IDs. TUI exposes a timer
+  dialog (`T` key). (`wpick-core`, `wpick-daemon`, `wpick-tui`)
+
+- **Favorites** — wallpapers can be starred (`*` key in TUI) and appear in a
+  dedicated Favorites section in the left navigation panel. Saved to config.
+  (`wpick-core`, `wpick-tui`)
+
+- **Most Played (Frequent)** — daemon tracks `play_count` and `last_played_secs`
+  per wallpaper in SQLite; TUI shows a Frequent section (top 10 by plays).
+  (`wpick-core`, `wpick-daemon`, `wpick-tui`)
+
+- **Packs** — named collections of wallpapers. Create with `p` in TUI, assign
+  wallpapers from list. Packs appear as nav sections and can be used as timer
+  playlists. (`wpick-core`, `wpick-tui`)
+
+- **Spotify-style navigation panel** — left panel shows Favorites / Frequent /
+  Packs / Source sections. Toggle with `[` key; navigate with `←→`. Right
+  preview panel toggled with `]`. (`wpick-tui`)
+
+- **Sort dialog** — `o` key opens sort options: Default / Name / Size /
+  Resolution. (`wpick-tui`)
+
+- **Settings dialog** — `S` key opens a two-level settings panel: Theme,
+  Colors, Layout, Volume style, Now-playing position. (`wpick-tui`)
+
+- **Help overlay** — `?` key shows full key binding reference. (`wpick-tui`)
+
+- **Theme presets** — `dark` (default), `nord`, `dracula`, `tokyo`, `forrest`,
+  `deep`. Set via `[tui] theme = "nord"` or Settings dialog. (`wpick-core`,
+  `wpick-tui`)
+
+- **Windowed TUI mode** — `[tui] windowed = true` renders the TUI in an
+  82 × 82 % centered sub-area instead of fullscreen. (`wpick-tui`)
+
+- **Screen-lock reassert** — Hyprland `lockguard>>0` event (screen unlock)
+  schedules a surface reassert after 1 s so wpick re-appears on top of
+  QuickShell's background layer, which re-renders on unlock. (`wpick-daemon`)
+
+- **`[tui] surface_reassert_secs`** — configurable delay (default 12 s) before
+  the renderer reinitialises its Wayland surfaces on startup. Set to `0` to
+  disable. Previously the delay was always 8 s and not configurable.
+  (`wpick-core`, `wpick-daemon`)
+
+- **`RecordPlay` IPC command** — TUI sends `RecordPlay { id }` after each
+  wallpaper application so the daemon can update play statistics without
+  relying on the renderer's internal state. (`wpick-core`, `wpick-daemon`,
+  `wpick-tui`)
+
+### Fixed
+
+- **Shuffle fairness** — timer shuffle replaced `DefaultHasher` seeded by
+  `SystemTime` (non-uniform, deterministic within a second) with `fastrand::shuffle`
+  (uniform Fisher-Yates). (`wpick-daemon`)
+
+- **IPC idle leak** — `recv_command` now has a 30-second timeout; stalled
+  client connections are closed automatically instead of leaking tokio tasks.
+  (`wpick-daemon`)
+
+- **Kill command auth** — `Kill` IPC command now checks `SO_PEERCRED`; only
+  the process owner (same UID as the daemon) can issue it. Fails closed:
+  if credential retrieval fails the command is denied. (`wpick-daemon`)
+
+- **Symlink traversal in extra_dirs** — `WalkDir` changed from
+  `follow_links(true)` to `follow_links(false)` when scanning user-defined
+  video directories. Prevents reads outside declared paths via crafted symlinks.
+  (`wpick-core`)
+
+### Changed
+
+- **`license = "MIT"`** added to all three crate `Cargo.toml` files. SPDX
+  field was previously absent. (`wpick-core`, `wpick-daemon`, `wpick-tui`)
+
+---
+
 ## [0.4.1] — 2026-05-15
 
 ### Added

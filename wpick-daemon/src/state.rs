@@ -16,6 +16,11 @@ pub struct DaemonState {
     /// (monitor_name_or_"*", fit) — "*" means all monitors.
     pub fit_tx:          watch::Sender<(String, FitMode)>,
     pub outputs:         Arc<Mutex<Vec<(String, u32, u32)>>>,
+    // v0.5 — wallpaper timer
+    pub timer_task:      Option<tokio::task::JoinHandle<()>>,
+    pub timer_interval:  u64,        // seconds; 0 when inactive
+    pub timer_started:   std::time::Instant,
+    pub timer_ids:       Vec<u64>,   // wallpaper IDs in current rotation
 }
 
 impl DaemonState {
@@ -34,6 +39,15 @@ impl DaemonState {
         let mut pins = self.per_monitor_tx.borrow().clone();
         pins.insert(monitor, Some(info));
         let _ = self.per_monitor_tx.send(pins);
+    }
+
+    /// Stop the running timer task (if any).
+    pub fn stop_timer(&mut self) {
+        if let Some(t) = self.timer_task.take() {
+            t.abort();
+        }
+        self.timer_interval = 0;
+        self.timer_ids.clear();
     }
 
     pub fn set_volume(&mut self, level: f32) {

@@ -45,20 +45,58 @@ async fn handle_connection(
     cache:  Arc<Mutex<Cache>>,
     dirs:   AppDirs,
 ) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
     use tokio::io::BufWriter;
+
+    // Capture peer credentials before split — used to authenticate Kill.
+    let peer_uid: Option<u32> = unsafe {
+        let mut cred: libc::ucred = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        if ret == 0 { Some(cred.uid) } else { None }
+    };
+    let my_uid: u32 = unsafe { libc::getuid() };
+
     let (r, w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut writer = BufWriter::new(w);
 
     loop {
-        let cmd = match recv_command(&mut reader).await {
-            Ok(cmd)  => cmd,
-            Err(e)   => {
+        // 30-second idle timeout — prevents stalled clients from leaking tasks.
+        let cmd = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            recv_command(&mut reader),
+        ).await {
+            Ok(Ok(cmd))  => cmd,
+            Ok(Err(e))   => {
                 tracing::debug!("IPC recv error (connection closed): {}", e);
+                break;
+            }
+            Err(_elapsed) => {
+                tracing::debug!("IPC recv timeout — closing idle connection");
                 break;
             }
         };
         tracing::debug!("Command: {:?}", cmd);
+
+        // Only the daemon owner may issue Kill.
+        // If SO_PEERCRED failed (peer_uid == None), we deny — fail-closed.
+        if let ClientCommand::Kill = &cmd {
+            let allowed = peer_uid.map_or(false, |uid| uid == my_uid);
+            if !allowed {
+                tracing::warn!("Kill rejected: peer uid={:?} != daemon uid={}", peer_uid, my_uid);
+                let _ = send_response(&mut writer, &DaemonResponse::Error {
+                    message: "Permission denied: Kill requires daemon owner UID".into(),
+                }).await;
+                break;
+            }
+        }
 
         // Scan is handled separately — it streams ScanProgress messages before
         // the final WallpaperList, so it cannot go through the single-response dispatcher.
@@ -178,16 +216,102 @@ async fn dispatch(
             DaemonResponse::Ok
         }
 
+        ClientCommand::SetTimer { ids, interval_secs, shuffle } => {
+            if ids.is_empty() || interval_secs == 0 {
+                return DaemonResponse::Error {
+                    message: "SetTimer: ids must be non-empty and interval_secs > 0".into(),
+                };
+            }
+            // Resolve wallpaper infos for the given IDs.
+            let wallpapers: Vec<WallpaperInfo> = {
+                let guard = cache.lock().await;
+                ids.iter().filter_map(|&id| guard.get_by_id(id).ok().flatten()).collect()
+            };
+            if wallpapers.is_empty() {
+                return DaemonResponse::Error { message: "SetTimer: no valid IDs found in cache".into() };
+            }
+
+            let wallpaper_tx = state.lock().await.wallpaper_tx.clone();
+            let state_ref    = Arc::clone(state);
+            let interval     = std::time::Duration::from_secs(interval_secs);
+
+            // Start from the wallpaper after the currently playing one (if it's in the list).
+            let current_id = state.lock().await.current.as_ref().map(|w| w.id);
+            let start_idx = current_id
+                .and_then(|cid| wallpapers.iter().position(|w| w.id == cid))
+                .map(|p| (p + 1) % wallpapers.len())
+                .unwrap_or(0);
+
+            let task = tokio::spawn(async move {
+                let mut seq: Vec<WallpaperInfo> = wallpapers;
+                let mut idx = start_idx;
+                loop {
+                    // Sleep first — current wallpaper keeps playing for a full interval.
+                    tokio::time::sleep(interval).await;
+
+                    if shuffle {
+                        fastrand::shuffle(&mut seq);
+                        idx = 0;
+                    }
+                    let wp = seq[idx % seq.len()].clone();
+                    tracing::info!("timer: applying '{}'", wp.title);
+                    // Update state.current so TUI Status queries reflect the change.
+                    state_ref.lock().await.current = Some(wp.clone());
+                    let _ = wallpaper_tx.send(Some(wp));
+                    idx += 1;
+                }
+            });
+
+            let stored_ids = ids.clone();
+            {
+                let mut s = state.lock().await;
+                s.stop_timer();
+                s.timer_task     = Some(task);
+                s.timer_interval = interval_secs;
+                s.timer_started  = std::time::Instant::now();
+                s.timer_ids      = stored_ids;
+            }
+            DaemonResponse::TimerState {
+                active:        true,
+                interval_secs,
+                remaining_secs: interval_secs,
+                ids,
+            }
+        }
+
+        ClientCommand::StopTimer => {
+            state.lock().await.stop_timer();
+            DaemonResponse::TimerState { active: false, interval_secs: 0, remaining_secs: 0, ids: vec![] }
+        }
+
+        ClientCommand::GetTimerState => {
+            let s = state.lock().await;
+            let active = s.timer_task.is_some();
+            let remaining = if active && s.timer_interval > 0 {
+                let elapsed = s.timer_started.elapsed().as_secs() % s.timer_interval;
+                s.timer_interval.saturating_sub(elapsed)
+            } else { 0 };
+            DaemonResponse::TimerState {
+                active,
+                interval_secs:  s.timer_interval,
+                remaining_secs: remaining,
+                ids:            s.timer_ids.clone(),
+            }
+        }
+
+        ClientCommand::RecordPlay { id } => {
+            let guard = cache.lock().await;
+            if let Err(e) = guard.record_play(id) {
+                tracing::warn!("record_play({}): {}", id, e);
+            }
+            DaemonResponse::Ok
+        }
+
         ClientCommand::Kill => {
             tracing::info!("Kill received — initiating graceful shutdown");
-            // Grab the shutdown sender from state before releasing the lock.
             let sd = state.lock().await.shutdown_tx.clone();
-            // Delay long enough for the TUI to receive and process the Ok
-            // response before the daemon begins tearing down Wayland objects.
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                // Broadcast shutdown — renderer exits cleanly, drops layer_surface
-                // and wl_surface, then main() runs cleanup() which removes the socket.
                 let _ = sd.send(());
             });
             DaemonResponse::Ok

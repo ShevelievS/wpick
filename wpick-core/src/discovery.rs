@@ -212,7 +212,7 @@ pub fn find_local_video_files(extra_dirs: &[String]) -> Vec<WallpaperInfo> {
             .unwrap_or(dir_str)
             .to_owned();
 
-        for entry in WalkDir::new(dir).max_depth(6).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(dir).max_depth(6).follow_links(false).into_iter().filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() { continue; }
 
             let path = entry.path();

@@ -39,6 +39,20 @@ pub enum ClientCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         monitor: Option<String>,
     },
+    /// Start the wallpaper timer: cycle through `ids` every `interval_secs` seconds.
+    /// `shuffle = true` randomises the order each cycle.
+    /// Replaces any running timer.
+    SetTimer {
+        ids:          Vec<u64>,
+        interval_secs: u64,
+        shuffle:      bool,
+    },
+    /// Stop the running timer (no-op if no timer is running).
+    StopTimer,
+    /// Query the current timer state without changing it.
+    GetTimerState,
+    /// Record that wallpaper `id` was played (for Frequent tracking).
+    RecordPlay { id: u64 },
     Kill,
 }
 
@@ -68,6 +82,16 @@ pub enum DaemonResponse {
         names: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         resolutions: Vec<(u32, u32)>,
+    },
+    /// Current timer state, returned by `SetTimer`, `StopTimer`, and `GetTimerState`.
+    TimerState {
+        active:         bool,
+        interval_secs:  u64,
+        /// Seconds until the next wallpaper change (0 when inactive).
+        remaining_secs: u64,
+        /// Wallpaper IDs in current rotation (empty when inactive).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ids: Vec<u64>,
     },
 }
 

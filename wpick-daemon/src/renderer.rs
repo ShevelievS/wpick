@@ -34,14 +34,18 @@ use crate::video::VideoDecoder;
 
 // ─── Fullscreen monitors (Hyprland + Sway) ───────────────────────────────────
 
-fn start_fullscreen_monitor(on_exit: Option<Arc<dyn Fn() + Send + Sync>>) -> Arc<AtomicBool> {
+fn start_fullscreen_monitor(
+    on_exit:       Option<Arc<dyn Fn() + Send + Sync>>,
+    reassert_flag: Arc<AtomicBool>,
+) -> Arc<AtomicBool> {
     let flag  = Arc::new(AtomicBool::new(false));
     let flag2 = Arc::clone(&flag);
 
     if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
         let cb = on_exit.clone();
+        let rf = Arc::clone(&reassert_flag);
         std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
-            hyprland_fullscreen_loop(flag2, sig, cb);
+            hyprland_fullscreen_loop(flag2, sig, cb, rf);
         }).ok();
     } else if std::env::var("SWAYSOCK").is_ok() {
         std::thread::Builder::new().name("fs-mon".into()).spawn(move || {
@@ -66,7 +70,12 @@ fn hyprland_query_fullscreen(sock1: &str) -> bool {
     resp.contains("\"hasfullscreen\":true") || resp.contains("\"hasfullscreen\": true")
 }
 
-fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String, on_exit: Option<Arc<dyn Fn() + Send + Sync>>) {
+fn hyprland_fullscreen_loop(
+    flag:          Arc<AtomicBool>,
+    sig:           String,
+    on_exit:       Option<Arc<dyn Fn() + Send + Sync>>,
+    reassert_flag: Arc<AtomicBool>,
+) {
     // Hyprland >= 0.30 moved the socket from /tmp/hypr/ to $XDG_RUNTIME_DIR/hypr/.
     let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
     let path_xdg = format!("{}/hypr/{}/.socket2.sock", xdg, sig);
@@ -91,6 +100,16 @@ fn hyprland_fullscreen_loop(flag: Arc<AtomicBool>, sig: String, on_exit: Option<
                         prev_active = active;
                         flag.store(active, Ordering::Relaxed);
                         tracing::info!("hyprland fullscreen → {}", active);
+                    }
+                    // lockguard>>0 = screen unlocked — reassert wpick surface so it ends
+                    // up on top of QuickShell's background layer which re-renders on unlock.
+                    Ok(l) if l.starts_with("lockguard>>0") => {
+                        tracing::info!("hyprland: screen unlocked — scheduling surface reassert");
+                        let rf = Arc::clone(&reassert_flag);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_secs(1));
+                            rf.store(true, Ordering::Relaxed);
+                        });
                     }
                     // workspace>> fires when switching workspaces.
                     // Hyprland does NOT resend fullscreen>> on workspace switch, so the
@@ -644,6 +663,15 @@ struct OutputSurface {
     pinned_wp:     Option<WallpaperInfo>,
     /// Active fit mode for this monitor — settable at runtime via SetFit.
     fit:           FitMode,
+    /// Most-recent successfully decoded frame; copied here every frame for crossfade.
+    /// Set to false after a HW decode failure so we skip HW and go straight to SW.
+    hw_ok:             bool,
+    last_frame:        Vec<u8>,
+    last_frame_tick:   u32,      // counts Ok(true) frames, used to throttle last_frame updates
+    /// Snapshot of last_frame taken when a wallpaper change starts.
+    fade_old:          Vec<u8>,
+    fade_frames_left:  u32,
+    fade_frames_total: u32,
 }
 
 // ─── Renderer context ─────────────────────────────────────────────────────────
@@ -791,8 +819,14 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
             nudge_at:       None,
             recreate_after: None,
             last_commit_at: None,
-            pinned_wp:     None,
-            fit:           FitMode::default(),
+            pinned_wp:         None,
+            fit:               FitMode::default(),
+            hw_ok:             true,
+            last_frame:        Vec::new(),
+            last_frame_tick:   0,
+            fade_old:          Vec::new(),
+            fade_frames_left:  0,
+            fade_frames_total: 0,
         });
 
         wls.surf_ev[i].needs_ack   = false;
@@ -817,10 +851,11 @@ pub async fn run(
     mut per_monitor_rx:  watch::Receiver<HashMap<String, Option<WallpaperInfo>>>,
     fit_rx:              watch::Receiver<(String, FitMode)>,
     outputs_out:         Arc<std::sync::Mutex<Vec<(String, u32, u32)>>>,
+    reassert_flag:       Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut shutdown_rx   = shutdown_rx;
     let mut init_failures = 0u32;
-    let fullscreen        = start_fullscreen_monitor(on_fullscreen_exit);
+    let fullscreen        = start_fullscreen_monitor(on_fullscreen_exit, Arc::clone(&reassert_flag));
 
     // Start pause monitors — only for sources enabled in config.
     let battery = if pause_cfg.on_battery   { start_battery_monitor() } else { Arc::new(AtomicBool::new(false)) };
@@ -899,8 +934,9 @@ pub async fn run(
             lid:           Arc::clone(&pause.lid),
         };
         let monitors_cfg = monitors.clone();
+        let reassert     = Arc::clone(&reassert_flag);
         let result = tokio::task::spawn_blocking(move || {
-            render_loop(ctx, wp_rx, pin_rx, sd_rx, fit_fwd_rx, fs, pm, monitors_cfg, monitor_wallpapers)
+            render_loop(ctx, wp_rx, pin_rx, sd_rx, fit_fwd_rx, fs, pm, monitors_cfg, monitor_wallpapers, reassert)
         }).await.context("render loop panic")?;
 
         wp_fwd.abort();
@@ -910,6 +946,10 @@ pub async fn run(
 
         match result {
             Ok(()) => break,
+            Err(ref e) if e.to_string().contains("__reassert__") => {
+                tracing::info!("renderer: reasserting surfaces (session startup z-order fix)");
+                continue; // reinit — new surfaces end up on top of QuickShell background
+            }
             Err(ref e) if e.to_string().contains("__fatal__") => {
                 if shutdown_rx.try_recv().is_ok() { break; }
                 tracing::warn!("renderer fatal — full reinit");
@@ -945,6 +985,10 @@ async fn resolve_monitor_wallpapers(
 // ─── Render loop ──────────────────────────────────────────────────────────────
 
 const NUDGE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Number of decoded frames to blend during a wallpaper crossfade (~4 s at 30 fps).
+const FADE_FRAMES: u32 = 120;
+/// Update last_frame snapshot only every N successful frames to save memory bandwidth.
+const LAST_FRAME_UPDATE_INTERVAL: u32 = 10;
 
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
@@ -957,6 +1001,7 @@ fn render_loop(
     pause:              PauseMonitors,
     monitors_cfg:       HashMap<String, MonitorConfig>,
     monitor_wallpapers: HashMap<String, WallpaperInfo>,
+    reassert_flag:      Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut current_wp: Option<WallpaperInfo> = None;
 
@@ -972,7 +1017,7 @@ fn render_loop(
         if let Some(info) = monitor_wallpapers.get(&surf.output_name) {
             tracing::info!("surface[{}] ({}) pinned to wallpaper '{}'",
                 surf.ev_idx, surf.output_name, info.title);
-            surf.decoder   = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
+            surf.decoder   = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit, surf.hw_ok);
             surf.next_frame = Instant::now();
             surf.pinned_wp  = Some(info.clone());
         }
@@ -981,6 +1026,11 @@ fn render_loop(
     loop {
         // ── shutdown ──────────────────────────────────────────────────────────
         if sd_rx.try_recv().is_ok() { break; }
+
+        // ── surface reassert (session startup z-order fix) ────────────────────
+        if reassert_flag.swap(false, Ordering::Relaxed) {
+            anyhow::bail!("__reassert__");
+        }
 
         // ── wayland events ────────────────────────────────────────────────────
         // dispatch_pending does NOT read from the socket in wayland-client 0.31.
@@ -1004,7 +1054,7 @@ fn render_loop(
                     // Recreate decoder with new fit mode.
                     let active_wp = surf.pinned_wp.clone().or_else(|| current_wp.clone());
                     if let Some(ref info) = active_wp {
-                        surf.decoder      = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
+                        surf.decoder      = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit, surf.hw_ok);
                         surf.next_frame   = Instant::now();
                         surf.canvas_ready = false;
                     }
@@ -1024,7 +1074,7 @@ fn render_loop(
                         Some(info) => {
                             tracing::info!("pin update: surface '{}' → '{}'",
                                 surf.output_name, info.title);
-                            surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
+                            surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit, surf.hw_ok);
                             surf.next_frame = Instant::now();
                             surf.pinned_wp  = Some(info.clone());
                             surf.canvas_ready = false;
@@ -1034,7 +1084,7 @@ fn render_loop(
                             surf.pinned_wp    = None;
                             surf.canvas_ready = false;
                             surf.decoder = current_wp.as_ref()
-                                .and_then(|info| open_decoder(info, surf.surf_w, surf.surf_h, surf.fit));
+                                .and_then(|info| open_decoder(info, surf.surf_w, surf.surf_h, surf.fit, surf.hw_ok));
                             if surf.decoder.is_some() { surf.next_frame = Instant::now(); }
                         }
                     }
@@ -1054,10 +1104,24 @@ fn render_loop(
             for surf in &mut ctx.surfaces {
                 // Surfaces with a per-monitor override ignore global wallpaper changes.
                 if surf.pinned_wp.is_some() { continue; }
+                // Capture old frame for crossfade before switching decoder.
+                surf.hw_ok = true; // reset per-wallpaper HW flag for new video
+                if surf.canvas_ready && new_wp.is_some() && !surf.last_frame.is_empty() {
+                    tracing::info!("crossfade: starting {} frames on '{}'",
+                        FADE_FRAMES, surf.output_name);
+                    surf.fade_old          = std::mem::take(&mut surf.last_frame);
+                    surf.last_frame_tick   = 0;
+                    surf.fade_frames_left  = FADE_FRAMES;
+                    surf.fade_frames_total = FADE_FRAMES;
+                } else {
+                    tracing::info!("crossfade: skipped (canvas_ready={} last_frame_empty={})",
+                        surf.canvas_ready, surf.last_frame.is_empty());
+                    surf.fade_frames_left = 0;
+                }
                 surf.decoder      = None;
                 surf.canvas_ready = false;
                 if let Some(ref info) = new_wp {
-                    surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit);
+                    surf.decoder    = open_decoder(info, surf.surf_w, surf.surf_h, surf.fit, surf.hw_ok);
                     surf.next_frame = Instant::now();
                 }
             }
@@ -1213,7 +1277,7 @@ fn process_surface(
                     ctx.surfaces[i].canvas_ready  = false;
                     let active_wp = ctx.surfaces[i].pinned_wp.clone().or_else(|| current_wp.clone());
                     if let Some(ref info) = active_wp {
-                        ctx.surfaces[i].decoder = open_decoder(info, new_w, new_h, ctx.surfaces[i].fit);
+                        ctx.surfaces[i].decoder = open_decoder(info, new_w, new_h, ctx.surfaces[i].fit, ctx.surfaces[i].hw_ok);
                     }
                 }
                 Err(e) => tracing::warn!("pool resize surface[{}]: {}", i, e),
@@ -1285,6 +1349,39 @@ fn process_surface(
     match result {
         Ok(true) => {
             ctx.surfaces[i].canvas_ready = true;
+            // Extract raw mmap pointer before any field borrows (primitive, no lifetime).
+            let (frame_ptr, frame_size) = {
+                let c = &ctx.surfaces[i].pool.as_ref().unwrap().slots[slot_i].canvas;
+                (c.ptr, c.size)
+            };
+            // Crossfade: blend old frame into newly decoded frame.
+            let fade_left = ctx.surfaces[i].fade_frames_left;
+            if fade_left > 0 {
+                let fade_total = ctx.surfaces[i].fade_frames_total;
+                ctx.surfaces[i].fade_frames_left -= 1;
+                // Integer blend: alpha = fade_left/fade_total in 0..=255 range.
+                let alpha = ((fade_left as u32 * 255) / fade_total as u32) as u16; // old weight
+                let ialpha = 255u16 - alpha;                                         // new weight
+                let old = &ctx.surfaces[i].fade_old;
+                let blend_len = frame_size.min(old.len());
+                // SAFETY: frame_ptr is mmap (memfd); old.as_ptr() is heap Vec — no overlap.
+                unsafe {
+                    let new_sl = std::slice::from_raw_parts_mut(frame_ptr, blend_len);
+                    for (n, &o) in new_sl.iter_mut().zip(old.iter()) {
+                        *n = ((o as u16 * alpha + *n as u16 * ialpha) / 255) as u8;
+                    }
+                }
+            } else {
+                // Update last_frame every LAST_FRAME_UPDATE_INTERVAL frames to save bandwidth.
+                ctx.surfaces[i].last_frame_tick += 1;
+                if ctx.surfaces[i].last_frame_tick >= LAST_FRAME_UPDATE_INTERVAL {
+                    ctx.surfaces[i].last_frame_tick = 0;
+                    let lf = &mut ctx.surfaces[i].last_frame;
+                    if lf.len() != frame_size { lf.resize(frame_size, 0); }
+                    // SAFETY: frame_ptr is mmap (memfd); lf.as_mut_ptr() is heap Vec.
+                    unsafe { std::ptr::copy_nonoverlapping(frame_ptr, lf.as_mut_ptr(), frame_size); }
+                }
+            }
             commit_slot(ctx, i, slot_i);
             let _ = ctx.evq.flush();
             ctx.surfaces[i].next_frame += dur;
@@ -1302,7 +1399,8 @@ fn process_surface(
         Err(e) => {
             ctx.wls.surf_ev[ev_idx].frame_ready = true;
             if is_hw {
-                tracing::warn!("hw surface[{}]: {} — sw fallback", i, e);
+                tracing::warn!("hw surface[{}]: {} — sw fallback (hw disabled for this wallpaper)", i, e);
+                ctx.surfaces[i].hw_ok = false; // skip HW on future frames of this wallpaper
                 let active_wp = ctx.surfaces[i].pinned_wp.clone().or_else(|| current_wp.clone());
                 if let Some(ref info) = active_wp {
                     let fit = ctx.surfaces[i].fit;
@@ -1331,7 +1429,7 @@ fn is_static_image(path: &str) -> bool {
     )
 }
 
-fn open_decoder(info: &WallpaperInfo, target_w: u32, target_h: u32, fit: FitMode) -> Option<AnyDecoder> {
+fn open_decoder(info: &WallpaperInfo, target_w: u32, target_h: u32, fit: FitMode, hw_ok: bool) -> Option<AnyDecoder> {
     if is_static_image(&info.file_path) {
         match StaticDecoder::try_open(&info.file_path, target_w, target_h, fit) {
             Some(d) => {
@@ -1345,12 +1443,14 @@ fn open_decoder(info: &WallpaperInfo, target_w: u32, target_h: u32, fit: FitMode
         }
     }
 
-    if let Some(hw) = HwDecoder::try_open(&info.file_path, target_w, target_h) {
-        tracing::info!(
-            "hw decode (va-api) {}x{} → {}x{} bgra",
-            hw.dimensions().0, hw.dimensions().1, target_w, target_h
-        );
-        return Some(AnyDecoder::Hw(hw));
+    if hw_ok {
+        if let Some(hw) = HwDecoder::try_open(&info.file_path, target_w, target_h) {
+            tracing::info!(
+                "hw decode (va-api) {}x{} → {}x{} bgra",
+                hw.dimensions().0, hw.dimensions().1, target_w, target_h
+            );
+            return Some(AnyDecoder::Hw(hw));
+        }
     }
     match VideoDecoder::open(&info.file_path, target_w, target_h, fit) {
         Ok(sw) => {

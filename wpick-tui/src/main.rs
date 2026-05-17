@@ -260,7 +260,12 @@ async fn run_tui(config: WpickConfig, dirs: AppDirs) -> Result<()> {
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    crossterm::execute!(
+        stdout,
+        EnterAlternateScreen,
+        crossterm::terminal::SetTitle("wpick"),
+        crossterm::event::EnableMouseCapture,
+    )?;
 
     // Query terminal for image protocol support after entering alternate screen.
     // Falls back to halfblocks unicode if the terminal doesn't support Kitty/Sixel.
@@ -276,7 +281,11 @@ async fn run_tui(config: WpickConfig, dirs: AppDirs) -> Result<()> {
 
     // Always restore terminal even if app returned an error
     crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+    )?;
 
     result
 }

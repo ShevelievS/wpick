@@ -3,8 +3,12 @@
 > Native Wayland live wallpaper daemon for Wallpaper Engine (Steam) content.  
 > No Wine, no `linux-wallpaperengine`, no DRM hacks — pure Rust.
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.1-blue)](CHANGELOG.md)
+> **Disclaimer:** wpick is an independent open-source project and is not affiliated with,
+> endorsed by, or sponsored by Valve Corporation or the Wallpaper Engine developers.
+> "Wallpaper Engine" and "Steam" are trademarks of Valve Corporation.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.4.2-blue)](CHANGELOG.md)
 
 wpick plays Wallpaper Engine video wallpapers directly on `wlr-layer-shell`
 background surfaces, with streaming audio, PulseAudio ducking,
@@ -35,9 +39,14 @@ your Steam Workshop library.
 | CLI one-shot commands | ✅ |
 | SQLite metadata cache | ✅ |
 | Systemd user service | ✅ |
-| Scene wallpapers | ❌ planned |
-| Web wallpapers | ❌ planned |
-| Shell completions / man pages | ❌ planned |
+| Global hotkey (`Super+W` → TUI popup) | ✅ |
+| Wallpaper timer with shuffle | ✅ |
+| Favorites & Most Played | ✅ |
+| Packs (named collections) | ✅ |
+| Theme presets (nord, dracula, tokyo…) | ✅ |
+| Shell completions / man pages | ✅ |
+| Scene wallpapers | ❌ not planned |
+| Web wallpapers | ❌ not planned |
 
 **Compositor requirements:** `wlr-layer-shell` (Hyprland, Sway, river, niri).  
 GNOME and KDE are **not** supported.
@@ -98,15 +107,24 @@ View logs:    `journalctl --user -u wpick-daemon -f`
 # Launch TUI — auto-starts daemon in background
 wpick
 
-# CLI one-shot commands
+# Wallpaper control
 wpick list              # list all cached wallpapers
 wpick set 1234567890    # set wallpaper by Steam Workshop ID
-wpick volume 60         # set volume to 60 %
-wpick mute              # toggle mute
+wpick scan              # rescan Workshop dirs and extra_dirs
 wpick info 1234567890   # show wallpaper details
 wpick status            # show current wallpaper, volume, mute state
-wpick scan              # rescan Workshop dirs and extra_dirs
-wpick kill              # stop daemon
+
+# Audio
+wpick volume 60         # set volume to 60 %
+wpick mute              # toggle mute
+
+# Timer (playlist rotation)
+wpick timer set --ids 111 222 333 --interval 300 --shuffle
+wpick timer stop
+wpick timer status
+
+# Daemon control
+wpick kill              # stop daemon (requires same UID as daemon)
 ```
 
 On first run `wpick` scans your Steam Workshop library automatically.
@@ -121,18 +139,49 @@ content is under `~/.steam/steam/steamapps/workshop/content/431960/`.
 wpick
 ```
 
+**Navigation**
+
 | Key | Action |
 |-----|--------|
-| `↑ ↓` / `j k` | Navigate list |
-| `Enter` | Apply selected wallpaper |
+| `↑ ↓` / `j k` | Move through wallpaper list |
+| `← →` / `h l` | Switch between Nav panel and List |
+| `[` | Toggle left navigation panel |
+| `]` | Toggle right preview panel |
+| `Tab` | Cycle source filter (All → Workshop → Local folders) |
+| `/` | Live search |
+| `o` | Sort dialog (Default / Name / Size / Resolution) |
+
+**Wallpaper**
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Apply selected wallpaper (monitor picker if multi-monitor) |
+| `f` | Cycle fit mode (Fit → Fill → Stretch → Center) |
+| `*` | Toggle favorite |
+| `p` | Add to pack |
+| `i` | Toggle detail / full-screen view |
+
+**Timer**
+
+| Key | Action |
+|-----|--------|
+| `T` | Open timer dialog |
+
+**Audio**
+
+| Key | Action |
+|-----|--------|
 | `+ -` | Volume up / down |
 | `m` | Toggle mute |
+
+**Library & UI**
+
+| Key | Action |
+|-----|--------|
 | `r` | Rescan library |
-| `/` | Live search |
-| `Tab` | Cycle source filter (All → Workshop → Local folders) |
-| `f` | Cycle fit mode (Fit → Fill → Stretch → Center) |
 | `s` | Open folder picker — add/remove custom video folders |
-| `i` | Toggle detail / full-screen view |
+| `S` | Settings dialog (theme, colors, layout) |
+| `?` | Help overlay |
 | `q` | Quit TUI (daemon keeps running) |
 | `Q` / `Ctrl-C` | Quit TUI **and** kill daemon |
 | `Esc` | Cancel active scan / close overlays |
@@ -140,8 +189,40 @@ wpick
 The right panel shows an image preview of the selected wallpaper.
 Protocol is auto-detected: Kitty graphics → Sixel → halfblocks fallback.
 
+The left navigation panel shows: **Favorites**, **Frequent** (most played),
+**Packs** (named collections), and source filters (Workshop / local folders).
+
 Scans run in the background — the TUI stays responsive. Press `Esc` at any
 time to cancel a running scan.
+
+---
+
+## Global Hotkey
+
+wpick can open its TUI in a floating terminal popup via a global hotkey,
+even when the TUI is not running.
+
+**Setup (one-time):**
+
+```bash
+# Add yourself to the input group (re-login required)
+sudo usermod -aG input $USER
+```
+
+**Config:**
+
+```toml
+[hotkey]
+enabled  = true
+keys     = "super+w"   # modifiers: super ctrl shift alt
+terminal = ""          # auto-detected: foot → kitty → alacritty → wezterm → xterm
+width    = 960
+height   = 640
+```
+
+On Hyprland the popup appears as `[float;center;size 960 640]` and is
+refocused if already open. On other compositors the terminal is spawned
+without size hints.
 
 ---
 
@@ -182,28 +263,43 @@ Created automatically with defaults on first run.
 [general]
 volume             = 0.8
 muted              = false
-# pause_competitors = false  # true = SIGSTOP competing wallpaper tools instead of SIGKILL
+# pause_competitors = false  # true = SIGSTOP competing daemons; false (default) = SIGKILL
 
 [audio]
-ducking_enabled = true    # fade out wallpaper audio when another app plays sound
-chunk_frames    = 2048    # streaming decode buffer (frames)
+ducking_enabled = true    # fade wallpaper audio when another app plays
+chunk_frames    = 2048    # streaming decode chunk size (frames, ~42 ms at 48 kHz)
 
 [pause]
-on_fullscreen = true      # pause when a fullscreen window is detected (Hyprland only)
-on_battery    = false     # not yet implemented
-on_lid_close  = false     # not yet implemented
+on_fullscreen = true      # pause rendering when a fullscreen window is active
+on_battery    = false     # pause on battery power
+on_lid_close  = false     # pause when laptop lid is closed
 
 [paths]
 # Extra directories scanned for local video files (mp4, webm, mkv, avi, mov, …)
+# Symlinks are NOT followed — use real paths.
 extra_dirs = [
     "/home/user/Videos/wallpapers",
     "/mnt/nas/wallpapers",
 ]
 
+[hotkey]
+enabled  = true           # requires: sudo usermod -aG input $USER + re-login
+keys     = "super+w"      # modifiers: super ctrl shift alt + key
+terminal = ""             # auto-detected if empty
+width    = 960
+height   = 640
+
+[tui]
+theme    = "dark"         # dark | nord | dracula | tokyo | forrest | deep
+windowed = false          # render TUI in a centered 82×82% sub-area
+surface_reassert_secs = 0 # delay before Wayland surface reinit on startup
+                          # set >0 (e.g. 12) only if QuickShell starts after wpick
+
 # Per-monitor wallpaper (key = wl_output name, e.g. "eDP-1", "HDMI-A-1")
 [monitors."eDP-1"]
 wallpaper_id = 1234567890
 fit          = "fill"     # fit | fill | stretch | center
+mute         = false      # mute audio on this monitor
 ```
 
 ### Fit modes
@@ -254,13 +350,14 @@ shell does not restart it in a loop. wpick will resume it on exit.
 
 ```
 wpick (TUI + CLI binary)
-  └── Unix socket (~/.wpick.sock) ──► wpick-daemon
-                                          ├── renderer     (wlr-layer-shell + wl_shm)
-                                          │     ├── HwDecoder    (VA-API → NV12 → BGRA)
-                                          │     └── VideoDecoder (swscale → BGRA)
-                                          ├── audio task   (rodio + streaming ffmpeg)
-                                          │     └── DuckHandle   (PulseAudio ducking)
-                                          └── IPC server   (JSON-newline / Unix socket)
+  └── Unix socket ($XDG_RUNTIME_DIR/wpick.sock) ──► wpick-daemon
+                                                         ├── renderer      (wlr-layer-shell + wl_shm)
+                                                         │     ├── HwDecoder    (VA-API → NV12 → BGRA)
+                                                         │     └── VideoDecoder (swscale → BGRA)
+                                                         ├── audio task    (rodio + streaming ffmpeg)
+                                                         │     └── DuckHandle   (PulseAudio ducking)
+                                                         ├── hotkey task   (evdev /dev/input/*)
+                                                         └── IPC server    (JSON-newline, UID-auth Kill)
 ```
 
 **Rendering pipeline:**
@@ -296,6 +393,37 @@ cargo build  --workspace --release
 
 ---
 
+## Roadmap
+
+### v0.4.3 — Stability & performance (planned)
+
+| Item | Description |
+|------|-------------|
+| Config write safety | Replace per-command `load → save` pattern with a single `Arc<Mutex<WpickConfig>>` + debounced writer — eliminates silent data loss when two IPC commands fire concurrently |
+| IPC timeout resilience | Structured backoff on Hyprland socket reconnect (currently flat 2 s sleep) |
+| Batch SQLite scan | Wrap all `upsert` calls in a single transaction — 10-20× faster scan on large libraries |
+| `prune()` chunking | Split `WHERE id NOT IN (…)` into chunks of 999 to avoid SQLite variable limit |
+| VA-API device discovery | Glob `/dev/dri/renderD*` instead of hardcoding `renderD128`/`renderD129`; fixes AMD APU and multi-GPU setups |
+| `has_audio` probe | Detect audio tracks in local video files at scan time via ffmpeg stream inspection |
+| IPC server tests | Unit tests for each `dispatch()` arm with mocked state and cache |
+
+### v0.5 — Architecture (planned)
+
+| Item | Description |
+|------|-------------|
+| Typed renderer errors | Replace `__reassert__`/`__fatal__` string matching with a proper `RendererSignal` enum |
+| Renderer trait abstraction | Extract `Decoder` trait + headless implementation for unit-testable renderer logic |
+| Rust 2024 Edition | MSRV bump, all three crates updated |
+| EGL/GPU render path | Optional wl_egl_surface path for hardware-accelerated frame delivery (prerequisite for GPU transitions) |
+
+---
+
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option. See [LICENSE](LICENSE).
+wpick source code is licensed under the [MIT License](LICENSE) © 2026 ShevelievS.
+
+This binary links dynamically against:
+- **FFmpeg** (`ffmpeg-next` / `ffmpeg-sys-next`) — [LGPL 2.1+](https://ffmpeg.org/legal.html)
+- **PulseAudio** (`libpulse-binding`) — [LGPL 2.1](https://www.freedesktop.org/wiki/Software/PulseAudio/)
+
+These libraries are not modified. Their licenses apply to their respective source code.

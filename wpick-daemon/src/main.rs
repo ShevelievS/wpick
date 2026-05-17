@@ -1,5 +1,6 @@
 mod audio;
 mod ducking;
+mod hotkey;
 mod hw_decode;
 mod ipc_server;
 mod renderer;
@@ -7,6 +8,7 @@ mod state;
 mod video;
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use tokio::sync;
@@ -123,12 +125,16 @@ async fn main() -> anyhow::Result<()> {
     let dirs   = config.app_dirs().context("Failed to resolve app dirs")?;
 
     // 2. Logging — journal when running under systemd, rolling file otherwise.
+    //    _log_guard must live for the entire duration of main() — dropping it early
+    //    shuts down the non-blocking writer and silences all subsequent log output.
     let env_filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("wpick_daemon=info".parse()?)
         .add_directive("wpick_core=info".parse()?);
 
+    let _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>;
+
     if std::env::var_os("JOURNAL_STREAM").is_some() {
-        // systemd captures stderr; disable ANSI colours so journal formats cleanly.
+        _log_guard = None;
         tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_ansi(false)
@@ -137,7 +143,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let log_path = dirs.log_dir.join("wpick.log");
         let file_appender = tracing_appender::rolling::daily(&dirs.log_dir, "wpick.log");
-        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        _log_guard = Some(guard);
         tracing_subscriber::fmt()
             .with_writer(non_blocking)
             .with_env_filter(env_filter)
@@ -148,8 +155,6 @@ async fn main() -> anyhow::Result<()> {
         if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
             use std::os::unix::io::IntoRawFd;
             let raw = f.into_raw_fd();
-            // dup2 closes fd 2 and makes it an alias of raw; then close raw
-            // so we don't leak the original file descriptor.
             unsafe { libc::dup2(raw, 2); libc::close(raw); }
         }
     }
@@ -186,15 +191,19 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. DaemonState
     let state = Arc::new(sync::Mutex::new(DaemonState {
-        current:     None,
-        volume:      config.general.volume,
-        muted:       config.general.muted,
+        current:       None,
+        volume:        config.general.volume,
+        muted:         config.general.muted,
         wallpaper_tx,
         volume_tx,
-        shutdown_tx: shutdown_tx.clone(),
+        shutdown_tx:   shutdown_tx.clone(),
         per_monitor_tx,
         fit_tx,
         outputs,
+        timer_task:    None,
+        timer_interval: 0,
+        timer_started:  std::time::Instant::now(),
+        timer_ids:      Vec::new(),
     }));
 
     // 5b. Restore last wallpaper from config (persist-on-restart).
@@ -314,7 +323,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 11. IPC server task
+    // 11. Global hotkey listener task
+    {
+        let hotkey_cfg = config.hotkey.clone();
+        let hotkey_sd  = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            hotkey::run(hotkey_cfg, hotkey_sd).await;
+        });
+    }
+
+    // 12. IPC server task
     {
         let state = Arc::clone(&state);
         let cache = Arc::clone(&cache);
@@ -326,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 12. Audio task — dedicated OS thread (rodio OutputStream is !Send)
+    // 13. Audio task — dedicated OS thread (rodio OutputStream is !Send)
     {
         let audio_cfg       = config.audio.clone();
         let ducking_enabled = config.audio.ducking_enabled;
@@ -353,7 +371,7 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to spawn audio thread")?;
     }
 
-    // 13. Renderer — must run on this thread (Wayland is !Send)
+    // 14. Renderer — must run on this thread (Wayland is !Send)
     tracing::info!("Starting renderer");
     // When fullscreen exits, any competitor that was restarted by a watchdog
     // (e.g. QuickShell's mpvpaper manager) is killed again so our surface stays on top.
@@ -381,9 +399,24 @@ async fn main() -> anyhow::Result<()> {
             });
         }))
     };
+    // Reassert Wayland surfaces after a short delay so wpick ends up on top of
+    // QuickShell's background layer, which initializes lazily after session start.
+    let reassert_flag = Arc::new(AtomicBool::new(false));
+    {
+        let flag = Arc::clone(&reassert_flag);
+        let delay_secs = config.tui.surface_reassert_secs;
+        if delay_secs > 0 {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                tracing::info!("triggering surface reassert after {}s startup delay", delay_secs);
+                flag.store(true, Ordering::Relaxed);
+            });
+        }
+    }
+
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit, per_monitor_rx, fit_rx, outputs_renderer))
+        .run_until(renderer::run(renderer_rx, shutdown_rx, config.pause, config.monitors, Arc::clone(&cache), on_fs_exit, per_monitor_rx, fit_rx, outputs_renderer, reassert_flag))
         .await
         .context("Renderer error")?;
 

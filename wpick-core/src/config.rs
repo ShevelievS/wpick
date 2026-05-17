@@ -21,6 +21,113 @@ pub struct WpickConfig {
     // v0.4 additions:
     /// Last wallpaper set by the user; restored on daemon restart.
     pub last_wallpaper_id: Option<u64>,
+    // v0.5 additions:
+    pub tui:              TuiConfig,
+    /// Global hotkey that opens the wpick TUI popup window.
+    pub hotkey:           HotkeyConfig,
+}
+
+// ─── TUI config ───────────────────────────────────────────────────────────────
+
+/// Per-slot color configuration — each value is an index into PALETTE in app.rs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiColorConfig {
+    pub border_active:  usize,
+    pub border_idle:    usize,
+    pub border_overlay: usize,
+    pub sel_bg:         usize,
+    pub sel_fg:         usize,
+    pub color_hint:     usize,
+    pub color_playing:  usize,
+    pub color_fav:      usize,
+    pub col_title:      usize,  // column header title text color
+    pub text_dim:       usize,  // secondary / dim text color
+    pub vol_bar:        usize,  // volume bar fill color
+}
+
+impl Default for TuiColorConfig {
+    fn default() -> Self {
+        Self {
+            border_active:  3,   // Light Gray
+            border_idle:    1,   // Dark Gray
+            border_overlay: 9,   // Soft Blue
+            sel_bg:         6,   // Dark Blue
+            sel_fg:         4,   // Near White
+            color_hint:     7,   // Dim Blue
+            color_playing:  14,  // Green
+            color_fav:      15,  // Yellow
+            col_title:      9,   // Soft Blue
+            text_dim:       2,   // Mid Gray
+            vol_bar:        9,   // Soft Blue
+        }
+    }
+}
+
+/// TUI-specific preferences: favorites, packs, panel visibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TuiConfig {
+    /// Wallpaper IDs marked as favorites (shown in the Favorites nav section).
+    pub favorites:    Vec<u64>,
+    /// User-created named collections of wallpapers.
+    pub packs:        Vec<Pack>,
+    /// Show the left navigation panel (toggle with `[`).
+    #[serde(default = "default_true")]
+    pub show_nav:     bool,
+    /// Show the right preview panel (toggle with `]`).
+    #[serde(default = "default_true")]
+    pub show_preview: bool,
+    /// Visual theme preset: "dark" | "minimal" | "contrast"
+    #[serde(default)]
+    pub theme:        String,
+    /// Per-slot color overrides (palette indices).
+    #[serde(default)]
+    pub colors:       TuiColorConfig,
+    /// Position of now-playing title in header: "top-left" | "top-center" | "top-right"
+    #[serde(default = "default_now_playing_pos")]
+    pub now_playing_pos: String,
+    /// Volume display style: "bar" | "slim" | "number"
+    #[serde(default = "default_vol_style")]
+    pub vol_style: String,
+    /// Windowed mode: render in a centered sub-area instead of fullscreen.
+    #[serde(default)]
+    pub windowed: bool,
+    /// Seconds after daemon start before reasserting Wayland surfaces.
+    /// Fixes z-order when another layer-shell client (e.g. QuickShell) creates
+    /// its background surface lazily and ends up on top of wpick.
+    /// Set to 0 to disable. Default: 8.
+    #[serde(default = "default_surface_reassert_secs")]
+    pub surface_reassert_secs: u64,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            favorites:       Vec::new(),
+            packs:           Vec::new(),
+            show_nav:        true,
+            show_preview:    true,
+            theme:           "dark".to_owned(),
+            colors:          TuiColorConfig::default(),
+            now_playing_pos: default_now_playing_pos(),
+            vol_style:       default_vol_style(),
+            windowed:               false,
+            surface_reassert_secs:  default_surface_reassert_secs(),
+        }
+    }
+}
+
+fn default_true() -> bool { true }
+fn default_now_playing_pos() -> String { "top-right".to_owned() }
+fn default_vol_style() -> String { "slim".to_owned() }
+fn default_surface_reassert_secs() -> u64 { 12 }
+
+/// A named collection of wallpaper IDs created by the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pack {
+    pub name: String,
+    pub ids:  Vec<u64>,
 }
 
 /// Playback / audio settings.
@@ -115,6 +222,50 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         Self { chunk_frames: 2048, max_preload_mb: 50, ducking_enabled: true }
+    }
+}
+
+// ─── Hotkey config ────────────────────────────────────────────────────────────
+
+/// Global hotkey that opens the wpick TUI in a floating popup terminal.
+///
+/// Requires the daemon user to be in the `input` group:
+///   `sudo usermod -aG input $USER`  (re-login to apply)
+///
+/// Example config:
+/// ```toml
+/// [hotkey]
+/// enabled  = true
+/// keys     = "super+w"
+/// terminal = "foot"     # auto-detected if empty
+/// width    = 960
+/// height   = 640
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeyConfig {
+    /// Enable the global hotkey listener.
+    pub enabled:  bool,
+    /// Key combination: modifiers joined by `+`, e.g. `"super+w"`, `"ctrl+shift+p"`.
+    /// Supported modifiers: `super`, `ctrl`, `shift`, `alt`.
+    pub keys:     String,
+    /// Terminal emulator to launch. Auto-detected (foot → kitty → alacritty → xterm) if empty.
+    pub terminal: String,
+    /// Popup window width in pixels passed to the compositor.
+    pub width:    u32,
+    /// Popup window height in pixels passed to the compositor.
+    pub height:   u32,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled:  false,
+            keys:     "super+w".to_owned(),
+            terminal: String::new(),
+            width:    960,
+            height:   640,
+        }
     }
 }
 
