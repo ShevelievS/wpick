@@ -16,6 +16,10 @@ use wpick_core::model::WallpaperInfo;
 const CHUNK_SIZE_DEFAULT: usize = 8_192;
 /// Default channel capacity (backpressure bound).
 const CHANNEL_CAP_DEFAULT: usize = 16;
+/// Audio fade-out duration when switching wallpapers (milliseconds).
+const AUDIO_FADE_MS: u64 = 1_500;
+/// Number of volume steps in the fade-out ramp.
+const AUDIO_FADE_STEPS: u32 = 30;
 
 // ─── StreamingSource — rodio Source backed by a background decode thread ──────
 
@@ -217,10 +221,22 @@ pub async fn run(
                 res?; // Sender dropped → run() exits cleanly
                 let new_wp = wallpaper_rx.borrow_and_update().clone();
 
-                // Stop old sink — drops StreamingSource's Receiver, signalling
-                // the decode thread to exit (E-29).
-                if let Some(sink) = current_sink.take() {
-                    sink.stop();
+                // Fade out old sink smoothly instead of stopping it abruptly.
+                // The task owns the Arc exclusively (current_sink.take()), so
+                // volume ramps can't race with the volume_rx handler.
+                // When the ramp completes (or the sink drains naturally), stop()
+                // drops the StreamingSource Receiver → decoder thread exits.
+                if let Some(old_sink) = current_sink.take() {
+                    tokio::spawn(async move {
+                        let start_vol = old_sink.volume();
+                        let step_ms   = AUDIO_FADE_MS / AUDIO_FADE_STEPS as u64;
+                        for i in (0..AUDIO_FADE_STEPS).rev() {
+                            if old_sink.empty() { break; }
+                            old_sink.set_volume(start_vol * i as f32 / AUDIO_FADE_STEPS as f32);
+                            tokio::time::sleep(std::time::Duration::from_millis(step_ms)).await;
+                        }
+                        old_sink.stop();
+                    });
                 }
 
                 if let Some(ref info) = new_wp {

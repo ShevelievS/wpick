@@ -1592,20 +1592,28 @@ fn process_surface(
                 let fade_total = ctx.surfaces[i].fade_frames_total;
                 ctx.surfaces[i].fade_frames_left -= 1;
                 // Integer blend: alpha = fade_left/fade_total in 0..=255 range.
-                let alpha = ((fade_left * 255) / fade_total.max(1)) as u16; // old weight
-                let ialpha = 255u16 - alpha;                                         // new weight
-                let old = &ctx.surfaces[i].fade_old;
-                let blend_len = frame_size.min(old.len());
-                // SAFETY: frame_ptr is mmap (memfd); old.as_ptr() is heap Vec — no overlap.
+                let alpha  = ((fade_left * 255) / fade_total.max(1)) as u16; // old weight
+                let ialpha = 255u16 - alpha;                                  // new weight
+                let blend_len = frame_size.min(ctx.surfaces[i].fade_old.len());
+                let old_ptr   = ctx.surfaces[i].fade_old.as_ptr();
+                // SAFETY: frame_ptr is mmap (memfd); old_ptr is heap Vec — no overlap.
                 unsafe {
                     let new_sl = std::slice::from_raw_parts_mut(frame_ptr, blend_len);
-                    for (n, &o) in new_sl.iter_mut().zip(old.iter()) {
-                        *n = ((o as u16 * alpha + *n as u16 * ialpha) / 255) as u8;
+                    for j in 0..blend_len {
+                        let o = *old_ptr.add(j);
+                        new_sl[j] = ((o as u16 * alpha + new_sl[j] as u16 * ialpha) / 255) as u8;
                     }
                 }
-                // Release the old-frame buffer as soon as the fade is complete.
-                // Without this the 8–32 MB BGRA snapshot lives forever until the
-                // next wallpaper change, growing RSS continuously.
+                // Mirror blended output into last_frame every frame during crossfade.
+                // Without this, last_frame remains empty (it was moved into fade_old at
+                // crossfade start), so a rapid wallpaper switch mid-crossfade finds no
+                // snapshot and falls through to a hard cut.  With this copy in place,
+                // the new change picks up the current blended frame and continues
+                // smoothly into the next crossfade.
+                let lf = &mut ctx.surfaces[i].last_frame;
+                if lf.len() != blend_len { lf.resize(blend_len, 0); lf.shrink_to_fit(); }
+                // SAFETY: frame_ptr (mmap) and lf.as_mut_ptr() (heap Vec) do not overlap.
+                unsafe { std::ptr::copy_nonoverlapping(frame_ptr, lf.as_mut_ptr(), blend_len); }
                 if ctx.surfaces[i].fade_frames_left == 0 {
                     ctx.surfaces[i].fade_old = Vec::new();
                 }
