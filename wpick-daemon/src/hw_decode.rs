@@ -65,21 +65,32 @@ impl HwDecoder {
     /// — caller should fall back to `VideoDecoder`.
     pub fn try_open(path: &str, target_w: u32, target_h: u32) -> Option<Self> {
         let path_c = std::ffi::CString::new(path).ok()?;
-        for device in ["/dev/dri/renderD128", "/dev/dri/renderD129"] {
-            if !std::path::Path::new(device).exists() {
-                continue;
-            }
-            let device_c = match std::ffi::CString::new(device) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
+        let render_nodes: Vec<std::path::PathBuf> = {
+            let Ok(entries) = std::fs::read_dir("/dev/dri") else { return None };
+            let mut v: Vec<_> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.starts_with("renderD"))
+                        .unwrap_or(false)
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        if render_nodes.is_empty() { return None; }
+
+        for device_path in &render_nodes {
+            let Ok(device_c) = std::ffi::CString::new(device_path.to_string_lossy().as_bytes()) else { continue };
             match unsafe { Self::open_inner(&path_c, &device_c, target_w, target_h) } {
                 Ok(dec) => {
-                    tracing::info!("HW decode active: VA-API on {}", device);
+                    tracing::info!("HW decode active: VA-API on {}", device_path.display());
                     return Some(dec);
                 }
                 Err(e) => {
-                    tracing::debug!("HW decode unavailable on {}: {}", device, e);
+                    tracing::debug!("HW decode unavailable on {}: {}", device_path.display(), e);
                 }
             }
         }
@@ -380,6 +391,11 @@ impl HwDecoder {
 
     pub fn seek_to_start(&mut self) -> anyhow::Result<()> {
         unsafe {
+            // Unref in-flight frames before seek so VA surfaces are returned to the
+            // driver pool. Without this, surface refcount grows with each loop cycle
+            // until the VA driver exhausts its surface budget and decode fails.
+            ffsys::av_frame_unref(self.vaapi_frame);
+            ffsys::av_frame_unref(self.nv12_frame);
             let ret = ffsys::av_seek_frame(
                 self.format_ctx, -1, 0, ffsys::AVSEEK_FLAG_BACKWARD,
             );

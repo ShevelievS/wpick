@@ -86,8 +86,10 @@ fn hyprland_fullscreen_loop(
     let sock1 = if std::path::Path::new(&sock1_xdg).exists() { sock1_xdg } else { sock1_tmp };
     tracing::info!("hyprland fullscreen monitor: {}", path);
     let mut prev_active = false;
+    let mut backoff_secs: u64 = 2;
     loop {
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
+            backoff_secs = 2; // reset on successful connect
             use std::io::BufRead;
             for line in std::io::BufReader::new(stream).lines() {
                 match line {
@@ -128,7 +130,9 @@ fn hyprland_fullscreen_loop(
                 }
             }
         }
-        std::thread::sleep(Duration::from_secs(2));
+        tracing::debug!("hyprland ipc disconnected — reconnecting in {}s", backoff_secs);
+        std::thread::sleep(Duration::from_secs(backoff_secs));
+        backoff_secs = (backoff_secs * 2).min(30);
     }
 }
 
@@ -147,9 +151,11 @@ fn sway_fullscreen_loop(flag: Arc<AtomicBool>, on_exit: Option<Arc<dyn Fn() + Se
         Err(_) => return,
     };
 
+    let mut backoff_secs: u64 = 2;
     loop {
         match std::os::unix::net::UnixStream::connect(&sock) {
             Ok(mut stream) => {
+                backoff_secs = 2; // reset on successful connect
                 let payload = b"[\"window\"]";
                 let mut msg = Vec::with_capacity(14 + payload.len());
                 msg.extend_from_slice(MAGIC);
@@ -158,16 +164,28 @@ fn sway_fullscreen_loop(flag: Arc<AtomicBool>, on_exit: Option<Arc<dyn Fn() + Se
                 msg.extend_from_slice(payload);
 
                 if stream.write_all(&msg).is_err() {
-                    std::thread::sleep(Duration::from_secs(2));
+                    tracing::debug!("sway ipc disconnected — reconnecting in {}s", backoff_secs);
+                    std::thread::sleep(Duration::from_secs(backoff_secs));
+                    backoff_secs = (backoff_secs * 2).min(30);
                     continue;
                 }
 
                 // drain subscribe ACK
                 let mut hdr = [0u8; 14];
-                if stream.read_exact(&mut hdr).is_err() { std::thread::sleep(Duration::from_secs(2)); continue; }
+                if stream.read_exact(&mut hdr).is_err() {
+                    tracing::debug!("sway ipc disconnected — reconnecting in {}s", backoff_secs);
+                    std::thread::sleep(Duration::from_secs(backoff_secs));
+                    backoff_secs = (backoff_secs * 2).min(30);
+                    continue;
+                }
                 let ack_len = u32::from_le_bytes(hdr[6..10].try_into().unwrap_or_default()) as usize;
                 let mut ack = vec![0u8; ack_len];
-                if stream.read_exact(&mut ack).is_err() { std::thread::sleep(Duration::from_secs(2)); continue; }
+                if stream.read_exact(&mut ack).is_err() {
+                    tracing::debug!("sway ipc disconnected — reconnecting in {}s", backoff_secs);
+                    std::thread::sleep(Duration::from_secs(backoff_secs));
+                    backoff_secs = (backoff_secs * 2).min(30);
+                    continue;
+                }
 
                 // event loop
                 loop {
@@ -191,11 +209,12 @@ fn sway_fullscreen_loop(flag: Arc<AtomicBool>, on_exit: Option<Arc<dyn Fn() + Se
                         }
                     }
                 }
-                tracing::debug!("sway ipc disconnected — reconnecting");
+                tracing::debug!("sway ipc disconnected — reconnecting in {}s", backoff_secs);
             }
-            Err(e) => tracing::debug!("sway ipc connect: {}", e),
+            Err(e) => tracing::debug!("sway ipc connect: {} — reconnecting in {}s", e, backoff_secs),
         }
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_secs(backoff_secs));
+        backoff_secs = (backoff_secs * 2).min(30);
     }
 }
 
@@ -730,6 +749,11 @@ fn recreate_surface(ctx: &mut RendererCtx, i: usize) {
     let old_wl = std::mem::replace(&mut ctx.surfaces[i].wl_surface, new_wl);
     drop(old_ls);
     drop(old_wl);
+    // Drop the old ShmPool: its wl_buffer objects referenced the destroyed wl_surface,
+    // so the compositor will never send Release events for them.  Without this drop the
+    // in_use AtomicBool flags stay true forever and free_idx() returns None, causing the
+    // render loop to stall on this surface (no frames committed, decoder idles).
+    ctx.surfaces[i].pool = None;
     ctx.wls.surf_ev[ev_idx] = SurfaceEvent { frame_ready: true, ..Default::default() };
     let _ = ctx.evq.flush();
     tracing::info!("surface[{}] ({}) recreated", i, ctx.surfaces[i].output_name);
@@ -1164,13 +1188,14 @@ fn render_loop(
                 .filter(|s| s.decoder.is_some())
                 .filter_map(|s| s.next_frame.checked_duration_since(now))
                 .min()
-                .map(|d| d.as_millis().clamp(1, 8) as i32)
-                .unwrap_or(8);
+                .map(|d| d.as_millis().clamp(1, 16) as i32)
+                .unwrap_or(16);
             if let Some(guard) = ctx.conn.prepare_read() {
                 let fd = ctx.conn.as_fd().as_raw_fd();
                 let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                unsafe { libc::poll(&mut pfd, 1, timeout_ms); }
-                let _ = guard.read();
+                // Check poll() return: EINTR (-1) or spurious (0) must not call read().
+                let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                if ret > 0 { let _ = guard.read(); } else { drop(guard); }
             } else {
                 // Events already buffered in the display queue; yield so the OS can
                 // schedule the compositor before we loop back to dispatch them.
@@ -1371,13 +1396,24 @@ fn process_surface(
                         *n = ((o as u16 * alpha + *n as u16 * ialpha) / 255) as u8;
                     }
                 }
+                // Release the old-frame buffer as soon as the fade is complete.
+                // Without this the 8–32 MB BGRA snapshot lives forever until the
+                // next wallpaper change, growing RSS continuously.
+                if ctx.surfaces[i].fade_frames_left == 0 {
+                    ctx.surfaces[i].fade_old = Vec::new();
+                }
             } else {
                 // Update last_frame every LAST_FRAME_UPDATE_INTERVAL frames to save bandwidth.
                 ctx.surfaces[i].last_frame_tick += 1;
                 if ctx.surfaces[i].last_frame_tick >= LAST_FRAME_UPDATE_INTERVAL {
                     ctx.surfaces[i].last_frame_tick = 0;
                     let lf = &mut ctx.surfaces[i].last_frame;
-                    if lf.len() != frame_size { lf.resize(frame_size, 0); }
+                    if lf.len() != frame_size {
+                        lf.resize(frame_size, 0);
+                        // Release excess capacity when resolution decreased (e.g. 4K → 1080p).
+                        // Without this, Vec retains the larger allocation permanently.
+                        lf.shrink_to_fit();
+                    }
                     // SAFETY: frame_ptr is mmap (memfd); lf.as_mut_ptr() is heap Vec.
                     unsafe { std::ptr::copy_nonoverlapping(frame_ptr, lf.as_mut_ptr(), frame_size); }
                 }
@@ -1385,6 +1421,14 @@ fn process_surface(
             commit_slot(ctx, i, slot_i);
             let _ = ctx.evq.flush();
             ctx.surfaces[i].next_frame += dur;
+            // Clamp drift: if scheduling jitter pushed next_frame into the past,
+            // re-anchor to wall clock. Without this the render loop decodes back-
+            // to-back forever (no poll sleep), starving the compositor and causing
+            // cursor jitter that worsens over hours of runtime.
+            let wall = Instant::now();
+            if ctx.surfaces[i].next_frame < wall {
+                ctx.surfaces[i].next_frame = wall;
+            }
             true
         }
         Ok(false) => {

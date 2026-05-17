@@ -8,6 +8,8 @@ use ffmpeg_next::software::scaling::flag::Flags;
 
 use wpick_core::config::FitMode;
 
+static FFMPEG_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 pub struct VideoDecoder {
     input_ctx:        ffmpeg::format::context::Input,
     video_stream_idx: usize,
@@ -28,7 +30,7 @@ impl VideoDecoder {
     /// The scaler is configured once to produce BGRA at the exact blit dimensions,
     /// so the render loop can memcpy directly into the SHM slot.
     pub fn open(path: &str, target_w: u32, target_h: u32, fit: FitMode) -> anyhow::Result<Self> {
-        ffmpeg::init().context("ffmpeg::init failed")?;
+        FFMPEG_INIT.get_or_init(|| { ffmpeg::init().expect("ffmpeg init failed"); });
 
         let input_ctx = ffmpeg::format::input(&path)
             .context("Failed to open video file")?;

@@ -42,10 +42,20 @@ impl Iterator for StreamingSource {
                     self.buf = chunk;
                     self.pos = 0;
                 }
-                // E-28: Never return None — rodio treats None as "source exhausted"
-                // and silently drops the sink. Return silence on empty channel or
-                // disconnected sender so the sink stays alive.
-                Err(_) => return Some(0.0),
+                // Channel empty — block until decoder sends a chunk.
+                // try_recv + immediate Some(0.0) caused the rodio mixer thread to spin
+                // at ~96 000 calls/sec (sample_rate × channels) burning a full CPU core
+                // whenever the decoder was briefly behind.  Blocking here is safe: the
+                // channel holds CHANNEL_CAP_DEFAULT chunks (~680 ms at 48 kHz stereo),
+                // so we only block during a genuine underrun.
+                // E-28: on Disconnected we still return Some(0.0) — never None.
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    match self.rx.recv() {
+                        Ok(chunk) => { self.buf = chunk; self.pos = 0; }
+                        Err(_)    => return Some(0.0),
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Some(0.0),
             }
         }
     }
