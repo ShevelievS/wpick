@@ -310,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
             if let Ok(g) = pids.lock() { resume_paused_tools(&g); }
             let _ = sd.send(());
             let cfg = cfg_sig.lock().await.clone();
-            if let Err(e) = cfg.save() { tracing::warn!("Config flush on SIGINT failed: {}", e); }
+            if let Err(e) = cfg.save_preserving_tui() { tracing::warn!("Config flush on SIGINT failed: {}", e); }
             let _ = std::fs::remove_file(&sp);
         });
     }
@@ -328,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Ok(g) = pids.lock() { resume_paused_tools(&g); }
                 let _ = sd.send(());
                 let cfg = cfg_sig.lock().await.clone();
-                if let Err(e) = cfg.save() { tracing::warn!("Config flush on SIGTERM failed: {}", e); }
+                if let Err(e) = cfg.save_preserving_tui() { tracing::warn!("Config flush on SIGTERM failed: {}", e); }
                 let _ = std::fs::remove_file(&sp);
             }
         });

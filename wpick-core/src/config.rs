@@ -334,6 +334,24 @@ impl WpickConfig {
         Ok(cfg)
     }
 
+    /// Save daemon-owned fields while preserving the `[tui]` section from the
+    /// on-disk config.  The daemon never modifies `tui.*` (packs, favorites,
+    /// theme, layout) — those are written exclusively by the TUI process.
+    /// Without this merge, a daemon save (triggered by a wallpaper change,
+    /// volume update, etc.) would overwrite the file with its stale in-memory
+    /// copy and permanently erase any packs the user created in the TUI.
+    pub fn save_preserving_tui(&self) -> Result<()> {
+        match Self::load() {
+            Ok(disk) => {
+                let mut merged = self.clone();
+                merged.tui = disk.tui;
+                merged.save()
+            }
+            // Disk unreadable (first run, permissions, etc.) — save as-is.
+            Err(_) => self.save(),
+        }
+    }
+
     /// Atomically save config to the canonical XDG location.
     pub fn save(&self) -> Result<()> {
         let config_dir = dirs::config_dir()

@@ -406,14 +406,14 @@ pub async fn run_config_writer(
                     dirty_rx.changed(),
                 ).await {}
                 let cfg = config.lock().await.clone();
-                if let Err(e) = cfg.save() {
+                if let Err(e) = cfg.save_preserving_tui() {
                     tracing::warn!("Config debounced save failed: {}", e);
                 }
             }
             _ = shutdown.recv() => {
                 // Shutdown: flush immediately, no debounce.
                 let cfg = config.lock().await.clone();
-                if let Err(e) = cfg.save() {
+                if let Err(e) = cfg.save_preserving_tui() {
                     tracing::warn!("Config flush on shutdown failed: {}", e);
                 }
                 return;

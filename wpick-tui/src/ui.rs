@@ -222,7 +222,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         AppMode::PackPicker  => "↑↓ move  Space toggle  Esc close",
         AppMode::SortDialog  => "↑↓ select  d asc/desc  Enter apply  Esc cancel",
         _ => match app.active_panel {
-            Panel::Nav  => "→ focus list  n new pack  [ hide nav  S settings",
+            Panel::Nav  => "→ focus list  n new pack  d del pack  [ hide nav  S settings",
             Panel::List => "Enter apply  / search  p★ fav  o sort  t timer  q quit  +/- vol  ? help  Alt+K kill",
         },
     };
@@ -781,6 +781,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
         section("Other"),
         key("s",             "folders / extra dirs"),
         key("n",             "new pack"),
+        key("d / Del",       "delete pack"),
         key("M",             "select monitor"),
         key("r",             "refresh / scan"),
         key("S",             "settings"),

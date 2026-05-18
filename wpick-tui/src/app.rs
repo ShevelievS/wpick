@@ -689,6 +689,15 @@ impl App {
             KeyCode::Char('[') => { self.show_nav = !self.show_nav; self.save_tui_config(); }
             KeyCode::Char(']') => { self.show_preview = !self.show_preview; self.save_tui_config(); }
             KeyCode::Char('n') => { self.open_pack_name_dialog(); }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let NavItem::Pack(i) = self.current_nav() {
+                    let name = self.packs[i].name.clone();
+                    self.packs.remove(i);
+                    self.nav_selected = self.nav_selected.min(self.nav_items().len().saturating_sub(1));
+                    self.save_tui_config();
+                    self.set_status_ok(format!("Pack '{}' deleted", name));
+                }
+            }
             KeyCode::Char('S') | KeyCode::Char('e') => { self.mode = AppMode::Settings; self.settings_level = 0; self.settings_cat = 0; self.settings_selected = 0; }
             _ => {}
         }
