@@ -565,7 +565,12 @@ impl App {
                 }
             }
 
-            if self.should_quit { break; }
+            if self.should_quit {
+                // Final flush: ensures packs/favorites are on disk even if an
+                // earlier save silently failed (e.g. temporary permissions issue).
+                self.save_tui_config();
+                break;
+            }
         }
         Ok(())
     }

@@ -341,15 +341,14 @@ impl WpickConfig {
     /// volume update, etc.) would overwrite the file with its stale in-memory
     /// copy and permanently erase any packs the user created in the TUI.
     pub fn save_preserving_tui(&self) -> Result<()> {
-        match Self::load() {
-            Ok(disk) => {
-                let mut merged = self.clone();
-                merged.tui = disk.tui;
-                merged.save()
-            }
-            // Disk unreadable (first run, permissions, etc.) — save as-is.
-            Err(_) => self.save(),
-        }
+        // Propagate load errors rather than falling back to self.save().
+        // Calling self.save() when load fails would overwrite the disk file
+        // with the daemon's stale in-memory copy, permanently erasing any
+        // packs or favorites the TUI process wrote since daemon startup.
+        let disk = Self::load()?;
+        let mut merged = self.clone();
+        merged.tui = disk.tui;
+        merged.save()
     }
 
     /// Atomically save config to the canonical XDG location.
