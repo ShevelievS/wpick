@@ -354,7 +354,7 @@ fn render_nav_stats(frame: &mut Frame, app: &App, area: Rect) {
     let vol_line = if app.config.general.muted {
         Line::from(Span::styled(" \u{25a0} MUTED", Style::default().fg(t.color_fav)))
     } else {
-        let pct = (app.config.general.volume * 100.0) as u32;
+        let pct = (app.config.general.volume * 100.0).round() as u32;
         match app.config.tui.vol_style.as_str() {
             "number" => Line::from(vec![
                 Span::styled(" \u{266a} ", dim),

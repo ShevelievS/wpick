@@ -1191,7 +1191,11 @@ impl App {
     }
 
     async fn cmd_change_volume(&mut self, delta: f32) {
-        let new_vol = (self.config.general.volume + delta).clamp(0.0, 1.0);
+        // Round to nearest 1 % after each step to prevent f32 drift.
+        // Without rounding, 0.85 - 0.05 = 0.7999... which accumulates:
+        // 85→79→74→69 instead of the correct 85→80→75→70.
+        let raw     = self.config.general.volume + delta;
+        let new_vol = ((raw * 100.0).round() / 100.0).clamp(0.0, 1.0);
         match self.send(ClientCommand::Volume { level: new_vol }).await {
             Ok(DaemonResponse::VolumeState { volume, muted, .. }) => {
                 self.config.general.volume = volume;
