@@ -17,6 +17,12 @@ pub struct VideoDecoder {
     scaler:           ffmpeg::software::scaling::context::Context,
     fps:              f64,
     eof_sent:         bool,
+    /// Frames decoded since the last seek_to_start().  Used to detect
+    /// immediate-EOF-after-seek: if the first packet after a seek is EOF,
+    /// the demuxer's AVIOContext::eof_reached flag was not cleared by the seek
+    /// (happens on some containers with non-zero start_time).  We propagate
+    /// this as Err so the caller recreates the decoder instead of spinning.
+    frames_since_seek: u64,
     target_w:         u32,
     target_h:         u32,
     offset_x:         u32,
@@ -119,7 +125,8 @@ impl VideoDecoder {
             decoder,
             scaler,
             fps,
-            eof_sent: false,
+            eof_sent:          false,
+            frames_since_seek: 0,
             target_w,
             target_h,
             offset_x,
@@ -135,11 +142,7 @@ impl VideoDecoder {
         loop {
             let mut decoded = ffmpeg::frame::Video::empty();
             if self.decoder.receive_frame(&mut decoded).is_ok() {
-                // The scaler was configured with the correct source crop region
-                // (crop_x, crop_y) baked into scaler_src_w/h at open() time for
-                // Fill and Center modes. For YUV planar formats (the common case)
-                // we pass the full frame and rely on the scaler's src rect.
-                // TODO: per-plane byte-offset crop for packed/BGRA source formats.
+                self.frames_since_seek += 1;
                 return self.scale_and_blit(&decoded, dst);
             }
 
@@ -149,6 +152,13 @@ impl VideoDecoder {
 
             match self.input_ctx.packets().next() {
                 None => {
+                    // Immediate EOF on the first packet after a seek means the demuxer's
+                    // AVIOContext::eof_reached flag was not cleared by seek().  This causes
+                    // an infinite seek→EOF→seek loop that freezes the display.  Propagate
+                    // as Err so the render loop recreates the decoder from scratch.
+                    if self.frames_since_seek == 0 {
+                        anyhow::bail!("demuxer EOF immediately after seek — decoder state corrupt");
+                    }
                     self.decoder.send_eof().ok();
                     self.eof_sent = true;
                 }
@@ -207,9 +217,20 @@ impl VideoDecoder {
     }
 
     pub fn seek_to_start(&mut self) -> anyhow::Result<()> {
-        self.input_ctx.seek(0, ..).context("seek failed")?;
+        // Seek to the stream's actual start_time rather than literal 0.
+        // Files with a non-zero start_time (MPEG-TS, some mkv/webm) may leave
+        // AVIOContext::eof_reached set when seek(0) lands before the first packet,
+        // causing the demuxer to return EOF immediately on the next av_read_frame.
+        let start_ts = self.input_ctx.streams()
+            .nth(self.video_stream_idx)
+            .map(|s| s.start_time())
+            .filter(|&t| t != ffmpeg::ffi::AV_NOPTS_VALUE as i64)
+            .unwrap_or(0)
+            .max(0);
+        self.input_ctx.seek(start_ts, ..).context("seek failed")?;
         self.decoder.flush();
-        self.eof_sent = false;
+        self.eof_sent         = false;
+        self.frames_since_seek = 0;
         Ok(())
     }
 

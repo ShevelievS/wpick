@@ -202,6 +202,26 @@ fn hyprland_fullscreen_loop(
     }
 }
 
+/// Query Sway for current fullscreen state via GET_TREE (type=4).
+/// Returns true if any node in the tree has fullscreen_mode > 0.
+fn sway_query_fullscreen(sock: &str) -> bool {
+    use std::io::{Read, Write};
+    const MAGIC: &[u8] = b"i3-ipc";
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(sock) else { return false };
+    let mut msg = [0u8; 14];
+    msg[..6].copy_from_slice(MAGIC);
+    // payload_len = 0, msg_type = 4 (GET_TREE)
+    msg[10..14].copy_from_slice(&4u32.to_le_bytes());
+    if stream.write_all(&msg).is_err() { return false; }
+    let mut hdr = [0u8; 14];
+    if stream.read_exact(&mut hdr).is_err() { return false; }
+    let body_len = u32::from_le_bytes(hdr[6..10].try_into().unwrap_or_default()) as usize;
+    let mut body = vec![0u8; body_len];
+    if stream.read_exact(&mut body).is_err() { return false; }
+    let s = std::str::from_utf8(&body).unwrap_or("");
+    s.contains("\"fullscreen_mode\":1") || s.contains("\"fullscreen_mode\":2")
+}
+
 /// Sway native IPC — subscribe to window and workspace events.
 ///
 /// Protocol: 6-byte magic "i3-ipc" + u32 LE payload_len + u32 LE msg_type.
@@ -222,11 +242,24 @@ fn sway_fullscreen_loop(
         Err(_) => return,
     };
 
+    let mut prev_active = false;
     let mut backoff_secs: u64 = 2;
     loop {
         match std::os::unix::net::UnixStream::connect(&sock) {
             Ok(mut stream) => {
-                backoff_secs = 2; // reset on successful connect
+                backoff_secs = 2;
+
+                // Re-query fullscreen state on (re)connect — same race as Hyprland:
+                // if the socket was down when fullscreen exited, we'd never see the
+                // event and is_paused would be stuck true forever.
+                let reconnect_active = sway_query_fullscreen(&sock);
+                if prev_active && !reconnect_active {
+                    if let Some(ref cb) = on_exit { cb(); }
+                }
+                prev_active = reconnect_active;
+                flag.store(reconnect_active, Ordering::Relaxed);
+                tracing::info!("sway socket connected — fullscreen={}", reconnect_active);
+
                 let payload = b"[\"window\",\"workspace\"]";
                 let mut msg = Vec::with_capacity(14 + payload.len());
                 msg.extend_from_slice(MAGIC);
@@ -234,56 +267,56 @@ fn sway_fullscreen_loop(
                 msg.extend_from_slice(&SUBSCRIBE.to_le_bytes());
                 msg.extend_from_slice(payload);
 
-                if stream.write_all(&msg).is_err() {
-                    tracing::debug!("sway ipc disconnected — reconnecting in {}s", backoff_secs);
-                    std::thread::sleep(Duration::from_secs(backoff_secs));
-                    backoff_secs = (backoff_secs * 2).min(30);
-                    continue;
-                }
+                if stream.write_all(&msg).is_err() { continue; }
 
                 // drain subscribe ACK
                 let mut hdr = [0u8; 14];
-                if stream.read_exact(&mut hdr).is_err() {
-                    tracing::debug!("sway ipc disconnected — reconnecting in {}s", backoff_secs);
-                    std::thread::sleep(Duration::from_secs(backoff_secs));
-                    backoff_secs = (backoff_secs * 2).min(30);
-                    continue;
-                }
+                if stream.read_exact(&mut hdr).is_err() { continue; }
                 let ack_len = u32::from_le_bytes(hdr[6..10].try_into().unwrap_or_default()) as usize;
                 let mut ack = vec![0u8; ack_len];
-                if stream.read_exact(&mut ack).is_err() {
-                    tracing::debug!("sway ipc disconnected — reconnecting in {}s", backoff_secs);
-                    std::thread::sleep(Duration::from_secs(backoff_secs));
-                    backoff_secs = (backoff_secs * 2).min(30);
-                    continue;
-                }
+                if stream.read_exact(&mut ack).is_err() { continue; }
+
+                // 15-second read timeout — periodic re-query safety net.
+                stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
 
                 // event loop
-                loop {
-                    if stream.read_exact(&mut hdr).is_err() { break; }
-                    let body_len  = u32::from_le_bytes(hdr[6..10].try_into().unwrap_or_default()) as usize;
-                    let msg_type  = u32::from_le_bytes(hdr[10..14].try_into().unwrap_or_default());
-                    let mut body  = vec![0u8; body_len];
-                    if stream.read_exact(&mut body).is_err() { break; }
+                'sway: loop {
+                    match stream.read_exact(&mut hdr) {
+                        Ok(()) => {}
+                        Err(e) if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {
+                            let active = sway_query_fullscreen(&sock);
+                            if prev_active && !active {
+                                if let Some(ref cb) = on_exit { cb(); }
+                            }
+                            prev_active = active;
+                            flag.store(active, Ordering::Relaxed);
+                            continue 'sway;
+                        }
+                        Err(_) => break 'sway,
+                    }
+                    let body_len = u32::from_le_bytes(hdr[6..10].try_into().unwrap_or_default()) as usize;
+                    let msg_type = u32::from_le_bytes(hdr[10..14].try_into().unwrap_or_default());
+                    let mut body = vec![0u8; body_len];
+                    if stream.read_exact(&mut body).is_err() { break 'sway; }
 
                     if msg_type == EV_WINDOW {
                         let s = std::str::from_utf8(&body).unwrap_or("");
                         if s.contains("\"change\":\"fullscreen_mode\"") {
                             let active = s.contains("\"fullscreen_mode\":1")
                                       || s.contains("\"fullscreen_mode\":2");
-                            let prev = flag.load(Ordering::Relaxed);
-                            if prev && !active {
+                            if prev_active && !active {
                                 if let Some(ref cb) = on_exit { cb(); }
                             }
+                            prev_active = active;
                             flag.store(active, Ordering::Relaxed);
                             tracing::debug!("sway fullscreen → {}", active);
                         }
                     } else if msg_type == EV_WORKSPACE {
-                        // Workspace focus event — extract workspace name for per-workspace wallpaper.
-                        // Sway workspace event JSON: {"change":"focus","current":{"name":"1",...},...}
                         let s = std::str::from_utf8(&body).unwrap_or("");
                         if s.contains("\"change\":\"focus\"") {
-                            // Simple extraction: find "name":"<value>" inside "current" object.
                             if let Some(cur_pos) = s.find("\"current\"") {
                                 let after = &s[cur_pos..];
                                 if let Some(name_pos) = after.find("\"name\":\"") {
@@ -848,7 +881,14 @@ fn recreate_surface(ctx: &mut RendererCtx, i: usize) {
     // so the compositor will never send Release events for them.  Without this drop the
     // in_use AtomicBool flags stay true forever and free_idx() returns None, causing the
     // render loop to stall on this surface (no frames committed, decoder idles).
-    ctx.surfaces[i].pool = None;
+    ctx.surfaces[i].pool           = None;
+    ctx.surfaces[i].canvas_ready   = false;
+    ctx.surfaces[i].fade_frames_left = 0;
+    ctx.surfaces[i].fade_old       = Vec::new();
+    ctx.surfaces[i].last_frame.clear();
+    ctx.surfaces[i].last_frame.shrink_to_fit();
+    ctx.surfaces[i].nudge_at       = None;
+    ctx.surfaces[i].last_commit_at = None;
     ctx.wls.surf_ev[ev_idx] = SurfaceEvent { frame_ready: true, ..Default::default() };
     let _ = ctx.evq.flush();
     tracing::info!("surface[{}] ({}) recreated", i, ctx.surfaces[i].output_name);
@@ -937,7 +977,9 @@ fn init_renderer() -> anyhow::Result<RendererCtx> {
             closed_in_fs:   false,
             nudge_at:       None,
             recreate_after: None,
-            last_commit_at: None,
+            // Set to now so the 300ms fallback timer fires correctly from the first frame.
+            // None would permanently disable the fallback until the first commit_slot call.
+            last_commit_at: Some(Instant::now()),
             pinned_wp:         None,
             fit:               FitMode::default(),
             hw_ok:             true,
@@ -1490,6 +1532,8 @@ fn process_surface(
             ctx.surfaces[i].recreate_after = None;
             tracing::info!("post-fullscreen recreate: surface[{}] (z-order)", i);
             recreate_surface(ctx, i);
+            // Arm the nudge fallback so the surface recovers if configure never arrives.
+            ctx.surfaces[i].nudge_at = Some(Instant::now());
             return false;
         }
     }
@@ -1588,6 +1632,11 @@ fn process_surface(
 
     // ── acquire free buffer slot ──────────────────────────────────────────────
     let Some(slot_i) = ctx.surfaces[i].pool.as_ref().and_then(|p| p.free_idx()) else {
+        // Release event for an in-use slot may be sitting in the socket buffer.
+        // Drain it inline so the slot is freed before the next loop iteration
+        // instead of waiting up to 16 ms for the outer poll.
+        if let Some(guard) = ctx.conn.prepare_read() { let _ = guard.read(); }
+        let _ = ctx.evq.dispatch_pending(&mut ctx.wls);
         ctx.wls.surf_ev[ev_idx].frame_ready = true;
         return false;
     };
@@ -1689,6 +1738,11 @@ fn process_surface(
                 if let Err(e) = dec.seek_to_start() {
                     tracing::warn!("seek surface[{}]: {}", i, e);
                     ctx.surfaces[i].decoder = None;
+                } else {
+                    // Reset timing after seek so the next decode attempt is not
+                    // immediate — avoids a spin if seek succeeds but the decoder
+                    // immediately returns Ok(false) again (e.g. broken demuxer state).
+                    ctx.surfaces[i].next_frame = Instant::now();
                 }
             }
             false

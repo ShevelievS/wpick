@@ -297,7 +297,11 @@ impl HwDecoder {
             if ret == ffsys::AVERROR_EOF { return Ok(false); }
 
             if ret != AVERROR_EAGAIN {
-                tracing::warn!("HW: avcodec_receive_frame: {}", ret);
+                // Persistent errors (GPU driver reset, VA context loss, corrupted
+                // stream) are neither EOF nor EAGAIN.  Warn-and-continue causes an
+                // infinite spin with a frozen display.  Propagate as Err so the render
+                // loop sets hw_ok=false and falls back to the SW decoder.
+                anyhow::bail!("avcodec_receive_frame: {}", ret);
             }
 
             // Need more input
@@ -338,6 +342,11 @@ impl HwDecoder {
         let ret = ffsys::av_hwframe_transfer_data(self.nv12_frame, self.vaapi_frame, 0);
         if ret < 0 {
             tracing::warn!("HW: av_hwframe_transfer_data: {}", ret);
+            // Unref before returning — the transfer may have partially allocated a
+            // buffer in nv12_frame before failing.  Without this unref the buffer
+            // stays alive for one extra loop iteration, starving the VA surface pool
+            // under repeated GPU errors (e.g. suspend/resume).
+            ffsys::av_frame_unref(self.nv12_frame);
             return Ok(false);
         }
 
