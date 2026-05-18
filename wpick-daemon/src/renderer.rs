@@ -98,73 +98,101 @@ fn hyprland_fullscreen_loop(
     let mut backoff_secs: u64 = 2;
     loop {
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
-            backoff_secs = 2; // reset on successful connect
+            backoff_secs = 2;
+
+            // Re-query fullscreen state immediately on (re)connect.
+            // If fullscreen>>0 was sent while we were disconnected (during backoff or
+            // a Hyprland restart) the event is permanently lost and the flag would stay
+            // true forever, freezing the render loop indefinitely.  An explicit query
+            // after every connect makes us resilient to any missed transition event.
+            let reconnect_active = hyprland_query_fullscreen(&sock1);
+            if prev_active && !reconnect_active {
+                if let Some(ref cb) = on_exit { cb(); }
+            }
+            prev_active = reconnect_active;
+            flag.store(reconnect_active, Ordering::Relaxed);
+            tracing::info!("hyprland socket2 connected — fullscreen={}", reconnect_active);
+
+            // 15-second read timeout: if no event arrives within 15 s we re-query
+            // the real fullscreen state.  This is the safety net that corrects a
+            // stuck flag even while the socket stays connected (e.g. user closes a
+            // fullscreen window during a long idle period with no other events).
+            stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
+
             use std::io::BufRead;
-            for line in std::io::BufReader::new(stream).lines() {
-                match line {
-                    Ok(l) if l.starts_with("fullscreen>>") => {
-                        let p = l.trim_start_matches("fullscreen>>");
-                        let active = !p.starts_with('0') && !p.contains(",0");
+            let mut reader = std::io::BufReader::new(stream);
+            'event: loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break 'event, // EOF / disconnected
+                    Err(e) if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {
+                        // No event in 15 s — re-query to correct any stale flag.
+                        let active = hyprland_query_fullscreen(&sock1);
                         if prev_active && !active {
                             if let Some(ref cb) = on_exit { cb(); }
                         }
                         prev_active = active;
                         flag.store(active, Ordering::Relaxed);
-                        tracing::info!("hyprland fullscreen → {}", active);
+                        continue 'event;
                     }
-                    // lockguard>>0 = screen unlocked — reassert wpick surface so it ends
-                    // up on top of QuickShell's background layer which re-renders on unlock.
-                    Ok(l) if l.starts_with("lockguard>>0") => {
-                        tracing::info!("hyprland: screen unlocked — scheduling surface reassert");
-                        let rf = Arc::clone(&reassert_flag);
-                        std::thread::spawn(move || {
-                            std::thread::sleep(Duration::from_secs(1));
-                            rf.store(true, Ordering::Relaxed);
-                        });
+                    Err(e) => { tracing::debug!("hyprland ipc: {}", e); break 'event; }
+                    Ok(_)  => {}
+                }
+                let l = line.trim_end();
+                if l.starts_with("fullscreen>>") {
+                    let p = l.trim_start_matches("fullscreen>>");
+                    let active = !p.starts_with('0') && !p.contains(",0");
+                    if prev_active && !active {
+                        if let Some(ref cb) = on_exit { cb(); }
                     }
-                    // workspace>> fires when switching workspaces.
-                    // Hyprland does NOT resend fullscreen>> on workspace switch, so the
-                    // flag can get stuck as true when moving away from a fullscreen workspace.
-                    // Query the real state via socket1 and update the flag ONLY — do NOT
-                    // update prev_active or fire the callback here.  prev_active must only
-                    // track real fullscreen>> transitions so that the callback fires correctly
-                    // when the user actually exits fullscreen (fullscreen>>0).
-                    Ok(ref l) if l.starts_with("workspacev2>>") => {
-                        // Hyprland v0.40+: "workspacev2>>id,name"
-                        let active = hyprland_query_fullscreen(&sock1);
-                        flag.store(active, Ordering::Relaxed);
-                        let rest = l.trim_start_matches("workspacev2>>");
-                        if let Some((_, ws_name)) = rest.split_once(',') {
-                            let ws_name = ws_name.to_owned();
-                            tracing::info!("workspacev2 '{}' → fullscreen={}", ws_name, active);
-                            if let Ok(guard) = workspace_sender_slot.lock() {
-                                if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
-                            }
-                        }
-                    }
-                    Ok(ref l) if l.starts_with("workspace>>") => {
-                        let active = hyprland_query_fullscreen(&sock1);
-                        flag.store(active, Ordering::Relaxed);
-                        let ws_name = l.trim_start_matches("workspace>>").to_owned();
-                        tracing::info!("workspace change '{}' → fullscreen={}", ws_name, active);
+                    prev_active = active;
+                    flag.store(active, Ordering::Relaxed);
+                    tracing::info!("hyprland fullscreen → {}", active);
+                } else if l.starts_with("lockguard>>0") {
+                    // Screen unlocked — reassert wpick surface so it ends up on top of
+                    // QuickShell's background layer which re-renders on unlock.
+                    tracing::info!("hyprland: screen unlocked — scheduling surface reassert");
+                    let rf = Arc::clone(&reassert_flag);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(1));
+                        rf.store(true, Ordering::Relaxed);
+                    });
+                } else if l.starts_with("workspacev2>>") {
+                    // Hyprland v0.40+: "workspacev2>>id,name"
+                    // workspace>> does not resend fullscreen>> — re-query real state.
+                    let active = hyprland_query_fullscreen(&sock1);
+                    flag.store(active, Ordering::Relaxed);
+                    let rest = l.trim_start_matches("workspacev2>>");
+                    if let Some((_, ws_name)) = rest.split_once(',') {
+                        let ws_name = ws_name.to_owned();
+                        tracing::info!("workspacev2 '{}' → fullscreen={}", ws_name, active);
                         if let Ok(guard) = workspace_sender_slot.lock() {
                             if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
                         }
                     }
-                    Ok(ref l) if l.starts_with("focusedmon>>") => {
-                        let active = hyprland_query_fullscreen(&sock1);
-                        flag.store(active, Ordering::Relaxed);
-                        let rest = l.trim_start_matches("focusedmon>>");
-                        if let Some((_, ws_name)) = rest.split_once(',') {
-                            let ws_name = ws_name.to_owned();
-                            tracing::info!("focusedmon: workspace '{}' → fullscreen={}", ws_name, active);
-                            if let Ok(guard) = workspace_sender_slot.lock() {
-                                if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
-                            }
+                } else if l.starts_with("workspace>>") {
+                    // workspace>> does not resend fullscreen>> — re-query real state.
+                    let active = hyprland_query_fullscreen(&sock1);
+                    flag.store(active, Ordering::Relaxed);
+                    let ws_name = l.trim_start_matches("workspace>>").to_owned();
+                    tracing::info!("workspace change '{}' → fullscreen={}", ws_name, active);
+                    if let Ok(guard) = workspace_sender_slot.lock() {
+                        if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
+                    }
+                } else if l.starts_with("focusedmon>>") {
+                    let active = hyprland_query_fullscreen(&sock1);
+                    flag.store(active, Ordering::Relaxed);
+                    let rest = l.trim_start_matches("focusedmon>>");
+                    if let Some((_, ws_name)) = rest.split_once(',') {
+                        let ws_name = ws_name.to_owned();
+                        tracing::info!("focusedmon: workspace '{}' → fullscreen={}", ws_name, active);
+                        if let Ok(guard) = workspace_sender_slot.lock() {
+                            if let Some(ref tx) = *guard { let _ = tx.try_send(ws_name); }
                         }
                     }
-                    Ok(_)  => {}
-                    Err(e) => { tracing::debug!("hyprland ipc: {}", e); break; }
                 }
             }
         }
