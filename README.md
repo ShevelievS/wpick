@@ -8,7 +8,7 @@
 > "Wallpaper Engine" and "Steam" are trademarks of Valve Corporation.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.5.1-blue)](CHANGELOG.md)
 
 wpick plays video files directly on `wlr-layer-shell` background surfaces,
 with streaming audio, PulseAudio ducking, VA-API hardware decode,

@@ -6,6 +6,65 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.5.1] — 2026-05-18
+
+### Fixed
+
+- **Seamless crossfade chaining** — switching wallpapers mid-crossfade no
+  longer produces a hard cut. The blended output is mirrored into
+  `last_frame` every frame during the transition, so a rapid wallpaper
+  change always finds a valid snapshot and continues smoothly into the next
+  crossfade. (`wpick-daemon`)
+
+- **Audio fade-out on wallpaper switch** — the old audio sink now fades out
+  over 1.5 s (30 steps) in a detached task instead of stopping immediately.
+  Rapid wallpaper switches no longer produce hard audio cuts. (`wpick-daemon`)
+
+- **Fullscreen flag stuck after Hyprland socket2 reconnect** — if
+  `fullscreen>>0` was sent while the socket was disconnected (Hyprland
+  restart, session resume, backoff period), the flag stayed `true`
+  indefinitely, freezing the render loop: video appeared as a static image
+  and wallpaper switches only changed the audio. Fixed by re-querying
+  fullscreen state on every (re)connect and adding a 15 s read timeout with
+  periodic re-query. Same fix applied to the Sway socket. (`wpick-daemon`)
+
+- **9 video-freeze issues from deep audit** — see below. (`wpick-daemon`)
+  - `recreate_surface`: now clears `canvas_ready`, `fade_old`, `last_frame`,
+    `nudge_at`, `last_commit_at` to prevent stale-resolution blending and
+    disabled fallback timer after surface recreation.
+  - `recreate_after` path: arms `nudge_at` so the surface recovers if
+    configure never arrives after a post-fullscreen recreate.
+  - `last_commit_at`: initialised to `Some(Instant::now())` — `None` had
+    permanently disabled the 300 ms frame-callback fallback.
+  - `Ok(false)` / seek: resets `next_frame` after seek to prevent spin if
+    the decoder immediately returns EOF again.
+  - `free_idx() == None`: drains the Wayland socket inline so pending
+    `wl_buffer::Release` events are processed immediately.
+  - `video.rs` seek: uses the stream's actual `start_time` instead of
+    literal `0`; adds `frames_since_seek` counter to detect and bail on
+    infinite seek→EOF→seek loops (non-zero `start_pts` containers).
+  - `hw_decode.rs`: persistent `avcodec_receive_frame` errors (GPU reset,
+    VA context loss) now propagate as `anyhow::bail!` instead of warn-and-
+    continue, triggering SW fallback correctly.
+  - `hw_decode.rs`: `av_frame_unref(nv12_frame)` added before early return
+    in `transfer_and_scale` to prevent VA surface pool starvation.
+
+- **Pack delete** — packs can now be deleted with `d` / Delete when a pack
+  is selected in the nav panel. Footer hint and help overlay updated.
+  (`wpick-tui`)
+
+- **Packs disappearing after TUI close** — the daemon held a stale in-memory
+  `WpickConfig` (loaded at startup) with no knowledge of packs created by
+  the TUI. Any daemon save (wallpaper change, volume, timer, SIGTERM) would
+  overwrite the file with the stale copy, erasing TUI-written packs.
+  Fixed with `save_preserving_tui()`: before every daemon save the `[tui]`
+  section is re-read from disk and merged in, so packs/favorites/theme
+  survive regardless of daemon save timing. TUI event loop now also flushes
+  config on every graceful exit (`q` / Esc). (`wpick-core`, `wpick-daemon`,
+  `wpick-tui`)
+
+---
+
 ## [0.5.0] — 2026-05-18
 
 ### Added
