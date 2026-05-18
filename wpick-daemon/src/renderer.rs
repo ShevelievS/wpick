@@ -1550,7 +1550,7 @@ fn process_surface(
         let new_w = if ew > 0 { ew } else { ctx.surfaces[i].surf_w };
         let new_h = if eh > 0 { eh } else { ctx.surfaces[i].surf_h };
 
-        if new_w != ctx.surfaces[i].surf_w || new_h != ctx.surfaces[i].surf_h {
+        if ctx.surfaces[i].pool.is_none() || new_w != ctx.surfaces[i].surf_w || new_h != ctx.surfaces[i].surf_h {
             let qh = ctx.evq.handle();
             match ShmPool::create(&ctx.shm, &qh, new_w, new_h) {
                 Ok(mut p) => {
